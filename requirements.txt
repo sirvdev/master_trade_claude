@@ -1,0 +1,45 @@
+# Core Dependencies
+python-dotenv==1.0.0
+pyyaml==6.0.1
+numpy>=1.26.0
+pandas>=2.1.0
+
+# Technical Indicators
+ta-lib==0.4.28
+pandas_ta_classic==0.1.0
+
+# Database
+# sqlite3  # Built-in 
+
+# API Clients
+ccxt>=4.2.0  # Unified crypto exchange API (includes Binance)
+python-binance>=1.0.19  # Binance-specific client
+websockets>=12.0
+aiohttp>=3.9.1
+requests>=2.31.0
+
+# MT5 Bridge (Socket client)
+# asyncio  # Built-in
+# socket  # Built-in 
+
+# Machine Learning / Optimization
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# Dashboard
+streamlit>=1.29.0
+plotly>=5.18.0
+altair>=5.2.0
+
+# Notifications
+python-telegram-bot>=20.7
+
+# Testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+pytest-cov>=4.1.0
+
+# Utilities
+loguru>=0.7.2
+tqdm>=4.66.1
+joblib>=1.3.2
