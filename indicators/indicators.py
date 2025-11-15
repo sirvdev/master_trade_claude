@@ -97,9 +97,9 @@ class TechnicalIndicators:
         
     def calculate_macd(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
         """Calculate MACD indicator."""
-        fast = self.config['macd'].get('fast_period', 12)  # Changed
-        slow = self.config['macd'].get('slow_period', 26)  # Changed
-        signal = self.config['macd'].get('signal_period', 9)  # Changed
+        fast = self.config['macd'].get('fast', 12)  # ✅ Correct
+        slow = self.config['macd'].get('slow', 26)  # ✅ Correct
+        signal = self.config['macd'].get('signal', 9)  # ✅ Correct
         
         ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
         ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
@@ -152,8 +152,8 @@ class TechnicalIndicators:
         
     def calculate_bollinger_bands(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
         """Calculate Bollinger Bands."""
-        period = self.config.get('bollinger_bands', {}).get('period', 20)
-        std_dev = self.config.get('bollinger_bands', {}).get('std_dev', 2)
+        period = self.config.get('bollinger', {}).get('period', 20)  # ✅ Correct
+        std_dev = self.config.get('bollinger', {}).get('std_dev', 2) # ✅ Correct
         
         sma = df['close'].rolling(window=period).mean()
         std = df['close'].rolling(window=period).std()

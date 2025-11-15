@@ -21,9 +21,17 @@ symbols:
     timeframes: [1H, 15m, 5m]
     primary_timeframe: 1H
     entry_timeframe: 5m
+
+  BTC/USD:
+    enabled: true
+    platform: mt5
+    mode: demo
+    timeframes: [1H, 15m, 5m]
+    primary_timeframe: 1H
+    entry_timeframe: 5m
   
   BTC/USDT:
-    enabled: true
+    enabled: false
     platform: binance
     mode: demo
     market_type: futures  # spot or futures
@@ -32,7 +40,7 @@ symbols:
     entry_timeframe: 5m
   
   ETH/USDT:
-    enabled: true
+    enabled: false
     platform: binance
     mode: demo
     market_type: futures

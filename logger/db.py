@@ -194,6 +194,11 @@ class DatabaseManager:
         self.conn.commit()
         logger.info("Database schema initialized")
         
+    """
+    Fixed log_analysis method and _convert_numpy_types in logger/db.py
+    Replace the existing methods with these.
+    """
+
     def log_analysis(self, analysis_data: Dict[str, Any]) -> str:
         """
         Log a market analysis pass.
@@ -206,25 +211,6 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
         
-        
-    def convert_numpy_types(obj):
-        """Convert numpy types to native Python types for JSON serialization."""
-        import numpy as np
-        if isinstance(obj, dict):
-            return {k: convert_numpy_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_numpy_types(item) for item in obj]
-        elif isinstance(obj, np.bool_):
-            return bool(obj)
-        elif isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return obj
-
         analysis_id = f"analysis_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
         
         cursor.execute("""
@@ -240,9 +226,9 @@ class DatabaseManager:
             datetime.utcnow(),
             analysis_data.get('symbol'),
             analysis_data.get('primary_timeframe'),
-            json.dumps(convert_numpy_types(analysis_data.get('timeframe_snapshots', {}))),
-            json.dumps(convert_numpy_types(analysis_data.get('market_structure', {}))),
-            json.dumps(convert_numpy_types(analysis_data.get('indicators_state', {}))),
+            json.dumps(self._convert_numpy_types(analysis_data.get('timeframe_snapshots', {}))),
+            json.dumps(self._convert_numpy_types(analysis_data.get('market_structure', {}))),
+            json.dumps(self._convert_numpy_types(analysis_data.get('indicators_state', {}))),
             analysis_data.get('entry_signal', False),
             analysis_data.get('entry_reason'),
             analysis_data.get('entry_price'),
@@ -258,6 +244,34 @@ class DatabaseManager:
         
         self.conn.commit()
         return analysis_id
+
+    def _convert_numpy_types(self, obj):
+        """Convert numpy and pandas types to native Python types for JSON serialization."""
+        import numpy as np
+        import pandas as pd
+        
+        if isinstance(obj, dict):
+            return {k: self._convert_numpy_types(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._convert_numpy_types(item) for item in obj]
+        elif isinstance(obj, pd.Series):
+            # Convert Series to list of values
+            return obj.tolist()
+        elif isinstance(obj, pd.DataFrame):
+            # Convert DataFrame to dict of lists
+            return obj.to_dict('list')
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif pd.isna(obj):
+            return None
+        else:
+            return obj
         
     def log_trade(self, trade_data: Dict[str, Any]) -> str:
         """

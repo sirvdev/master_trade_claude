@@ -188,8 +188,13 @@ class TradingSystem:
                 self._learning_loop(),
                 self._daily_summary_loop()
             )
+        except asyncio.CancelledError:
+            logger.info("Trading loops cancelled - shutting down")
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received")
         except Exception as e:
             logger.error(f"Error in main loop: {e}", exc_info=True)
+        finally:
             await self.shutdown()
             
     async def _trading_loop(self):
@@ -224,8 +229,15 @@ class TradingSystem:
                     # Run strategy analysis
                     analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
                     
-                    # Log analysis
-                    analysis_id = self.audit_logger.log_analysis(analysis)
+                    # Log analysis - CAPTURE THE ID HERE
+                    try:
+                        analysis_id = self.audit_logger.log_analysis(analysis)
+                        # Add the ID to the analysis dict for later use
+                        analysis['analysis_id'] = analysis_id
+                    except Exception as e:
+                        logger.error(f"Error logging analysis: {e}", exc_info=True)
+                        # Continue even if logging fails
+                        analysis['analysis_id'] = None
                     
                     # Check for entry signal
                     if analysis['entry_signal']:
@@ -252,6 +264,9 @@ class TradingSystem:
     ):
         """Process entry signal and place trade."""
         try:
+            # Get analysis_id from the analysis dict
+            analysis_id = analysis.get('analysis_id', 'unknown')
+            
             # Calculate entry levels
             levels = self.strategy_engine.calculate_entry_levels(analysis, multi_tf_data)
             
@@ -285,7 +300,7 @@ class TradingSystem:
                     order_type='market',
                     stop_loss=levels['stop_loss'],
                     take_profit=levels.get('take_profit_1'),
-                    comment=f"Analysis_{analysis_id[:8]}"
+                    comment=f"Analysis_{analysis_id[:8]}" if analysis_id != 'unknown' else "Python"
                 )
             else:  # binance
                 result = await self.binance_client.place_order(
@@ -304,7 +319,7 @@ class TradingSystem:
                     'symbol': symbol,
                     'platform': platform,
                     'direction': analysis['direction'],
-                    'entry_price': result.get('filled_price') or result.get('price'),
+                    'entry_price': result.get('filled_price') or result.get('price') or levels['entry_price'],
                     'stop_loss': levels['stop_loss'],
                     'take_profit_1': levels.get('take_profit_1'),
                     'take_profit_2': levels.get('take_profit_2'),
@@ -445,26 +460,51 @@ class TradingSystem:
         
     async def shutdown(self):
         """Shutdown trading system gracefully."""
+        if not self.running:
+            return  # Already shut down
+            
         logger.info("=" * 60)
         logger.info("Shutting down Trading System")
         logger.info("=" * 60)
         
         self.running = False
         
+        # Give loops time to finish current iteration
+        await asyncio.sleep(1)
+        
         # Close open positions if emergency shutdown enabled
         if self.config.get('risk_management', {}).get('global_limits', {}).get('emergency_shutdown', {}).get('auto_close_all', False):
             logger.warning("Emergency shutdown - closing all positions")
             for position in self.open_positions.values():
-                # Would close positions here
-                pass
-                
+                try:
+                    if position['platform'] == 'mt5':
+                        await self.mt5_client.close_position(position['ticket'])
+                    else:
+                        await self.binance_client.close_position(position['symbol'])
+                except Exception as e:
+                    logger.error(f"Error closing position: {e}")
+                    
         # Close connections
-        await self.mt5_client.disconnect()
-        await self.binance_client.close()
-        await self.market_client.close_all()
+        try:
+            await self.mt5_client.disconnect()
+        except:
+            pass
+            
+        try:
+            await self.binance_client.close()
+        except:
+            pass
+            
+        try:
+            await self.market_client.close_all()
+        except:
+            pass
         
         # Close database
-        self.db.disconnect()
+        try:
+            self.db.disconnect()
+        except:
+            pass
         
         logger.info("Trading System shutdown complete")
 
@@ -478,20 +518,32 @@ async def main():
     # Initialize system
     system = TradingSystem()
     
-    # Setup signal handlers
-    def signal_handler(sig, frame):
+    # Setup signal handlers for graceful shutdown
+    loop = asyncio.get_event_loop()
+    
+    def handle_shutdown(sig):
         logger.info(f"Received signal {sig}")
-        asyncio.create_task(system.shutdown())
-        
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+        # Cancel all tasks
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+    
+    # Register signal handlers
+    if sys.platform != 'win32':
+        # Unix signals
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda s=sig: handle_shutdown(s))
     
     # Start system
     try:
         await system.start()
     except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received")
-    finally:
+        logger.info("\nKeyboard interrupt - shutting down gracefully...")
+        await system.shutdown()
+    except asyncio.CancelledError:
+        logger.info("Tasks cancelled - shutting down...")
+        await system.shutdown()
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
         await system.shutdown()
 
 
@@ -499,5 +551,8 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nExiting...")
+        print("\nShutdown complete. Goodbye!")
         sys.exit(0)
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        sys.exit(1)

@@ -326,10 +326,18 @@ class MultiMarketClient:
         client = self.get_client(platform)
         return await client.fetch_historical(symbol, timeframe, limit)
         
+    """
+    Fixed MT5DataClient in data_feed/market_client.py
+    Replace the fetch_multiple_timeframes method in MultiMarketClient class
+    """
+
     async def fetch_multiple_timeframes(self, symbol: str, platform: str,
-                                        timeframes: List[str]) -> Dict[str, pd.DataFrame]:
+                                    timeframes: List[str]) -> Dict[str, pd.DataFrame]:
         """
-        Fetch data for multiple timeframes simultaneously.
+        Fetch data for multiple timeframes.
+        
+        For MT5 file bridge, fetches sequentially to avoid file conflicts.
+        For other platforms, fetches in parallel.
         
         Args:
             symbol: Trading symbol
@@ -339,20 +347,34 @@ class MultiMarketClient:
         Returns:
             Dictionary mapping timeframe to DataFrame
         """
-        tasks = [
-            self.fetch_historical(symbol, platform, tf)
-            for tf in timeframes
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
         data = {}
-        for tf, result in zip(timeframes, results):
-            if isinstance(result, Exception):
-                logger.error(f"Error fetching {tf} for {symbol}: {result}")
-                continue
-            data[tf] = result
+        
+        if platform == 'mt5':
+            # Fetch sequentially for MT5 to avoid file conflicts
+            for tf in timeframes:
+                try:
+                    df = await self.fetch_historical(symbol, platform, tf)
+                    data[tf] = df
+                    # Small delay to ensure file operations complete
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error fetching {tf} for {symbol}: {e}")
+                    continue
+        else:
+            # Fetch in parallel for other platforms (Binance, etc)
+            tasks = [
+                self.fetch_historical(symbol, platform, tf)
+                for tf in timeframes
+            ]
             
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for tf, result in zip(timeframes, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error fetching {tf} for {symbol}: {result}")
+                    continue
+                data[tf] = result
+        
         return data
         
     async def subscribe_live(self, symbol: str, platform: str, callback: Callable):

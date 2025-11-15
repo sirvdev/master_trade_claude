@@ -112,7 +112,7 @@ class MT5FileBridge:
             logger.warning("MT5 status file not found - EA may not be running")
             self._connected = False
             
-    async def _send_command(self, command: Dict, timeout: float = 5.0) -> Dict:
+    async def _send_command(self, command: Dict, timeout: float = 10.0) -> Dict:
         """
         Send command to MT5 EA and wait for response.
         
@@ -178,7 +178,7 @@ class MT5FileBridge:
                             return response_data
                             
                     except json.JSONDecodeError as e:
-                        logger.error(f"Invalid JSON response: {e}")
+                        logger.debug(f"Waiting for complete JSON response...")
                         logger.debug(f"Response text: {response_text[:200]}")
                         await asyncio.sleep(0.1)
                         continue
