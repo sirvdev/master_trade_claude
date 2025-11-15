@@ -1,5 +1,5 @@
 """
-MT5 File-based bridge - Works with ALL MT5 versions (no sockets needed).
+MT5 File-based bridge - Fixed encoding issues.
 Communicates via files in MT5 Common Files directory.
 """
 
@@ -76,17 +76,35 @@ class MT5FileBridge:
         # Check if status file exists and is recent
         if self.status_file.exists():
             try:
-                try:
-                    status = self.status_file.read_text(encoding='utf-16')
-                except:
-                    status = self.status_file.read_text(encoding='utf-8')
-                    
-                if 'ready' in status or 'stopped' in status:
-                    logger.info(f"MT5 EA status: {status}")
+                # Try different encodings
+                status = None
+                for encoding in ['utf-8', 'utf-16-le', 'utf-16', 'ansi']:
+                    try:
+                        status = self.status_file.read_text(encoding=encoding)
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                
+                if status is None:
+                    # Try with no encoding specified (binary)
+                    status = self.status_file.read_bytes().decode('utf-8', errors='ignore')
+                
+                # Remove BOM and whitespace
+                status = status.lstrip('\ufeff').strip()
+                
+                logger.info(f"Status file content: '{status}'")
+                
+                if 'ready' in status.lower():
+                    logger.info(f"✓ MT5 EA is ready")
                     self._connected = True
-                else:
-                    logger.warning("MT5 EA may not be running")
+                elif 'stopped' in status.lower():
+                    logger.warning("MT5 EA is stopped")
                     self._connected = False
+                else:
+                    logger.warning(f"Unexpected status: {status}")
+                    # Still try to connect
+                    self._connected = True
+                    
             except Exception as e:
                 logger.error(f"Error reading status file: {e}")
                 self._connected = False
@@ -109,32 +127,59 @@ class MT5FileBridge:
             return await self._simulate_command(command)
             
         try:
-            # Delete old response file
+            # Delete old response file if exists
             if self.response_file.exists():
-                self.response_file.unlink()
+                try:
+                    self.response_file.unlink()
+                except:
+                    pass
                 
-            # Write command file
-            self.command_file.write_text(json.dumps(command))
+            # Write command file as UTF-8 (simple ASCII JSON)
+            command_json = json.dumps(command, ensure_ascii=True)
+            
+            # Write as ANSI/UTF-8 (what MQL5 expects)
+            with open(self.command_file, 'w', encoding='utf-8') as f:
+                f.write(command_json)
+            
             logger.debug(f"Sent command: {command.get('action')}")
             
             # Wait for response with timeout
             start_time = time.time()
+            response_data = None
+            
             while time.time() - start_time < timeout:
                 if self.response_file.exists():
                     # Small delay to ensure file is fully written
                     await asyncio.sleep(0.05)
                     
                     try:
-                        response_text = self.response_file.read_text()
-                        response = json.loads(response_text)
+                        # Try UTF-16 first (MT5 default), then UTF-8
+                        try:
+                            response_text = self.response_file.read_text(encoding='utf-16-le')
+                        except UnicodeDecodeError:
+                            try:
+                                response_text = self.response_file.read_text(encoding='utf-16')
+                            except UnicodeDecodeError:
+                                response_text = self.response_file.read_text(encoding='utf-8')
                         
-                        # Delete response file
-                        self.response_file.unlink()
+                        # Remove BOM if present
+                        response_text = response_text.lstrip('\ufeff').strip()
                         
-                        logger.debug(f"Received response: {response.get('status')}")
-                        return response
+                        if response_text:
+                            response_data = json.loads(response_text)
+                            
+                            # Delete response file after reading
+                            try:
+                                self.response_file.unlink()
+                            except:
+                                pass
+                            
+                            logger.debug(f"Received response: {response_data.get('status')}")
+                            return response_data
+                            
                     except json.JSONDecodeError as e:
                         logger.error(f"Invalid JSON response: {e}")
+                        logger.debug(f"Response text: {response_text[:200]}")
                         await asyncio.sleep(0.1)
                         continue
                     except Exception as e:
@@ -142,9 +187,13 @@ class MT5FileBridge:
                         await asyncio.sleep(0.1)
                         continue
                         
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)  # Check every 50ms
                 
             logger.error(f"Command timeout after {timeout}s")
+            logger.debug(f"Command was: {command}")
+            logger.debug(f"Command file exists: {self.command_file.exists()}")
+            logger.debug(f"Response file exists: {self.response_file.exists()}")
+            
             return {'status': 'error', 'error': 'timeout'}
             
         except Exception as e:
@@ -172,6 +221,12 @@ class MT5FileBridge:
                 'account': 12345678,
                 'balance': 10000.0,
                 'equity': 10000.0,
+                'demo_mode': True
+            }
+        elif action == 'ping':
+            return {
+                'status': 'success',
+                'message': 'pong',
                 'demo_mode': True
             }
         else:
@@ -342,49 +397,3 @@ class MT5FileBridge:
     def is_connected(self) -> bool:
         """Check connection status."""
         return self._connected
-
-
-# Example usage
-if __name__ == "__main__":
-    async def test_file_bridge():
-        """Test file-based bridge."""
-        config = {
-            'magic_number': 123456
-        }
-        
-        bridge = MT5FileBridge(config, demo_mode=True)
-        await bridge.connect()
-        
-        print("=== MT5 File Bridge Test ===\n")
-        
-        # Test order
-        print("1. Placing order...")
-        result = await bridge.place_order(
-            symbol='XAUUSD',
-            direction='long',
-            volume=0.01,
-            stop_loss=2000.0,
-            take_profit=2050.0
-        )
-        print(f"Result: {result}")
-        
-        if result['success']:
-            ticket = result['ticket']
-            
-            # Test modify
-            print(f"\n2. Modifying position {ticket}...")
-            mod_result = await bridge.modify_position(
-                ticket=ticket,
-                stop_loss=2005.0
-            )
-            print(f"Result: {mod_result}")
-            
-            # Test close
-            print(f"\n3. Closing position {ticket}...")
-            close_result = await bridge.close_position(ticket=ticket)
-            print(f"Result: {close_result}")
-            
-        await bridge.disconnect()
-        print("\nTest completed!")
-        
-    asyncio.run(test_file_bridge())

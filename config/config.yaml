@@ -1,0 +1,344 @@
+# Trading System Configuration
+# All parameters can be adjusted via dashboard in real-time
+
+# =============================================================================
+# GENERAL SETTINGS
+# =============================================================================
+general:
+  mode: demo  # demo or live
+  timezone: UTC
+  log_trades: true
+  log_analysis: true
+
+# =============================================================================
+# SYMBOLS & MARKETS
+# =============================================================================
+symbols:
+  XAU/USD:
+    enabled: false
+    platform: mt5
+    mode: demo
+    timeframes: [1H, 15m, 5m]
+    primary_timeframe: 1H
+    entry_timeframe: 5m
+  
+  BTC/USDT:
+    enabled: true
+    platform: binance
+    mode: demo
+    market_type: futures  # spot or futures
+    timeframes: [1H, 15m, 5m]
+    primary_timeframe: 1H
+    entry_timeframe: 5m
+  
+  ETH/USDT:
+    enabled: true
+    platform: binance
+    mode: demo
+    market_type: futures
+    timeframes: [1H, 15m, 5m]
+    primary_timeframe: 1H
+    entry_timeframe: 5m
+
+# =============================================================================
+# TIMEFRAME ANALYSIS
+# =============================================================================
+timeframes:
+  structure_timeframe: 1H  # For market structure (HH/HL/LH/LL)
+  trend_timeframe: 15m     # For trend confirmation
+  entry_timeframe: 5m      # For precise entry timing
+  min_timeframes: 3        # Must analyze at least 3 TFs
+
+# =============================================================================
+# INDICATORS
+# =============================================================================
+indicators:
+  ema:
+    periods: [20, 50, 200]
+    apply_to: close
+  
+  sma:
+    periods: [50, 100, 200]
+    apply_to: close
+  
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+  
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  
+  atr:
+    period: 14
+    use_for_stops: true
+  
+  bollinger_bands:
+    period: 20
+    std_dev: 2
+  
+  supertrend:
+    period: 10
+    multiplier: 3.0
+  
+  parabolic_sar:
+    acceleration: 0.02
+    maximum: 0.2
+  
+  stochastic:
+    k_period: 14
+    d_period: 3
+    smooth_k: 3
+    overbought: 80
+    oversold: 20
+  
+  adx:
+    period: 14
+    trend_strength_min: 25
+  
+  vwap:
+    enabled: true
+  
+  obv:
+    enabled: true
+  
+  fibonacci:
+    auto_detect_swing: true
+    lookback_bars: 50
+
+# =============================================================================
+# STRATEGY & ENTRY LOGIC
+# =============================================================================
+strategy:
+  entry_types:
+    - breakout_retest  # Preferred
+    - pullback_to_sr
+    - momentum_breakout
+  
+  confluence_required: 2  # Min independent signals
+  
+  filters:
+    respect_higher_tf_bias: true  # Only long in bullish 1H, short in bearish
+    allow_override: false
+    
+    # ATR volatility filter
+    min_atr_threshold: 0.0005  # Minimum ATR (avoid too quiet markets)
+    max_atr_threshold: 0.05    # Maximum ATR (avoid extreme volatility)
+    
+    # News/event blackout windows (UTC)
+    news_blackout:
+      enabled: true
+      windows:
+        - {start: "13:30", end: "14:30", days: [1, 2, 3, 4, 5]}  # Major US news
+        - {start: "07:30", end: "08:30", days: [1, 2, 3, 4, 5]}  # European session open
+  
+  candle_patterns:
+    enabled: true
+    patterns: [engulfing, pin_bar, doji, hammer, shooting_star]
+  
+  price_action:
+    detect_structure: true
+    hhhl_for_uptrend: true
+    lhlh_for_downtrend: true
+    structure_break_confirmation: true
+
+# =============================================================================
+# RISK MANAGEMENT
+# =============================================================================
+risk_management:
+  # Position Sizing
+  max_risk_percent_per_trade: 1.0  # % of account equity
+  use_dynamic_sizing: true
+  
+  # Stop Loss
+  stop_loss:
+    method: conservative  # structure, atr, or conservative (picks safer)
+    atr_multiplier: 2.0
+    structure_buffer_pips: 2  # Buffer beyond swing high/low
+    
+  # Take Profit
+  take_profit:
+    targets:
+      - {name: TP1, rr_ratio: 1.5, close_percent: 50}  # Close 50% at 1.5R
+      - {name: TP2, rr_ratio: 3.0, close_percent: 30}  # Close 30% at 3R
+      - {name: TP3, rr_ratio: 999, close_percent: 20}  # Trail remainder
+    
+    dynamic_extension: true  # Extend TP on new structural highs
+  
+  # Trailing Stop
+  trailing_stop:
+    enabled: true
+    activation_rr: 1.0  # Activate trailing at 1:1 R:R
+    method: atr  # atr or percentage
+    atr_multiplier: 1.5
+    percentage: 0.5  # If method is percentage
+    
+    breakeven:
+      enabled: true
+      trigger_rr: 1.0  # Move to BE at 1:1 R:R
+      buffer_pips: 1   # Small buffer above entry
+  
+  # Long Runner Logic
+  long_runner:
+    enabled: true
+    partial_profit_at_pivots: true
+    trail_on_new_highs: true
+    max_trail_distance_atr: 3.0
+  
+  # Global Risk Controls
+  global_limits:
+    daily_max_drawdown_percent: 5.0
+    max_concurrent_trades: 3
+    max_trades_per_day: 10
+    max_risk_per_symbol_percent: 2.0
+    
+    cooldown_after_losses:
+      enabled: true
+      consecutive_losses: 3
+      cooldown_seconds: 3600  # 1 hour
+    
+    emergency_shutdown:
+      enabled: true
+      trigger_drawdown_percent: 10.0
+      auto_close_all: true
+
+# =============================================================================
+# EXECUTION
+# =============================================================================
+execution:
+  slippage_tolerance_percent: 0.1
+  max_order_retry: 3
+  order_timeout_seconds: 30
+  
+  demo_mode:
+    simulate_fills: true
+    realistic_slippage: true
+    latency_ms: 50
+  
+  mt5:
+    magic_number: 123456
+    deviation_points: 10
+    fill_policy: FOK  # FOK or IOC
+  
+  binance:
+    use_websocket: true
+    order_type: LIMIT  # LIMIT or MARKET
+    time_in_force: GTC  # GTC, IOC, FOK
+
+# =============================================================================
+# LEARNING ENGINE
+# =============================================================================
+learning:
+  enabled: true
+  auto_apply: false  # Require manual approval
+  
+  optimization:
+    method: grid_search  # grid_search, random_search, or rl_bandit
+    param_ranges:
+      atr_multiplier: [1.5, 2.0, 2.5, 3.0]
+      rsi_oversold: [25, 30, 35]
+      rsi_overbought: [65, 70, 75]
+      confluence_required: [2, 3]
+    
+    backtest_bars: 1000
+    min_trades_required: 50
+    optimization_metric: expectancy  # expectancy, sharpe, profit_factor
+  
+  metrics:
+    track:
+      - win_rate
+      - avg_rr
+      - expectancy
+      - profit_factor
+      - sharpe_ratio
+      - max_drawdown
+      - avg_trade_duration
+    
+    per_symbol: true
+    per_timeframe: true
+  
+  guardrails:
+    min_sample_size: 50
+    min_expectancy: 0.5
+    max_drawdown_threshold: 20.0
+    require_positive_sharpe: true
+  
+  versioning:
+    enabled: true
+    save_rollback: true
+    max_versions: 10
+
+# =============================================================================
+# BACKTESTING
+# =============================================================================
+backtest:
+  data_source: historical  # historical or csv
+  date_range:
+    start: 2023-01-01
+    end: 2024-01-01
+  
+  simulation:
+    realistic_slippage: true
+    slippage_percent: 0.05
+    commission_percent: 0.1
+    latency_bars: 1  # Delay in bars for execution
+  
+  output:
+    save_trades: true
+    save_equity_curve: true
+    generate_report: true
+
+# =============================================================================
+# LOGGING & AUDIT
+# =============================================================================
+logging:
+  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  
+  database:
+    path: data/trading.db
+    backup_enabled: true
+    backup_frequency_hours: 24
+  
+  log_types:
+    analysis: true
+    trades: true
+    orders: true
+    errors: true
+    api_calls: false  # Set to true for debugging
+  
+  export:
+    auto_export_csv: false
+    export_frequency_hours: 168  # Weekly
+
+# =============================================================================
+# NOTIFICATIONS
+# =============================================================================
+notifications:
+  telegram:
+    enabled: false
+    events:
+      - trade_entry
+      - trade_exit
+      - daily_summary
+      - drawdown_alert
+      - error_critical
+      - system_shutdown
+  
+  email:
+    enabled: false
+  
+  dashboard:
+    refresh_interval_seconds: 5
+
+# =============================================================================
+# DASHBOARD
+# =============================================================================
+dashboard:
+  port: 8501
+  enable_manual_override: true
+  enable_config_edit: true
+  enable_learning_trigger: true
+  show_charts: true
+  chart_bars: 500
