@@ -81,7 +81,7 @@ def main():
         # System status
         st.subheader("System Status")
         status = st.radio("Mode", ["Demo", "Live"], index=0)
-        st.success("✓ System Running" if status else "○ System Stopped")
+        st.success("System Running" if status else "○ System Stopped")
         
         st.markdown("---")
         
@@ -424,7 +424,7 @@ def show_configuration_tab():
         
     # Save button
     if st.button("💾 Save Configuration", type="primary"):
-        st.success("✓ Configuration saved successfully!")
+        st.success("Configuration saved successfully!")
         st.info("Note: Restart system to apply changes")
 
 
@@ -502,7 +502,7 @@ def show_learning_tab(db):
         with st.spinner("Running optimization..."):
             st.info("This would run the learning engine in production")
             # result = learner.run_learning_cycle(...)
-            st.success("✓ Optimization complete!")
+            st.success("Optimization complete!")
             
     st.markdown("---")
     

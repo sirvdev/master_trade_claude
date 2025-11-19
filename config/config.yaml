@@ -5,7 +5,7 @@
 # GENERAL SETTINGS
 # =============================================================================
 general:
-  mode: demo  # demo or live
+  mode: live  # demo or live
   timezone: UTC
   log_trades: true
   log_analysis: true
@@ -15,15 +15,15 @@ general:
 # =============================================================================
 symbols:
   XAU/USD:
-    enabled: false
+    enabled: true
     platform: mt5
-    mode: demo
+    mode: live
     timeframes: [1H, 15m, 5m]
     primary_timeframe: 1H
     entry_timeframe: 5m
 
   BTC/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: demo
     timeframes: [1H, 15m, 5m]

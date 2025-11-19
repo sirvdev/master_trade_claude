@@ -233,7 +233,7 @@ class MT5DataClient(MarketDataClient):
                 'action': 'get_historical',
                 'symbol': symbol.replace('/', ''),  # Remove slash for MT5
                 'timeframe': mt5_timeframe,
-                'count': limit
+                'count': limit + 1 # +1 to account for current forming candle
             }
             
             response = await self.bridge._send_command(command)
@@ -356,7 +356,7 @@ class MultiMarketClient:
                     df = await self.fetch_historical(symbol, platform, tf)
                     data[tf] = df
                     # Small delay to ensure file operations complete
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.error(f"Error fetching {tf} for {symbol}: {e}")
                     continue

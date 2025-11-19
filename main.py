@@ -144,7 +144,7 @@ class TradingSystem:
             'server': os.getenv('MT5_SERVER'),
             'magic_number': 123456
         }
-        self.mt5_client = MT5Bridge(mt5_config, demo_mode=demo_mode)
+        self.mt5_client = MT5Bridge(mt5_config, demo_mode=False)
         
         # Binance
         binance_config = {
@@ -275,15 +275,16 @@ class TradingSystem:
             
             # Calculate position size
             sizing = self.money_manager.validate_trade(
-                account_equity=balance,
-                entry_price=levels['entry_price'],
-                stop_loss=levels['stop_loss'],
-                symbol=symbol,
-                direction=analysis['direction'],
-                current_exposure=self._get_current_exposure(),
-                daily_stats=self.daily_stats,
-                recent_trades=self._get_recent_trades()
-            )
+                    account_equity=balance,
+                    entry_price=levels['entry_price'],
+                    stop_loss=levels['stop_loss'],
+                    symbol=symbol,
+                    direction=analysis['direction'],
+                    platform=symbol_config['platform'],  # <-- ADD THIS LINE
+                    current_exposure=self._get_current_exposure(),
+                    daily_stats=self.daily_stats,
+                    recent_trades=self._get_recent_trades()
+                )
             
             if not sizing['approved']:
                 logger.info(f"Trade rejected: {sizing.get('reason')}")
@@ -338,7 +339,7 @@ class TradingSystem:
                 
                 self.daily_stats['trades_today'] += 1
                 
-                logger.info(f"✓ Trade opened: {symbol} {analysis['direction']}")
+                logger.info(f"Trade opened: {symbol} {analysis['direction']}")
                 
             else:
                 logger.error(f"Order failed: {result.get('error')}")
