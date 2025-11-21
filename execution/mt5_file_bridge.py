@@ -1,6 +1,6 @@
 """
-MT5 File-based bridge with single concatenated response file.
-Replace execution/mt5_file_bridge.py with this entire file.
+MT5 File Bridge - Fixed to get current price and validate stops.
+Implements an execution bridge to MetaTrader 5 using file-based communication.
 """
 
 import asyncio
@@ -17,10 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class MT5FileBridge:
-    """
-    MT5 execution bridge using single-file response system.
-    Each request gets a unique ID, all responses concatenated in one file.
-    """
+    """MT5 execution bridge with current price fetching."""
     
     def __init__(self, config: Dict, demo_mode: bool = True):
         """Initialize MT5 bridge."""
@@ -28,7 +25,7 @@ class MT5FileBridge:
         self.demo_mode = demo_mode
         self.magic_number = config.get('magic_number', 123456)
         
-        # Generate session ID (resets on each program start)
+        # Generate session ID
         self.session_id = str(uuid.uuid4())[:8]
         
         # Find MT5 Common Files directory
@@ -71,7 +68,6 @@ class MT5FileBridge:
             self._connected = True
             return
             
-        # Write session ID so EA knows to reset
         try:
             self.session_file.write_text(self.session_id, encoding='utf-8')
             logger.info(f"Session ID: {self.session_id}")
@@ -85,7 +81,7 @@ class MT5FileBridge:
                 status = status.lstrip('\ufeff').strip()
                 
                 if 'ready' in status.lower():
-                    logger.info(f" MT5 EA is ready")
+                    logger.info(f"MT5 EA is ready")
                     self._connected = True
                 else:
                     logger.warning(f"MT5 EA status: {status}")
@@ -98,25 +94,20 @@ class MT5FileBridge:
             self._connected = False
             
     async def _send_command(self, command: Dict, timeout: float = 0.5) -> Dict:
-        """Send command with unique ID and wait for response."""
+        """Send command and wait for response."""
         if self.demo_mode:
             return await self._simulate_command(command)
         
-        # Generate unique request ID
         self.request_counter += 1
         request_id = f"{self.session_id}_{self.request_counter}"
-        
-        # Add request ID to command
         command['request_id'] = request_id
         
         try:
-            # Write command
             command_json = json.dumps(command, ensure_ascii=True)
             self.command_file.write_text(command_json, encoding='utf-8')
             
             logger.debug(f"Sent command {request_id}: {command.get('action')}")
             
-            # Wait for response in the concatenated file
             start_time = time.time()
             while time.time() - start_time < timeout:
                 response = await self._read_response_for_id(request_id)
@@ -139,7 +130,6 @@ class MT5FileBridge:
             return None
         
         try:
-            # Read file from last position
             with open(self.response_file, 'r', encoding='utf-8', errors='ignore') as f:
                 f.seek(self.last_read_position)
                 new_content = f.read()
@@ -147,7 +137,6 @@ class MT5FileBridge:
                 if not new_content:
                     return None
                 
-                # Split into lines
                 lines = new_content.strip().split('\n')
                 
                 for line in lines:
@@ -157,13 +146,11 @@ class MT5FileBridge:
                     try:
                         response = json.loads(line)
                         if response.get('request_id') == request_id:
-                            # Update read position to end of file
                             self.last_read_position = f.tell()
                             return response
                     except json.JSONDecodeError:
                         continue
                 
-                # Update position even if not found
                 self.last_read_position = f.tell()
                 
         except Exception as e:
@@ -185,18 +172,64 @@ class MT5FileBridge:
                 'volume': command.get('volume'),
                 'demo_mode': True
             }
-        elif action == 'authenticate':
+        elif action == 'get_current_price':
             return {
                 'status': 'success',
-                'account': 12345678,
-                'balance': 10000.0,
-                'equity': 10000.0,
+                'bid': 4084.5,
+                'ask': 4084.7,
                 'demo_mode': True
             }
-        elif action == 'ping':
-            return {'status': 'success', 'message': 'pong', 'demo_mode': True}
+        elif action == 'get_symbol_info':
+            return {
+                'status': 'success',
+                'stops_level': 10.0,
+                'freeze_level': 5.0,
+                'demo_mode': True
+            }
         else:
             return {'status': 'success', 'demo_mode': True}
+    
+    async def get_current_price(self, symbol: str) -> Optional[Dict]:
+        """Get current bid/ask prices."""
+        logger.debug(f"Getting current price for {symbol}")
+        
+        command = {
+            'action': 'get_current_price',
+            'symbol': symbol
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            return {
+                'bid': response.get('bid'),
+                'ask': response.get('ask'),
+                'spread': response.get('ask', 0) - response.get('bid', 0)
+            }
+        else:
+            logger.error(f"Failed to get price: {response.get('error')}")
+            return None
+    
+    async def get_symbol_info(self, symbol: str) -> Optional[Dict]:
+        """Get symbol trading info (stops level, etc)."""
+        command = {
+            'action': 'get_symbol_info',
+            'symbol': symbol
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            return {
+                'stops_level': response.get('stops_level', 0),
+                'freeze_level': response.get('freeze_level', 0),
+                'min_lot': response.get('min_lot', 0.01),
+                'max_lot': response.get('max_lot', 100),
+                'lot_step': response.get('lot_step', 0.01),
+                'point': response.get('point', 0.01)
+            }
+        else:
+            return None
     
     async def place_order(
         self,
@@ -209,11 +242,64 @@ class MT5FileBridge:
         take_profit: Optional[float] = None,
         comment: Optional[str] = None
     ) -> Dict:
-        """Place an order on MT5."""
+        """Place an order with validated stops."""
         logger.info(
             f"Placing MT5 order: {symbol} {direction} {volume} lots, "
             f"SL: {stop_loss}, TP: {take_profit}"
         )
+        
+        # Get current price
+        current_price_data = await self.get_current_price(symbol)
+        if not current_price_data:
+            return {
+                'success': False,
+                'error': 'Could not get current price',
+                'platform': 'mt5'
+            }
+        
+        bid = current_price_data['bid']
+        ask = current_price_data['ask']
+        
+        logger.info(f"Current prices - Bid: {bid}, Ask: {ask}")
+        
+        # Get symbol info for stops validation
+        symbol_info = await self.get_symbol_info(symbol)
+        
+        if symbol_info:
+            stops_level = symbol_info['stops_level']
+            point = symbol_info['point']
+            
+            logger.info(f"Symbol info - Stops level: {stops_level}, Point: {point}")
+            
+            # Validate and adjust stops
+            if direction == 'long':
+                entry_price = ask
+                if stop_loss and (entry_price - stop_loss) < stops_level * point:
+                    old_sl = stop_loss
+                    stop_loss = entry_price - (stops_level * point * 1.5)  # Add 50% buffer
+                    logger.warning(
+                        f"Adjusted SL from {old_sl} to {stop_loss} "
+                        f"(min distance: {stops_level * point})"
+                    )
+                    
+                if take_profit and (take_profit - entry_price) < stops_level * point:
+                    old_tp = take_profit
+                    take_profit = entry_price + (stops_level * point * 1.5)
+                    logger.warning(f"Adjusted TP from {old_tp} to {take_profit}")
+            else:  # short
+                entry_price = bid
+                if stop_loss and (stop_loss - entry_price) < stops_level * point:
+                    old_sl = stop_loss
+                    stop_loss = entry_price + (stops_level * point * 1.5)
+                    logger.warning(
+                        f"Adjusted SL from {old_sl} to {stop_loss} "
+                        f"(min distance: {stops_level * point})"
+                    )
+                    
+                if take_profit and (entry_price - take_profit) < stops_level * point:
+                    old_tp = take_profit
+                    take_profit = entry_price - (stops_level * point * 1.5)
+                    logger.warning(f"Adjusted TP from {old_tp} to {take_profit}")
         
         # Map direction to MT5 order type
         if order_type == 'market':
@@ -232,7 +318,7 @@ class MT5FileBridge:
             'comment': comment or 'Python'
         }
         
-        response = await self._send_command(command)
+        response = await self._send_command(command, timeout=2.0)
         
         if response.get('status') == 'success':
             result = {
@@ -251,10 +337,11 @@ class MT5FileBridge:
             result = {
                 'success': False,
                 'error': response.get('error', 'Unknown error'),
+                'error_code': response.get('code'),
                 'timestamp': datetime.utcnow().isoformat(),
                 'platform': 'mt5'
             }
-            logger.error(f"Order failed: {result['error']}")
+            logger.error(f" Order failed: {result['error']}")
             
         return result
     
@@ -289,7 +376,7 @@ class MT5FileBridge:
         volume: Optional[float] = None,
         comment: Optional[str] = None
     ) -> Dict:
-        """Close position (full or partial)."""
+        """Close position."""
         logger.info(f"Closing position {ticket}")
         
         command = {
@@ -342,8 +429,7 @@ class MT5FileBridge:
             return []
     
     async def disconnect(self):
-        """Close connection and cleanup response file."""
-        # Delete the response file on shutdown
+        """Close connection."""
         try:
             if self.response_file.exists():
                 self.response_file.unlink()

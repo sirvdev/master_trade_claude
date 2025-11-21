@@ -448,7 +448,7 @@ class DataBuffer:
         self.buffers[symbol][timeframe] = df
         self.last_update[f"{symbol}_{timeframe}"] = datetime.utcnow()
         
-    def get_data(self, symbol: str, timeframe: str, bars: int = 100) -> Optional[pd.DataFrame]:
+    def get_data(self, symbol: str, timeframe: str, bars: int = 500) -> Optional[pd.DataFrame]:
         """
         Get data from buffer.
         
@@ -498,7 +498,7 @@ if __name__ == "__main__":
         client = BinanceDataClient(config)
         
         # Fetch historical data
-        df = await client.fetch_historical('BTC/USDT', '1h', limit=100)
+        df = await client.fetch_historical('BTC/USDT', '1h', limit=500)
         print(f"Fetched {len(df)} candles")
         print(df.head())
         print(df.tail())
