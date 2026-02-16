@@ -26,9 +26,9 @@ symbols:
     enabled: true
     platform: mt5
     mode: live
-    timeframes: [4H, 1H, 15m]
-    primary_timeframe: 1H
-    entry_timeframe: 15m
+    timeframes: [1H, 15m, 1m]
+    primary_timeframe: 15m
+    entry_timeframe: 1m
 
   BTC/USDz:
     enabled: false
@@ -122,7 +122,7 @@ indicators:
   
   fibonacci:
     auto_detect_swing: true
-    lookback_bars: 50
+    lookback_bars: 150
 
 # =============================================================================
 # STRATEGY & ENTRY LOGIC
@@ -140,7 +140,7 @@ strategy:
     allow_override: false
     
     # ATR volatility filter
-    min_atr_threshold: 0.0005  # Minimum ATR (avoid too quiet markets)
+    min_atr_threshold: 0.005  # Minimum ATR (avoid too quiet markets)
     max_atr_threshold: 0.05    # Maximum ATR (avoid extreme volatility)
     
     # News/event blackout windows (UTC)
@@ -152,7 +152,7 @@ strategy:
   
   candle_patterns:
     enabled: true
-    patterns: [engulfing, pin_bar, doji, hammer, shooting_star]
+    patterns: [engulfing, pin_bar, doji, hammer, shooting_star, morning_star, evening_star, double_top_bottom, inside_bar]
   
   price_action:
     detect_structure: true
@@ -177,8 +177,8 @@ risk_management:
   # Take Profit
   take_profit:
     targets:
-      - {name: TP1, rr_ratio: 1, close_percent: 50}  # Close 50% at 1.5R
-      - {name: TP2, rr_ratio: 1.5, close_percent: 30}  # Close 30% at 3R
+      - {name: TP1, rr_ratio: 2, close_percent: 50}  # Close 50% at 1.5R
+      - {name: TP2, rr_ratio: 2.5, close_percent: 30}  # Close 30% at 3R
       - {name: TP3, rr_ratio: 999, close_percent: 20}  # Trail remainder
     
     dynamic_extension: true  # Extend TP on new structural highs
@@ -207,7 +207,7 @@ risk_management:
   global_limits:
     daily_max_drawdown_percent: 5.0
     max_concurrent_trades: 3
-    max_trades_per_day: 100
+    max_trades_per_day: 150
     max_risk_per_symbol_percent: 5.0
     
     cooldown_after_losses:
@@ -290,7 +290,6 @@ learning:
 # BACKTESTING
 # =============================================================================
 backtest:
-  lookback_bars: 500
   data_source: historical  # historical or csv
   date_range:
     start: 2023-01-01

@@ -478,7 +478,7 @@ class DataBuffer:
             
         return df.iloc[-1].to_dict()
         
-    def is_stale(self, symbol: str, timeframe: str, max_age_seconds: int = 300) -> bool:
+    def is_stale(self, symbol: str, timeframe: str, max_age_seconds: int = 960) -> bool:
         """Check if data is stale."""
         key = f"{symbol}_{timeframe}"
         if key not in self.last_update:

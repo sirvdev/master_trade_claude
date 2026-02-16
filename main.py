@@ -38,7 +38,75 @@ logger = logging.getLogger(__name__)
 
 
 class TradingSystem:
-    """
+    """TradingSystem Class Documentation
+    A comprehensive trading system orchestrator that manages multi-platform trading operations,
+    including market data fetching, strategy analysis, position management, and risk control.
+    Attributes:
+        config (dict): Configuration dictionary loaded from YAML file with environment overrides
+        db (DatabaseManager): Database connection manager for persistent storage
+        audit_logger (AuditLogger): Logger for trade and analysis audit trails
+        market_client (MultiMarketClient): Client for fetching market data from multiple sources
+        indicators (TechnicalIndicators): Technical analysis indicators calculator
+        strategy_engine (StrategyEngine): Main strategy analysis engine
+        money_manager (MoneyManager): Position sizing and risk validation engine
+        stop_manager (StopManager): Stop loss and take profit management
+        mt5_client (MT5Bridge): MetaTrader 5 execution and data client
+        binance_client (BinanceAPI): Binance exchange execution and data client
+        learner (StrategyLearner): Machine learning engine for strategy optimization
+        running (bool): System execution state flag
+        open_positions (dict): Dictionary of currently open trades tracked by trade_id
+        daily_stats (dict): Daily performance metrics including trade count and drawdown
+    Methods:
+        __init__(config_path: str) -> None:
+            Initialize trading system with configuration and all components.
+        _apply_env_overrides() -> None:
+            Apply environment variable overrides to configuration settings.
+        _init_database() -> None:
+            Initialize database connection and audit logging.
+        _init_market_clients() -> None:
+            Initialize multi-market data clients (Binance, MT5).
+        _init_strategy_components() -> None:
+            Initialize technical indicators, strategy engine, money manager, and stop manager.
+        _init_execution_clients() -> None:
+            Initialize order execution clients for both MT5 and Binance platforms.
+        _init_learning_engine() -> None:
+            Initialize machine learning engine if enabled in configuration.
+        start() -> Coroutine:
+            Main entry point - starts all async trading loops concurrently.
+        _load_open_positions_from_db() -> Coroutine:
+            Load positions from database on startup and verify with brokers.
+        _trading_loop() -> Coroutine:
+            Main trading loop that analyzes symbols and processes entry signals.
+            Enforces position limits before entry validation.
+        _process_entry_signal(symbol: str, symbol_config: dict, analysis: dict, 
+                             multi_tf_data: dict) -> Coroutine:
+            Process entry signal with final validation, order placement, and position tracking.
+        _position_monitor_loop() -> Coroutine:
+            Monitor open positions with batched API calls for efficiency.
+        _batch_update_mt5_positions(positions: dict) -> Coroutine:
+            Update all MT5 positions in a single API call.
+        _batch_update_binance_positions(positions: dict) -> Coroutine:
+            Update all Binance positions in a single API call.
+        _update_trailing_stop_if_needed(trade_id: str, position: dict, 
+                                       current_price: float) -> Coroutine:
+            Update trailing stop loss for a position if conditions are met.
+        _handle_external_close(trade_id: str, position: dict) -> Coroutine:
+            Handle positions closed outside the system and update database.
+        _update_position(trade_id: str, position: dict) -> Coroutine:
+            Update a single position's current status and market data.
+        _learning_loop() -> Coroutine:
+            Run strategy learning engine periodically on configured schedule.
+        _daily_summary_loop() -> Coroutine:
+            Generate daily performance summary and reset daily statistics.
+        _get_total_balance() -> Coroutine[float]:
+            Get total account balance across all connected platforms.
+        _get_current_exposure() -> dict:
+            Get current exposure summary including open position count and symbol breakdown.
+        _get_recent_trades(n: int = 10) -> list[dict]:
+            Get N most recent closed trades from database.
+        shutdown() -> Coroutine:
+            Gracefully shutdown system, close positions, and disconnect clients.
+    
     Main trading system orchestrator.
     """
     
@@ -73,6 +141,7 @@ class TradingSystem:
         # State
         self.running = False
         self.open_positions = {}
+        self.current_equity = 0.0
         self.daily_stats = {
             'trades_today': 0,
             'daily_drawdown_percent': 0,
@@ -82,6 +151,13 @@ class TradingSystem:
         logger.info("Trading System initialized successfully")
         
     def _apply_env_overrides(self):
+        """
+        Apply environment variable overrides to the configuration.
+        Reads environment variables and updates the config dictionary with their values:
+        - ENVIRONMENT: Sets the general mode (defaults to 'demo' if not set)
+        - DATABASE_PATH: Sets the database path if provided
+        Environment variables take precedence over existing config values.
+        """
         """Apply environment variable overrides to config."""
         env_mode = os.getenv('ENVIRONMENT', 'demo')
         if env_mode:
@@ -164,7 +240,123 @@ class TradingSystem:
         else:
             self.learner = None
             logger.info("Learning engine disabled")
+
+    async def _balance_monitor_loop(self):
+        """Monitor account balance and update equity."""
+        logger.info("Balance monitor loop started")
+        
+        while self.running:
+            try:
+                # Update equity every 30 seconds
+                await asyncio.sleep(30)
+                
+                current_equity = await self._get_total_balance()
+                
+                # Calculate drawdown
+                if self.daily_stats['starting_balance'] > 0:
+                    drawdown = (
+                        (self.daily_stats['starting_balance'] - current_equity) / 
+                        self.daily_stats['starting_balance'] * 100
+                    )
+                    self.daily_stats['daily_drawdown_percent'] = drawdown
+                    
+                    # Check drawdown limits
+                    max_dd = self.config.get('risk_management', {}).get(
+                        'global_limits', {}
+                    ).get('daily_max_drawdown_percent', 5.0)
+                    
+                    if drawdown >= max_dd:
+                        logger.error(
+                            f"DRAWDOWN LIMIT HIT: {drawdown:.2f}% >= {max_dd}%"
+                        )
+                        
+                        # Check if emergency shutdown enabled
+                        emergency_config = self.config.get('risk_management', {}).get(
+                            'global_limits', {}
+                        ).get('emergency_shutdown', {})
+                        
+                        if emergency_config.get('enabled', True):
+                            logger.error("EMERGENCY SHUTDOWN TRIGGERED!")
+                            self.audit_logger.log_risk_event({
+                                'event_type': 'emergency_shutdown',
+                                'drawdown_percent': drawdown,
+                                'max_allowed': max_dd,
+                                'message': 'Emergency shutdown triggered by drawdown limit'
+                            })
+                            
+                            # Stop trading
+                            self.running = False
+                            
+                            # Close all positions if configured
+                            if emergency_config.get('auto_close_all', True):
+                                await self._emergency_close_all()
+                    
+            except Exception as e:
+                logger.error(f"Error in balance monitor: {e}", exc_info=True)
+                await asyncio.sleep(30)
+
+    async def _get_total_balance(self) -> float:
+        """Get total account balance across all platforms."""
+        total_equity = 0.0
+        
+        try:
+            # Get MT5 balance
+            if self.mt5_client and self.mt5_client.is_connected():
+                mt5_balance = await self.mt5_client.get_balance()
+                if mt5_balance.get('success'):
+                    total_equity += mt5_balance.get('equity', 0.0)
+                    logger.info(f"MT5 Equity: ${mt5_balance.get('equity', 0):.2f}")
             
+            # Get Binance balance
+            if self.binance_client and self.binance_client.is_connected():
+                try:
+                    binance_balance = await self.binance_client.get_balance()
+                    # Binance returns different format
+                    total_equity += binance_balance.get('total_usd', 0.0)
+                    logger.info(f"Binance Equity: ${binance_balance.get('total_usd', 0):.2f}")
+                except Exception as e:
+                    logger.warning(f"Could not get Binance balance: {e}")
+            
+            # Update equity variable
+            self.current_equity = total_equity
+            
+            logger.info(f"Total Equity: ${total_equity:.2f}")
+            return total_equity
+            
+        except Exception as e:
+            logger.error(f"Error getting total balance: {e}")
+            # Return last known equity or default
+            return self.current_equity if self.current_equity > 0 else 10000.0
+
+    async def _emergency_close_all(self):
+        """Emergency close all positions."""
+        logger.warning("EMERGENCY: Closing all positions!")
+        
+        for trade_id, position in list(self.open_positions.items()):
+            try:
+                platform = position['platform']
+                symbol = position['symbol']
+                ticket = position.get('ticket')
+                
+                if platform == 'mt5' and ticket:
+                    result = await self.mt5_client.close_position(ticket)
+                    logger.info(f"Emergency closed MT5 position {ticket}: {result}")
+                elif platform == 'binance':
+                    result = await self.binance_client.close_position(symbol)
+                    logger.info(f"Emergency closed Binance position {symbol}: {result}")
+                
+                # Log the closure
+                self.audit_logger.log_trade_exit(trade_id, {
+                    'exit_price': 0,  # Will be filled from actual result
+                    'reason': 'emergency_shutdown',
+                    'pnl': 0,
+                    'pnl_percent': 0,
+                    'realized_rr': 0
+                })
+                
+            except Exception as e:
+                logger.error(f"Error closing position {trade_id}: {e}")
+
     async def start(self):
         """Start the trading system."""
         logger.info("=" * 60)
@@ -187,6 +379,7 @@ class TradingSystem:
             await asyncio.gather(
                 self._trading_loop(),
                 self._position_monitor_loop(),
+                self._balance_monitor_loop(),
                 self._learning_loop(),
                 self._daily_summary_loop()
             )
@@ -263,7 +456,7 @@ class TradingSystem:
                         f"Skipping analysis - at max positions "
                         f"({current_positions}/{max_concurrent})"
                     )
-                    await asyncio.sleep(300)
+                    await asyncio.sleep(960)
                     continue
                 
                 # Get enabled symbols
@@ -341,11 +534,11 @@ class TradingSystem:
                         continue
                 
                 # Wait before next iteration
-                await asyncio.sleep(300)
+                await asyncio.sleep(960)
                 
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
-                await asyncio.sleep(300)
+                await asyncio.sleep(960)
                 
     async def _process_entry_signal(self, symbol: str, symbol_config: dict,
                                 analysis: dict, multi_tf_data: dict):

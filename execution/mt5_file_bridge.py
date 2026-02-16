@@ -39,7 +39,6 @@ class MT5FileBridge:
         
         self._connected = False
         self.request_counter = 0
-        self.last_read_position = 0
         
         # Demo mode state
         self.demo_orders = {}
@@ -130,29 +129,20 @@ class MT5FileBridge:
             return None
         
         try:
+            # Simply read the entire file and look for our request_id
             with open(self.response_file, 'r', encoding='utf-8', errors='ignore') as f:
-                f.seek(self.last_read_position)
-                new_content = f.read()
-                
-                if not new_content:
-                    return None
-                
-                lines = new_content.strip().split('\n')
-                
-                for line in lines:
-                    if not line.strip():
+                for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
                     
                     try:
                         response = json.loads(line)
                         if response.get('request_id') == request_id:
-                            self.last_read_position = f.tell()
                             return response
                     except json.JSONDecodeError:
                         continue
-                
-                self.last_read_position = f.tell()
-                
+        
         except Exception as e:
             logger.debug(f"Error reading response file: {e}")
         
@@ -230,6 +220,65 @@ class MT5FileBridge:
             }
         else:
             return None
+    async def get_balance(self) -> Dict:
+        """
+        Get account balance and equity.
+        
+        Returns:
+            Dictionary with balance, equity, margin info
+        """
+        if self.demo_mode:
+            return {
+                'success': True,
+                'account': 12345678,
+                'balance': 10000.0,
+                'equity': 10000.0,
+                'margin': 0.0,
+                'free_margin': 10000.0,
+                'margin_level': 0.0,
+                'profit': 0.0,
+                'currency': 'USD',
+                'account_type': 'Demo',
+                'leverage': 100,
+                'demo_mode': True
+            }
+        
+        logger.info("Getting account balance...")
+        
+        command = {
+            'action': 'get_balance'
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            result = {
+                'success': True,
+                'account': response.get('account'),
+                'balance': response.get('balance'),
+                'equity': response.get('equity'),
+                'margin': response.get('margin'),
+                'free_margin': response.get('free_margin'),
+                'margin_level': response.get('margin_level'),
+                'profit': response.get('profit'),
+                'currency': response.get('currency'),
+                'account_type': response.get('account_type'),
+                'leverage': response.get('leverage')
+            }
+            
+            logger.info(
+                f"Account Balance: ${result['balance']:.2f}, "
+                f"Equity: ${result['equity']:.2f}, "
+                f"Profit: ${result['profit']:.2f}"
+            )
+            
+            return result
+        else:
+            logger.error(f"Failed to get balance: {response.get('error')}")
+            return {
+                'success': False,
+                'error': response.get('error', 'Unknown error')
+            }
     
     async def place_order(
         self,
