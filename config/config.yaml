@@ -14,18 +14,26 @@ general:
 # SYMBOLS & MARKETS
 # =============================================================================
 symbols:
-  XAU/USD:
+  XAU/USDz:
     enabled: true
     platform: mt5
     mode: live
-    timeframes: [1H, 15m, 5m]
+    timeframes: [4H, 1H, 15m]
     primary_timeframe: 1H
-    entry_timeframe: 5m
+    entry_timeframe: 15m
+  
+  XAG/USDz:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes: [4H, 1H, 15m]
+    primary_timeframe: 1H
+    entry_timeframe: 15m
 
-  BTC/USD:
+  BTC/USDz:
     enabled: false
     platform: mt5
-    mode: demo
+    mode: live
     timeframes: [1H, 15m, 5m]
     primary_timeframe: 1H
     entry_timeframe: 5m
@@ -35,9 +43,9 @@ symbols:
     platform: binance
     mode: demo
     market_type: futures  # spot or futures
-    timeframes: [1H, 15m, 5m]
+    timeframes: [4H, 15m, 5m]
     primary_timeframe: 1H
-    entry_timeframe: 5m
+    entry_timeframe: 15m
   
   ETH/USDT:
     enabled: false
@@ -52,9 +60,9 @@ symbols:
 # TIMEFRAME ANALYSIS
 # =============================================================================
 timeframes:
-  structure_timeframe: 1H  # For market structure (HH/HL/LH/LL)
-  trend_timeframe: 15m     # For trend confirmation
-  entry_timeframe: 5m      # For precise entry timing
+  structure_timeframe: 4H  # For market structure (HH/HL/LH/LL)
+  trend_timeframe: 1H     # For trend confirmation
+  entry_timeframe: 15m      # For precise entry timing
   min_timeframes: 3        # Must analyze at least 3 TFs
 
 # =============================================================================
@@ -157,7 +165,7 @@ strategy:
 # =============================================================================
 risk_management:
   # Position Sizing
-  max_risk_percent_per_trade: 1.0  # % of account equity
+  max_risk_percent_per_trade: 5.0  # % of account equity
   use_dynamic_sizing: true
   
   # Stop Loss
@@ -199,8 +207,8 @@ risk_management:
   global_limits:
     daily_max_drawdown_percent: 5.0
     max_concurrent_trades: 3
-    max_trades_per_day: 10
-    max_risk_per_symbol_percent: 2.0
+    max_trades_per_day: 100
+    max_risk_per_symbol_percent: 5.0
     
     cooldown_after_losses:
       enabled: true
@@ -302,7 +310,7 @@ backtest:
 # LOGGING & AUDIT
 # =============================================================================
 logging:
-  level: INFO  # DEBUG, INFO, WARNING, ERROR
+  level: DEBUG  # DEBUG, INFO, WARNING, ERROR
   
   database:
     path: data/trading.db

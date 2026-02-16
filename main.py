@@ -7,7 +7,7 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 import yaml
 from dotenv import load_dotenv
@@ -179,6 +179,8 @@ class TradingSystem:
         
         # Get starting balance
         self.daily_stats['starting_balance'] = await self._get_total_balance()
+
+        await self._load_open_positions_from_db()
         
         # Start main trading loop
         try:
@@ -196,13 +198,74 @@ class TradingSystem:
             logger.error(f"Error in main loop: {e}", exc_info=True)
         finally:
             await self.shutdown()
+    
+    async def _load_open_positions_from_db(self):
+        """Load open positions from database on startup."""
+        try:
+            open_trades = self.db.get_open_trades()
+            
+            logger.info(f"Loading {len(open_trades)} open positions from database")
+            
+            for trade in open_trades:
+                trade_id = trade['trade_id']
+                
+                # Verify position still exists on broker
+                platform = trade['platform']
+                ticket = trade.get('ticket')
+                
+                if platform == 'mt5' and ticket:
+                    pos_info = await self.mt5_client.get_position_info(ticket)
+                    if not pos_info:
+                        logger.warning(f"Position {trade_id} not found on MT5, marking closed")
+                        self.db.update_trade(trade_id, {
+                            'status': 'closed',
+                            'exit_reason': 'not_found_on_broker',
+                            'exit_time': datetime.utcnow()
+                        })
+                        continue
+                
+                # Add to tracking
+                self.open_positions[trade_id] = {
+                    'trade_id': trade_id,
+                    'symbol': trade['symbol'],
+                    'platform': trade['platform'],
+                    'direction': trade['direction'],
+                    'entry_price': trade['entry_price'],
+                    'stop_loss': trade['stop_loss'],
+                    'take_profit_1': trade.get('take_profit_1'),
+                    'take_profit_2': trade.get('take_profit_2'),
+                    'position_size': trade['position_size'],
+                    'ticket': ticket,
+                    'entry_time': trade['entry_time'],
+                    'analysis_id': trade.get('analysis_id')
+                }
+            
+            logger.info(f" Loaded {len(self.open_positions)} active positions")
+            
+        except Exception as e:
+            logger.error(f"Error loading open positions: {e}", exc_info=True)
+
             
     async def _trading_loop(self):
-        """Main trading loop - analyzes markets and places trades."""
+        """Main trading loop - WITH POSITION COUNT CHECK."""
         logger.info("Trading loop started")
         
         while self.running:
             try:
+                # ✅ CHECK: Verify we haven't exceeded limits BEFORE analyzing
+                current_positions = len(self.open_positions)
+                max_concurrent = self.config.get('risk_management', {}).get(
+                    'global_limits', {}
+                ).get('max_concurrent_trades', 3)
+                
+                if current_positions >= max_concurrent:
+                    logger.debug(
+                        f"Skipping analysis - at max positions "
+                        f"({current_positions}/{max_concurrent})"
+                    )
+                    await asyncio.sleep(300)
+                    continue
+                
                 # Get enabled symbols
                 symbols_config = self.config.get('symbols', {})
                 enabled_symbols = [
@@ -212,6 +275,24 @@ class TradingSystem:
                 ]
                 
                 for symbol, symbol_config in enabled_symbols:
+                    # ✅ DOUBLE CHECK before each symbol
+                    if len(self.open_positions) >= max_concurrent:
+                        logger.info(
+                            f"Reached max positions ({max_concurrent}), "
+                            f"stopping new entries this cycle"
+                        )
+                        break
+                    
+                    # ✅ CHECK: Don't analyze if already have position in this symbol
+                    symbol_has_position = any(
+                        pos['symbol'] == symbol 
+                        for pos in self.open_positions.values()
+                    )
+                    
+                    if symbol_has_position:
+                        logger.debug(f"Skipping {symbol} - already have open position")
+                        continue
+                    
                     platform = symbol_config['platform']
                     timeframes = symbol_config['timeframes']
                     
@@ -225,142 +306,374 @@ class TradingSystem:
                     if not multi_tf_data:
                         logger.warning(f"No data fetched for {symbol}")
                         continue
-                        
+                    
                     # Run strategy analysis
-                    analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
-                    
-                    # Log analysis - CAPTURE THE ID HERE
                     try:
-                        analysis_id = self.audit_logger.log_analysis(analysis)
-                        # Add the ID to the analysis dict for later use
-                        analysis['analysis_id'] = analysis_id
-                    except Exception as e:
-                        logger.error(f"Error logging analysis: {e}", exc_info=True)
-                        # Continue even if logging fails
-                        analysis['analysis_id'] = None
-                    
-                    # Check for entry signal
-                    if analysis['entry_signal']:
-                        await self._process_entry_signal(
-                            symbol,
-                            symbol_config,
-                            analysis,
-                            multi_tf_data
-                        )
+                        analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
                         
+                        # Log analysis
+                        try:
+                            analysis_id = self.audit_logger.log_analysis(analysis)
+                            analysis['analysis_id'] = analysis_id
+                        except Exception as e:
+                            logger.error(f"Error logging analysis: {e}", exc_info=True)
+                            analysis['analysis_id'] = None
+                        
+                        # ✅ FINAL CHECK before processing entry
+                        if analysis['entry_signal']:
+                            current_count = len(self.open_positions)
+                            if current_count >= max_concurrent:
+                                logger.warning(
+                                    f"Signal detected but max positions reached "
+                                    f"({current_count}/{max_concurrent}), skipping"
+                                )
+                                continue
+                            
+                            await self._process_entry_signal(
+                                symbol,
+                                symbol_config,
+                                analysis,
+                                multi_tf_data
+                            )
+                        
+                    except Exception as e:
+                        logger.error(f"Error in strategy analysis: {e}", exc_info=True)
+                        continue
+                
                 # Wait before next iteration
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(300)
                 
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
-                await asyncio.sleep(60)
+                await asyncio.sleep(300)
                 
-    async def _process_entry_signal(
-        self,
-        symbol: str,
-        symbol_config: dict,
-        analysis: dict,
-        multi_tf_data: dict
-    ):
-        """Process entry signal and place trade."""
+    async def _process_entry_signal(self, symbol: str, symbol_config: dict,
+                                analysis: dict, multi_tf_data: dict):
+        """Process entry signal - FINAL VALIDATION BEFORE ORDER."""
         try:
-            # Get analysis_id from the analysis dict
             analysis_id = analysis.get('analysis_id', 'unknown')
+            platform = symbol_config['platform']
             
-            # Calculate entry levels
-            levels = self.strategy_engine.calculate_entry_levels(analysis, multi_tf_data)
+            # ✅ ABSOLUTE FINAL CHECK (defensive programming)
+            max_concurrent = self.config.get('risk_management', {}).get(
+                'global_limits', {}
+            ).get('max_concurrent_trades', 3)
             
-            # Get current balance
+            current_count = len(self.open_positions)
+            
+            if current_count >= max_concurrent:
+                logger.error(
+                    f"CRITICAL: Attempted to place order with {current_count} positions "
+                    f"(max: {max_concurrent}). This should never happen!"
+                )
+                return
+            
+            # Get current price from broker
+            if platform == 'mt5':
+                price_data = await self.mt5_client.get_current_price(symbol.replace('/', ''))
+                if not price_data:
+                    logger.error("Could not get current price from MT5")
+                    return
+                
+                if analysis['direction'] == 'long':
+                    current_price = price_data['ask']
+                else:
+                    current_price = price_data['bid']
+                
+                logger.info(f"Current price from MT5: {current_price:.4f}")
+            else:
+                ticker = await self.binance_client.get_ticker(symbol)
+                current_price = ticker['last']
+                logger.info(f"Current price from Binance: {current_price:.4f}")
+            
+            # Calculate stops with current price
+            entry_tf = symbol_config['timeframes'][-1]
+            df = multi_tf_data[entry_tf]
+            
+            from indicators.indicators import TechnicalIndicators
+            indicators = TechnicalIndicators()
+            atr_result = indicators.calculate_atr(df)
+            atr = atr_result['current']
+            
+            atr_multiplier = self.config.get('risk_management', {}).get(
+                'stop_loss', {}
+            ).get('atr_multiplier', 2.0)
+            
+            if analysis['direction'] == 'long':
+                stop_loss = current_price - (atr * atr_multiplier)
+                risk = current_price - stop_loss
+                take_profit_1 = current_price + (risk * 1.5)
+                take_profit_2 = current_price + (risk * 3.0)
+            else:
+                stop_loss = current_price + (atr * atr_multiplier)
+                risk = stop_loss - current_price
+                take_profit_1 = current_price - (risk * 1.5)
+                take_profit_2 = current_price - (risk * 3.0)
+            
+            # Get balance
             balance = await self._get_total_balance()
             
-            # Calculate position size
+            # ✅ Validate trade with current exposure
             sizing = self.money_manager.validate_trade(
-                    account_equity=balance,
-                    entry_price=levels['entry_price'],
-                    stop_loss=levels['stop_loss'],
-                    symbol=symbol,
-                    direction=analysis['direction'],
-                    platform=symbol_config['platform'],  # <-- ADD THIS LINE
-                    current_exposure=self._get_current_exposure(),
-                    daily_stats=self.daily_stats,
-                    recent_trades=self._get_recent_trades()
-                )
+                account_equity=balance,
+                entry_price=current_price,
+                stop_loss=stop_loss,
+                symbol=symbol,
+                direction=analysis['direction'],
+                platform=platform,
+                current_exposure=self._get_current_exposure(),  # Gets actual count
+                daily_stats=self.daily_stats,
+                recent_trades=self._get_recent_trades()
+            )
             
             if not sizing['approved']:
                 logger.info(f"Trade rejected: {sizing.get('reason')}")
                 return
-                
-            # Place order
-            platform = symbol_config['platform']
             
+            # Place order
             if platform == 'mt5':
                 result = await self.mt5_client.place_order(
                     symbol=symbol.replace('/', ''),
                     direction=analysis['direction'],
                     volume=sizing['position_size'],
                     order_type='market',
-                    stop_loss=levels['stop_loss'],
-                    take_profit=levels.get('take_profit_1'),
+                    price=None,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit_1,
                     comment=f"Analysis_{analysis_id[:8]}" if analysis_id != 'unknown' else "Python"
                 )
-            else:  # binance
+            else:
                 result = await self.binance_client.place_order(
                     symbol=symbol,
                     direction=analysis['direction'],
                     amount=sizing['position_size'],
                     order_type='market',
-                    stop_loss=levels['stop_loss'],
-                    take_profit=levels.get('take_profit_1')
+                    stop_loss=stop_loss,
+                    take_profit=take_profit_1
                 )
-                
+            
             if result['success']:
-                # Log trade
+                executed_price = result.get('filled_price') or result.get('price') or current_price
+                ticket = result.get('ticket') or result.get('order_id')
+                
                 trade_data = {
                     'analysis_id': analysis_id,
                     'symbol': symbol,
                     'platform': platform,
                     'direction': analysis['direction'],
-                    'entry_price': result.get('filled_price') or result.get('price') or levels['entry_price'],
-                    'stop_loss': levels['stop_loss'],
-                    'take_profit_1': levels.get('take_profit_1'),
-                    'take_profit_2': levels.get('take_profit_2'),
+                    'entry_price': executed_price,
+                    'stop_loss': stop_loss,
+                    'take_profit_1': take_profit_1,
+                    'take_profit_2': take_profit_2,
                     'position_size': sizing['position_size']
                 }
                 
+                # Log to database
                 trade_id = self.audit_logger.log_trade_entry(trade_data)
                 
-                # Store in open positions
+                # Update with ticket
+                self.db.update_trade(trade_id, {
+                    # 'ticket': ticket,
+                    'status': 'open'
+                })
+                
+                # Add to tracking
                 self.open_positions[trade_id] = {
                     **trade_data,
                     'trade_id': trade_id,
-                    'ticket': result.get('ticket') or result.get('order_id'),
+                    'ticket': ticket,
                     'entry_time': datetime.utcnow()
                 }
                 
                 self.daily_stats['trades_today'] += 1
                 
-                logger.info(f"Trade opened: {symbol} {analysis['direction']}")
-                
+                logger.info(
+                    f" Trade #{len(self.open_positions)}: {symbol} {analysis['direction']} "
+                    f"@ {executed_price:.4f}, Ticket: {ticket}"
+                )
             else:
-                logger.error(f"Order failed: {result.get('error')}")
-                
+                logger.error(f" Order failed: {result.get('error')}")
+        
         except Exception as e:
             logger.error(f"Error processing entry signal: {e}", exc_info=True)
             
     async def _position_monitor_loop(self):
-        """Monitor open positions and manage exits."""
-        logger.info("Position monitor loop started")
+        """Monitor open positions - BATCHED VERSION."""
+        logger.info("Position monitor loop started (batched)")
         
         while self.running:
             try:
+                if len(self.open_positions) == 0:
+                    # No positions to monitor, wait longer
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Group positions by platform for batch checking
+                mt5_positions = {}
+                binance_positions = {}
+                
                 for trade_id, position in list(self.open_positions.items()):
-                    await self._update_position(trade_id, position)
-                    
-                await asyncio.sleep(10)  # Check every 10 seconds
+                    if position['platform'] == 'mt5':
+                        mt5_positions[trade_id] = position
+                    else:
+                        binance_positions[trade_id] = position
+                
+                # Batch check MT5 positions (single API call)
+                if mt5_positions:
+                    await self._batch_update_mt5_positions(mt5_positions)
+                
+                # Batch check Binance positions (single API call)
+                if binance_positions:
+                    await self._batch_update_binance_positions(binance_positions)
+                
+                # Wait before next check
+                await asyncio.sleep(10)
                 
             except Exception as e:
                 logger.error(f"Error in position monitor: {e}", exc_info=True)
                 await asyncio.sleep(10)
+
+    async def _batch_update_mt5_positions(self, positions: dict):
+        """Update all MT5 positions in one call."""
+        try:
+            # Get ALL positions from MT5 in single call
+            all_mt5_positions = await self.mt5_client.get_all_positions()
+            
+            # Create lookup by ticket
+            mt5_by_ticket = {
+                pos['ticket']: pos 
+                for pos in all_mt5_positions
+            }
+            
+            # Update each tracked position
+            for trade_id, position in list(positions.items()):
+                ticket = position.get('ticket')
+                
+                # Check if position still exists
+                if ticket not in mt5_by_ticket:
+                    # Position was closed externally
+                    logger.warning(f"Position {trade_id} closed externally")
+                    await self._handle_external_close(trade_id, position)
+                    continue
+                
+                # Get current position data
+                current = mt5_by_ticket[ticket]
+                current_price = current.get('price', 0)
+                
+                # Check for stop loss hit (simplified check)
+                # In production, MT5 handles SL/TP automatically
+                # This is just for our tracking
+                
+                # Update trailing stop if needed
+                await self._update_trailing_stop_if_needed(
+                    trade_id, 
+                    position, 
+                    current_price
+                )
+                
+        except Exception as e:
+            logger.error(f"Error batch updating MT5 positions: {e}", exc_info=True)
+
+
+    async def _batch_update_binance_positions(self, positions: dict):
+        """Update all Binance positions in one call."""
+        try:
+            # Get all positions from Binance
+            all_binance_positions = await self.binance_client.get_all_positions()
+            
+            # Create lookup by symbol
+            binance_by_symbol = {
+                pos['symbol']: pos
+                for pos in all_binance_positions
+            }
+            
+            for trade_id, position in list(positions.items()):
+                symbol = position['symbol']
+                
+                if symbol not in binance_by_symbol:
+                    logger.warning(f"Position {trade_id} not found on Binance")
+                    await self._handle_external_close(trade_id, position)
+                    continue
+                
+                current = binance_by_symbol[symbol]
+                # Update trailing stops etc.
+                
+        except Exception as e:
+            logger.error(f"Error batch updating Binance positions: {e}", exc_info=True)
+
+
+    async def _update_trailing_stop_if_needed(
+        self, 
+        trade_id: str, 
+        position: dict, 
+        current_price: float
+    ):
+        """Update trailing stop for a single position (only if needed)."""
+        try:
+            # Only update if position has been running for a while
+            # and price has moved favorably
+            
+            direction = position['direction']
+            entry_price = position['entry_price']
+            current_sl = position['stop_loss']
+            
+            # Calculate current R:R
+            risk = abs(entry_price - current_sl)
+            if direction == 'long':
+                current_rr = (current_price - entry_price) / risk if risk > 0 else 0
+            else:
+                current_rr = (entry_price - current_price) / risk if risk > 0 else 0
+            
+            # Only trail if RR >= 1.0 (configurable)
+            trail_activation = 1.0
+            if current_rr < trail_activation:
+                return
+            
+            # Calculate new trailing stop
+            # This would use stop_manager logic
+            # For now, simplified version
+            
+            # Only update if significantly moved (reduce API calls)
+            # Update at most every 180 seconds per position
+            last_update = position.get('last_sl_update', 0)
+            if time.time() - last_update < 180:
+                return
+            
+            # # Would call MT5 modify_position here if needed
+            # position['last_sl_update'] = time.time()
+            
+        except Exception as e:
+            logger.error(f"Error updating trailing stop for {trade_id}: {e}")
+
+
+    async def _handle_external_close(self, trade_id: str, position: dict):
+        """Handle position closed outside our system."""
+        try:
+            logger.info(f"Recording external close for {trade_id}")
+
+            # Update database
+            self.db.update_trade(trade_id, {
+            'status': 'closed',
+            'exit_time': datetime.utcnow(),
+            'exit_reason': 'external_close',
+            'exit_price': 0  # Unknown
+        })
+            
+            # Log the close
+            self.audit_logger.log_trade_exit(trade_id, {
+                'exit_price': 0,  # Unknown
+                'reason': 'external_close',
+                'pnl': 0,  # Would need to calculate
+                'pnl_percent': 0,
+                'realized_rr': 0
+            })
+            
+            # Remove from tracking
+            if trade_id in self.open_positions:
+                del self.open_positions[trade_id]
+            
+        except Exception as e:
+            logger.error(f"Error handling external close: {e}")
                 
     async def _update_position(self, trade_id: str, position: dict):
         """Update single position."""
@@ -449,11 +762,15 @@ class TradingSystem:
             if symbol not in symbols:
                 symbols[symbol] = {'risk_percent': 0, 'count': 0}
             symbols[symbol]['count'] += 1
-            
-        return {
-            'open_count': len(self.open_positions),
+
+        exposure = {
+            'open_count': len(self.open_positions),  # Actual count
             'symbols': symbols
         }
+
+        logger.debug(f"Current exposure: {exposure['open_count']} positions")
+            
+        return exposure
         
     def _get_recent_trades(self, n: int = 10) -> list[dict]:
         """Get recent closed trades."""

@@ -237,11 +237,15 @@ class MT5DataClient(MarketDataClient):
             }
             
             response = await self.bridge._send_command(command)
+
+            # print(response)
             
             if response.get('status') != 'success':
                 raise ValueError(f"Failed to fetch data: {response.get('error')}")
                 
             bars = response.get('data', [])
+
+            # print(bars)
             
             if not bars:
                 raise ValueError("No data returned")

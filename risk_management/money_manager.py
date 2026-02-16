@@ -233,14 +233,28 @@ class MoneyManager:
         symbol: str,
         current_exposure: Optional[Dict]
     ) -> float:
-        """Apply global risk limits."""
-        # Max concurrent trades
+        """Apply global risk limits - FIXED VERSION."""
+        
+        # Check max concurrent trades FIRST
         max_concurrent = self.global_limits.get('max_concurrent_trades', 3)
         if current_exposure:
             open_count = current_exposure.get('open_count', 0)
             if open_count >= max_concurrent:
-                logger.warning(f"Max concurrent trades reached ({max_concurrent})")
-                return 0
+                logger.warning(
+                    f"REJECTED: Max concurrent trades limit reached "
+                    f"({open_count}/{max_concurrent})"
+                )
+                return 0  # Return 0 to reject trade
+        
+        # Check max trades per day
+        max_trades_day = self.global_limits.get('max_trades_per_day', 10)
+        # This would need daily_stats passed in - skip for now or add parameter
+        
+        # Check max risk per symbol
+        max_symbol_risk = self.global_limits.get('max_risk_per_symbol_percent', 2.0)
+        if current_exposure and symbol in current_exposure.get('symbols', {}):
+            symbol_exposure = current_exposure['symbols'][symbol]
+            # Could add risk calculation here
         
         return position_size
     
@@ -262,19 +276,21 @@ class MoneyManager:
         stop_loss: float,
         symbol: str,
         direction: str,
-        platform: str = 'binance',  # ADD THIS
+        platform: str = 'binance',
         current_exposure: Optional[Dict] = None,
         daily_stats: Optional[Dict] = None,
         recent_trades: Optional[list] = None
     ) -> Dict:
-        """Complete trade validation with platform awareness."""
-        # Check daily limits
+        """Complete trade validation - FIXED VERSION."""
+        
+        # Check daily limits FIRST (before calculating position size)
         if daily_stats:
             limit_check = self.check_daily_limits(daily_stats)
             if not limit_check['limits_ok']:
                 logger.warning(f"Trade rejected: {limit_check['reasons']}")
                 return {
                     'approved': False,
+                    'position_size': 0,
                     'reason': '; '.join(limit_check['reasons']),
                     'limit_check': limit_check
                 }
@@ -286,24 +302,42 @@ class MoneyManager:
                 logger.warning(f"Trade rejected: Cooldown active")
                 return {
                     'approved': False,
+                    'position_size': 0,
                     'reason': f"Cooldown active: {cooldown['reason']}",
                     'cooldown': cooldown
                 }
         
-        # Calculate position size with platform parameter
+        # Check max concurrent BEFORE calculating size
+        max_concurrent = self.global_limits.get('max_concurrent_trades', 3)
+        if current_exposure:
+            open_count = current_exposure.get('open_count', 0)
+            if open_count >= max_concurrent:
+                logger.warning(
+                    f"REJECTED: Max concurrent trades ({open_count}/{max_concurrent})"
+                )
+                return {
+                    'approved': False,
+                    'position_size': 0,
+                    'reason': f'Max concurrent trades limit ({max_concurrent})',
+                    'open_positions': open_count
+                }
+        
+        # Now calculate position size
         sizing = self.calculate_position_size(
             account_equity,
             entry_price,
             stop_loss,
             symbol,
             direction,
-            platform,  # PASS PLATFORM HERE
+            platform,
             current_exposure
         )
         
-        if sizing['position_size'] == 0:
+        # Final check: if position size is 0, reject
+        if sizing['position_size'] == 0 or sizing['position_size'] < 0.01:
             sizing['approved'] = False
-            sizing['reason'] = 'Position size calculated as zero'
+            if 'reason' not in sizing:
+                sizing['reason'] = 'Position size too small or zero'
         
         return sizing
     
