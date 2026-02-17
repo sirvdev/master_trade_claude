@@ -1,0 +1,109 @@
+# Example config.yaml for Backtester
+
+backtest:
+  # Uniform lookback bars for ALL timeframes
+  # This single value applies to 1H, 15m, and 1m equally
+  lookback_bars: 500
+  
+  # Timeframe configuration
+  timeframes:
+    entry_timeframe: '15m'    # Iterate by this timeframe
+    minimum_timeframe: '1m'   # Use for granular SL/TP detection
+  
+  # Simulation parameters
+  simulation:
+    slippage_percent: 0.05     # 0.05% slippage on fills
+    commission_percent: 0.1    # 0.1% commission per trade
+    latency_bars: 1            # 1 bar delay for order execution
+
+# Strategy configuration
+strategy:
+  entry_types:
+    - breakout_retest
+    - pullback_to_sr
+  
+  confluence_required: 2       # Minimum signals needed
+  
+  filters:
+    time_filter:
+      enabled: true
+      allowed_hours:
+        start: 8
+        end: 20
+
+# Timeframes for analysis
+timeframes:
+  structure_timeframe: '1h'    # Higher timeframe for bias
+  entry_timeframe: '15m'       # Entry timeframe
+  
+# Risk management
+risk_management:
+  max_risk_percent_per_trade: 1.0
+  
+  stop_loss:
+    method: 'conservative'      # conservative, balanced, aggressive
+    atr_multiplier: 2.0
+  
+  take_profit:
+    method: 'scaled'
+    tp1_rr: 2.0
+    tp1_close_percent: 50
+    tp2_rr: 3.0
+  
+  trailing_stop:
+    enabled: true
+    activation_rr: 1.0
+    trail_by_atr: true
+    atr_distance: 1.5
+  
+  global_limits:
+    max_concurrent_trades: 3
+    max_daily_trades: 100
+    max_daily_loss_percent: 3.0
+
+# Indicators
+indicators:
+  ema:
+    periods: [9, 20, 50, 200]
+  
+  rsi:
+    period: 14
+    overbought: 70
+    oversold: 30
+  
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+  
+  atr:
+    period: 14
+  
+  bollinger:
+    period: 20
+    std: 2.0
+  
+  supertrend:
+    period: 10
+    multiplier: 3.0
+  
+  adx:
+    period: 14
+    threshold: 25
+
+# Data requirements for backtesting
+# 
+# To backtest 1 month with lookback_bars=500:
+#
+# For 1H timeframe:
+#   - Need 500 hours before test period
+#   - 500 hours = ~21 days
+#   - So provide data from 21 days before test start
+#
+# For 1m base data:
+#   - 500 hours = 30,000 minutes
+#   - Plus test period (e.g., 1 month = 43,200 minutes)
+#   - Total needed: ~73,200 1m bars (minimum 2 months)
+#
+# Example:
+#   Test January 2024 → Provide data from Dec 10, 2023 onwards

@@ -1,6 +1,10 @@
 """
 Backtesting engine for strategy validation.
-Loads real market data from CSV and resamples to configured timeframes.
+Implements walking-forward simulation with:
+- Uniform lookback bars across all timeframes
+- Iteration by entry timeframe
+- 1m granularity for SL/TP execution
+- Time-aligned multi-timeframe windows
 """
 
 import logging
@@ -9,7 +13,6 @@ from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-import copy
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -52,9 +55,13 @@ class Backtester:
         self.config = config.get('backtest', {})
         self.simulation_config = self.config.get('simulation', {})
         
+        # Simulation parameters
         self.slippage_percent = self.simulation_config.get('slippage_percent', 0.05)
         self.commission_percent = self.simulation_config.get('commission_percent', 0.1)
         self.latency_bars = self.simulation_config.get('latency_bars', 1)
+        
+        # Lookback configuration (uniform across all timeframes)
+        self.lookback_bars = self.config.get('lookback_bars', 500)
         
         # State
         self.trades: List[BacktestTrade] = []
@@ -181,14 +188,14 @@ class Backtester:
         self,
         csv_path: str,
         timeframes: List[str],
-        base_timeframe: str = '5m'
+        base_timeframe: str = '1m'
     ) -> Dict[str, pd.DataFrame]:
         """
         Load base data and create all required timeframes.
         
         Args:
             csv_path: Path to CSV file with base timeframe data
-            timeframes: List of timeframes to create (e.g., ['1h', '15m', '5m'])
+            timeframes: List of timeframes to create (e.g., ['1h', '15m', '1m'])
             base_timeframe: Timeframe of the CSV data
             
         Returns:
@@ -200,6 +207,33 @@ class Backtester:
         
         # Load base data
         base_df = self.load_data_from_csv(csv_path, base_timeframe)
+        
+        # Verify we have enough data for lookback
+        # Calculate minimum base bars needed
+        tf_multipliers = {
+            '1m': 1,
+            '5m': 5,
+            '15m': 15,
+            '30m': 30,
+            '1h': 60,
+            '4h': 240,
+            '1d': 1440
+        }
+        
+        # Find highest timeframe to determine minimum data needed
+        max_multiplier = max(tf_multipliers.get(tf.lower(), 1) for tf in timeframes)
+        min_base_bars_needed = self.lookback_bars * max_multiplier
+        
+        if len(base_df) < min_base_bars_needed:
+            raise ValueError(
+                f"Insufficient base data: have {len(base_df)} {base_timeframe} bars, "
+                f"need {min_base_bars_needed} for {self.lookback_bars} bars of highest timeframe"
+            )
+        
+        logger.info(
+            f"Base data sufficient: {len(base_df)} bars "
+            f"(need {min_base_bars_needed} for {self.lookback_bars}-bar lookback)"
+        )
         
         # Create dictionary for all timeframes
         multi_tf_data = {}
@@ -213,17 +247,11 @@ class Backtester:
                 # Resample to target timeframe
                 multi_tf_data[tf] = self.resample_to_timeframe(base_df, tf)
         
-        multi_tf_data_500 = {
-            key: df.tail(700)
-            for key, df in multi_tf_data.items()
-        }
-        # print(multi_tf_data_500.items())
-        
         logger.info("=" * 60)
         logger.info("Multi-Timeframe Data Ready")
         logger.info("=" * 60)
         
-        return multi_tf_data_500
+        return multi_tf_data
         
     def run(
         self,
@@ -251,6 +279,7 @@ class Backtester:
         logger.info("=" * 60)
         logger.info(f"Starting Backtest: {symbol}")
         logger.info(f"Initial Balance: ${initial_balance:,.2f}")
+        logger.info(f"Lookback Bars: {self.lookback_bars}")
         logger.info("=" * 60)
         
         self.balance = initial_balance
@@ -258,53 +287,98 @@ class Backtester:
         self.trades = []
         self.open_trades = {}
         
-        # Get entry timeframe data for iteration
-        entry_tf = '1m'  # From config - could be made configurable
-        if entry_tf not in multi_tf_data:
-            # Try to find lowest timeframe
-            available_tfs = list(multi_tf_data.keys())
-            if not available_tfs:
-                raise ValueError("No timeframe data available")
-            entry_tf = available_tfs[0]
-            logger.warning(f"5m not available, using {entry_tf} for iteration")
-            
-        entry_data = multi_tf_data[entry_tf]
-        total_bars = len(entry_data)
+        # Get timeframe configuration
+        timeframe_config = self.config.get('timeframes', {})
+        entry_tf = timeframe_config.get('entry_timeframe', '15m')
+        min_tf = timeframe_config.get('minimum_timeframe', '1m')
         
-        logger.info(f"Processing {total_bars} bars on {entry_tf} timeframe")
-        logger.info(f"Period: {entry_data.index[0]} to {entry_data.index[-1]}")
+        # Verify required timeframes exist
+        if entry_tf not in multi_tf_data:
+            raise ValueError(f"Entry timeframe {entry_tf} not in data")
+        if min_tf not in multi_tf_data:
+            raise ValueError(f"Minimum timeframe {min_tf} not in data")
+        
+        # Get iteration data (entry timeframe)
+        entry_data = multi_tf_data[entry_tf]
+        min_data = multi_tf_data[min_tf]
+        
+        # Calculate bars ratio (how many min_tf bars per entry_tf bar)
+        # E.g., 15m / 1m = 15 bars
+        tf_multipliers = {
+            '1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1d': 1440
+        }
+        bars_per_iteration = tf_multipliers[entry_tf.lower()] // tf_multipliers[min_tf.lower()]
+        
+        logger.info(f"Iteration timeframe: {entry_tf}")
+        logger.info(f"Minimum timeframe: {min_tf} ({bars_per_iteration} bars per iteration)")
+        logger.info(f"Total {entry_tf} bars to process: {len(entry_data)}")
+        
+        # Start after we have enough data for lookback
+        start_idx = self.lookback_bars
+        total_iterations = len(entry_data) - start_idx
+        
+        logger.info(f"Starting at bar {start_idx} (after {self.lookback_bars}-bar lookback)")
+        logger.info(f"Total iterations: {total_iterations}\n")
         
         # Iterate through bars
-        warmup_bars = 100
-        logger.info(f"Using {warmup_bars} bars for warmup\n")
-        
-        for i in range(warmup_bars, total_bars):
-            current_bar = entry_data.iloc[i]
-            current_time = current_bar.name
-            current_price = current_bar['close']
+        for i in range(start_idx, len(entry_data)):
+            current_entry_bar = entry_data.iloc[i]
+            current_time = current_entry_bar.name
+            current_price = current_entry_bar['close']
             
-            # Get multi-timeframe snapshot (data up to current point)
+            # Calculate corresponding indices in other timeframes
+            # Find the index in each timeframe that matches current_time
+            tf_indices = {}
+            for tf, df in multi_tf_data.items():
+                # Find index where timestamp <= current_time
+                matching_idx = df.index.get_indexer([current_time], method='ffill')[0]
+                if matching_idx >= 0:
+                    tf_indices[tf] = matching_idx
+            
+            # Build multi-timeframe snapshot with exactly lookback_bars for each
             tf_snapshot = {}
             for tf, df in multi_tf_data.items():
-                # Find the matching timestamp in this timeframe
-                # Get all bars up to current time
-                snapshot = df[df.index <= current_time]
-                if len(snapshot) > 0:
-                    tf_snapshot[tf] = snapshot.tail(200)  # Last 200 bars
+                if tf not in tf_indices:
+                    continue
+                    
+                current_idx = tf_indices[tf]
                 
-            # Update existing positions
-            self._update_open_positions(
-                current_time,
-                current_bar,
-                stop_manager,
-                tf_snapshot
-            )
+                # Get exactly lookback_bars ending at current index
+                start = max(0, current_idx - self.lookback_bars + 1)
+                end = current_idx + 1
+                
+                snapshot = df.iloc[start:end]
+                
+                # Ensure we have exactly lookback_bars (or close to it at start)
+                if len(snapshot) >= min(self.lookback_bars // 2, 50):  # At least half or 50 bars
+                    tf_snapshot[tf] = snapshot
+            
+            # Verify all timeframes are time-aligned
+            if len(tf_snapshot) > 0:
+                timestamps = [df.index[-1] for df in tf_snapshot.values()]
+                if not all(t == timestamps[0] for t in timestamps):
+                    logger.warning(f"Timeframes not aligned at {current_time}")
+                    continue
+            
+            # Update existing positions using 1m bars for granular exit detection
+            min_tf_idx = tf_indices.get(min_tf)
+            if min_tf_idx is not None:
+                # Get the min_tf bars that make up this entry_tf period
+                min_bars_in_period = min_data.iloc[
+                    max(0, min_tf_idx - bars_per_iteration + 1):min_tf_idx + 1
+                ]
+                
+                self._update_open_positions_granular(
+                    current_time,
+                    min_bars_in_period,
+                    stop_manager
+                )
             
             # Skip if too many open positions
             max_concurrent = 3  # From config
             if len(self.open_trades) >= max_concurrent:
                 continue
-                
+            
             # Run strategy analysis
             try:
                 analysis = strategy_engine.analyze_market(symbol, tf_snapshot)
@@ -324,7 +398,7 @@ class Backtester:
                     
                     if sizing['approved'] and sizing['position_size'] > 0:
                         # Simulate order fill with latency and slippage
-                        fill_bar_idx = min(i + self.latency_bars, total_bars - 1)
+                        fill_bar_idx = min(i + self.latency_bars, len(entry_data) - 1)
                         fill_bar = entry_data.iloc[fill_bar_idx]
                         
                         fill_result = self._simulate_fill(
@@ -338,7 +412,7 @@ class Backtester:
                             trade_id=f"bt_{i}_{symbol}",
                             symbol=symbol,
                             direction=analysis['direction'],
-                            entry_time=current_time,
+                            entry_time=fill_bar.name,
                             entry_price=fill_result['price'],
                             stop_loss=levels['stop_loss'],
                             take_profit_1=levels.get('take_profit_1'),
@@ -352,15 +426,16 @@ class Backtester:
                         commission = sizing['position_value'] * (self.commission_percent / 100)
                         self.balance -= commission
                         
-                        logger.debug(
-                            f"Entry: {trade.direction} {symbol} @ {trade.entry_price:.2f}, "
-                            f"SL: {trade.stop_loss:.2f}, Size: {trade.position_size:.4f}"
+                        logger.info(
+                            f"[{trade.entry_time}] Entry: {trade.direction.upper()} {symbol} @ "
+                            f"{trade.entry_price:.2f}, SL: {trade.stop_loss:.2f}, "
+                            f"Size: {trade.position_size:.4f}"
                         )
                         
             except Exception as e:
                 logger.error(f"Error in strategy analysis at bar {i}: {e}")
                 continue
-                
+            
             # Update equity curve
             unrealized_pnl = sum(
                 self._calculate_unrealized_pnl(trade, current_price)
@@ -369,17 +444,17 @@ class Backtester:
             self.equity_curve.append(self.balance + unrealized_pnl)
             
             # Progress update
-            if i % 100 == 0:
-                progress = (i / total_bars) * 100
+            if (i - start_idx) % 100 == 0:
+                progress = ((i - start_idx) / total_iterations) * 100
                 logger.info(
-                    f"Progress: {progress:.1f}% - "
+                    f"Progress: {progress:.1f}% [{i-start_idx}/{total_iterations}] - "
                     f"Balance: ${self.balance:,.2f}, "
                     f"Open: {len(self.open_trades)}, "
                     f"Closed: {len(self.trades)}"
                 )
-                
+        
         # Close any remaining open positions
-        logger.info("Closing remaining open positions...")
+        logger.info("\nClosing remaining open positions...")
         for trade in list(self.open_trades.values()):
             final_bar = entry_data.iloc[-1]
             self._close_trade(
@@ -388,7 +463,7 @@ class Backtester:
                 final_bar['close'],
                 'end_of_backtest'
             )
-            
+        
         # Generate results
         results = self._generate_results(symbol, initial_balance)
         
@@ -402,97 +477,78 @@ class Backtester:
         logger.info("=" * 60)
         
         return results
-        
-    def _update_open_positions(
+    
+    def _update_open_positions_granular(
         self,
         current_time: datetime,
-        current_bar: pd.Series,
-        stop_manager,
-        tf_snapshot: Dict
+        min_bars: pd.DataFrame,
+        stop_manager
     ):
-        """Update open positions and check for exits."""
-        current_price = current_bar['close']
-        high = current_bar['high']
-        low = current_bar['low']
+        """
+        Update open positions using 1m bars for granular exit detection.
+        
+        Args:
+            current_time: Current timestamp
+            min_bars: DataFrame of minimum timeframe bars in this period
+            stop_manager: Stop manager instance
+        """
+        if len(min_bars) == 0:
+            return
         
         for trade_id, trade in list(self.open_trades.items()):
-            # Check stop loss hit
-            sl_hit = False
-            if trade.direction == 'long':
-                if low <= trade.stop_loss:
-                    sl_hit = True
-                    exit_price = min(trade.stop_loss, current_bar['open'])
-            else:
-                if high >= trade.stop_loss:
-                    sl_hit = True
-                    exit_price = max(trade.stop_loss, current_bar['open'])
-                    
-            if sl_hit:
-                self._close_trade(trade, current_time, exit_price, 'stop_loss')
-                continue
+            # Check each 1m bar in sequence for exits
+            for idx, bar in min_bars.iterrows():
+                bar_time = idx
                 
-            # Check take profit
-            tp_hit = False
-            if trade.take_profit_1:
+                # Check stop loss first (priority)
+                sl_hit = False
+                exit_price = None
+                
                 if trade.direction == 'long':
-                    if high >= trade.take_profit_1:
-                        tp_hit = True
-                        exit_price = trade.take_profit_1
+                    if bar['low'] <= trade.stop_loss:
+                        sl_hit = True
+                        # Exit at stop or open if gap down
+                        exit_price = min(trade.stop_loss, bar['open'])
+                else:  # short
+                    if bar['high'] >= trade.stop_loss:
+                        sl_hit = True
+                        # Exit at stop or open if gap up
+                        exit_price = max(trade.stop_loss, bar['open'])
+                
+                if sl_hit:
+                    self._close_trade(trade, bar_time, exit_price, 'stop_loss')
+                    break  # Move to next trade
+                
+                # Check take profit (only if SL not hit)
+                tp_hit = False
+                
+                if trade.take_profit_1:
+                    if trade.direction == 'long':
+                        if bar['high'] >= trade.take_profit_1:
+                            tp_hit = True
+                            exit_price = trade.take_profit_1
+                    else:  # short
+                        if bar['low'] <= trade.take_profit_1:
+                            tp_hit = True
+                            exit_price = trade.take_profit_1
+                
+                if tp_hit:
+                    self._close_trade(trade, bar_time, exit_price, 'take_profit')
+                    break  # Move to next trade
+                
+                # Update max favorable/adverse excursion
+                if trade.direction == 'long':
+                    excursion = bar['high'] - trade.entry_price
+                    adverse = bar['low'] - trade.entry_price
                 else:
-                    if low <= trade.take_profit_1:
-                        tp_hit = True
-                        exit_price = trade.take_profit_1
-                        
-            if tp_hit:
-                self._close_trade(trade, current_time, exit_price, 'take_profit')
-                continue
+                    excursion = trade.entry_price - bar['low']
+                    adverse = trade.entry_price - bar['high']
                 
-            # Update trailing stop if enabled
-            if hasattr(stop_manager, 'update_trailing_stop'):
-                # Get ATR from current data
-                entry_tf = '5m'
-                if entry_tf in tf_snapshot:
-                    from indicators.indicators import TechnicalIndicators
-                    indicators = TechnicalIndicators()
-                    atr_result = indicators.calculate_atr(tf_snapshot[entry_tf])
-                    current_atr = atr_result['current']
-                    
-                    # Track high/low since entry
-                    if not hasattr(trade, 'high_since_entry'):
-                        trade.high_since_entry = trade.entry_price
-                        trade.low_since_entry = trade.entry_price
-                        
-                    trade.high_since_entry = max(trade.high_since_entry, high)
-                    trade.low_since_entry = min(trade.low_since_entry, low)
-                    
-                    # Update trailing stop
-                    update = stop_manager.update_trailing_stop(
-                        trade={
-                            'entry_price': trade.entry_price,
-                            'stop_loss': trade.stop_loss,
-                            'direction': trade.direction,
-                            'position_size': trade.position_size
-                        },
-                        current_price=current_price,
-                        atr=current_atr,
-                        high_since_entry=trade.high_since_entry,
-                        low_since_entry=trade.low_since_entry
-                    )
-                    
-                    if update.get('update_required'):
-                        trade.stop_loss = update['new_stop_loss']
-                        
-            # Track max favorable/adverse excursion
-            if trade.direction == 'long':
-                excursion = current_price - trade.entry_price
-            else:
-                excursion = trade.entry_price - current_price
-                
-            if excursion > 0:
-                trade.max_favorable = max(trade.max_favorable, excursion)
-            else:
-                trade.max_adverse = min(trade.max_adverse, excursion)
-                
+                if excursion > 0:
+                    trade.max_favorable = max(trade.max_favorable, excursion)
+                if adverse < 0:
+                    trade.max_adverse = min(trade.max_adverse, adverse)
+    
     def _simulate_fill(
         self,
         bar: pd.Series,
@@ -508,7 +564,7 @@ class Backtester:
             fill_price = target_price * (1 + abs(slippage))
         else:
             fill_price = target_price * (1 - abs(slippage))
-            
+        
         # Ensure fill price is within bar range
         fill_price = max(bar['low'], min(bar['high'], fill_price))
         
@@ -517,7 +573,7 @@ class Backtester:
             'slippage': slippage,
             'filled': True
         }
-        
+    
     def _close_trade(
         self,
         trade: BacktestTrade,
@@ -535,7 +591,7 @@ class Backtester:
             pnl = (exit_price - trade.entry_price) * trade.position_size
         else:
             pnl = (trade.entry_price - exit_price) * trade.position_size
-            
+        
         # Deduct commission
         position_value = exit_price * trade.position_size
         commission = position_value * (self.commission_percent / 100)
@@ -554,18 +610,18 @@ class Backtester:
         self.trades.append(trade)
         del self.open_trades[trade.trade_id]
         
-        logger.debug(
-            f"Exit: {trade.symbol} @ {exit_price:.2f} ({reason}), "
+        logger.info(
+            f"[{exit_time}] Exit: {trade.symbol} @ {exit_price:.2f} ({reason}), "
             f"P&L: ${pnl:.2f}, R:R: {trade.realized_rr:.2f}"
         )
-        
+    
     def _calculate_unrealized_pnl(self, trade: BacktestTrade, current_price: float) -> float:
         """Calculate unrealized P&L for open trade."""
         if trade.direction == 'long':
             return (current_price - trade.entry_price) * trade.position_size
         else:
             return (trade.entry_price - current_price) * trade.position_size
-            
+    
     def _generate_results(self, symbol: str, initial_balance: float) -> Dict:
         """Generate backtest results."""
         trade_dicts = [
@@ -596,12 +652,13 @@ class Backtester:
             'trades': trade_dicts,
             'equity_curve': self.equity_curve,
             'configuration': {
+                'lookback_bars': self.lookback_bars,
                 'slippage_percent': self.slippage_percent,
                 'commission_percent': self.commission_percent,
                 'initial_balance': initial_balance
             }
         }
-        
+    
     def export_trades(self, filepath: str):
         """Export trades to CSV."""
         df = pd.DataFrame([
@@ -622,7 +679,7 @@ class Backtester:
         ])
         df.to_csv(filepath, index=False)
         logger.info(f"Exported {len(self.trades)} trades to {filepath}")
-        
+    
     def plot_equity_curve(self, filepath: Optional[str] = None):
         """Plot equity curve (requires matplotlib)."""
         try:
@@ -640,60 +697,33 @@ class Backtester:
                 logger.info(f"Saved equity curve to {filepath}")
             else:
                 plt.show()
-                
+        
         except ImportError:
             logger.warning("Matplotlib not available for plotting")
 
 
-# Example usage
+# Test harness
 if __name__ == "__main__":
+    import sys
     from strategy.engine import StrategyEngine
     from risk_management.money_manager import MoneyManager
     from risk_management.stop_manager import StopManager
     from indicators.indicators import TechnicalIndicators
     
-    print("=== Backtester Test ===\n")
+    print("=" * 70)
+    print(" BACKTESTER - Correct Implementation")
+    print("=" * 70)
     
-    # Example CSV path (update with your actual path)
-    csv_path = "data/XAU_USD_1m.csv"
+    # Check for CSV file
+    csv_path = "data/XAUUSD_1m.csv"
     
-    # Check if file exists
     if not Path(csv_path).exists():
-        print(f"ERROR: CSV file not found: {csv_path}")
-        print("\nPlease create a CSV file with the following format:")
-        print("timestamp,open,high,low,close,volume")
-        print("2024-01-01 00:00:00,2000.50,2001.00,2000.00,2000.75,1234")
-        print("2024-01-01 00:01:00,2000.75,2001.50,2000.50,2001.00,1567")
-        print("...")
-        print("\nAlternatively, generate sample data:")
-        
-        # Generate sample data for testing
-        print("\nGenerating sample data...")
-        dates = pd.date_range(start='2024-01-01', periods=10000, freq='1min')
-        np.random.seed(42)
-        
-        # Create realistic price movement
-        price = 2000
-        prices = [price]
-        for _ in range(9999):
-            change = np.random.normal(0, 0.5)
-            price = max(price + change, 1000)
-            prices.append(price)
-        
-        sample_df = pd.DataFrame({
-            'timestamp': dates,
-            'open': prices,
-            'high': [p * 1.001 for p in prices],
-            'low': [p * 0.999 for p in prices],
-            'close': [p + np.random.uniform(-0.5, 0.5) for p in prices],
-            'volume': np.random.randint(100, 1000, 10000)
-        })
-        
-        Path('data').mkdir(exist_ok=True)
-        sample_df.to_csv(csv_path, index=False)
-        print(f"Sample data saved to {csv_path}")
+        print(f"\nERROR: CSV file not found: {csv_path}")
+        print("\nPlease provide a CSV file with at least 2 months of 1m data")
+        print("Format: timestamp,open,high,low,close,volume")
+        sys.exit(1)
     
-    # Initialize components
+    # Configuration
     config = {
         'indicators': TechnicalIndicators._default_config(),
         'strategy': {
@@ -702,40 +732,45 @@ if __name__ == "__main__":
         },
         'timeframes': {
             'structure_timeframe': '1h',
-            'trend_timeframe': '15m',
-            'entry_timeframe': '1m'
+            'entry_timeframe': '15m',
+            'minimum_timeframe': '1m'
         },
         'risk_management': {
             'max_risk_percent_per_trade': 1.0,
             'global_limits': {'max_concurrent_trades': 3}
         },
         'backtest': {
+            'lookback_bars': 500,  # Single value for all timeframes
+            'timeframes': {
+                'entry_timeframe': '15m',
+                'minimum_timeframe': '1m'
+            },
             'simulation': {
                 'slippage_percent': 0.05,
-                'commission_percent': 0.1
+                'commission_percent': 0.1,
+                'latency_bars': 1
             }
         }
     }
     
+    # Initialize components
     strategy_engine = StrategyEngine(config)
     money_manager = MoneyManager(config)
     stop_manager = StopManager(config)
     backtester = Backtester(config)
     
-    # Prepare multi-timeframe data from CSV
-    print("\n" + "=" * 60)
-    print("Loading and preparing data...")
-    print("=" * 60)
-    
-    timeframes = ['1h', '15m', '1m']  # Timeframes to use
+    # Prepare data
+    print("\nLoading and preparing data...")
+    timeframes = ['1h', '15m', '1m']
     
     multi_tf_data = backtester.prepare_multi_timeframe_data(
         csv_path=csv_path,
         timeframes=timeframes,
-        base_timeframe='1m'  # The timeframe of the CSV file
+        base_timeframe='1m'
     )
     
     # Run backtest
+    print("\nRunning backtest...")
     results = backtester.run(
         strategy_engine,
         money_manager,
@@ -745,18 +780,20 @@ if __name__ == "__main__":
         initial_balance=10000
     )
     
-    print(f"\n=== Backtest Results ===")
-    print(f"Total Trades: {results['total_trades']}")
-    print(f"Win Rate: {results['win_rate']:.2%}")
-    print(f"Total P&L: ${results['total_pnl']:.2f}")
-    print(f"Return: {results['return_percent']:.2f}%")
-    print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
-    print(f"Max Drawdown: {results['max_drawdown']:.2f}%")
-    print(f"Profit Factor: {results['profit_factor']:.2f}")
+    # Display results
+    print(f"\n{'='*70}")
+    print(" RESULTS")
+    print(f"{'='*70}")
+    print(f"Total Trades:        {results['total_trades']}")
+    print(f"Win Rate:            {results['win_rate']:.2%}")
+    print(f"Total P&L:           ${results['total_pnl']:,.2f}")
+    print(f"Return:              {results['return_percent']:.2f}%")
+    print(f"Profit Factor:       {results['profit_factor']:.2f}")
+    print(f"Max Drawdown:        {results['max_drawdown']:.2f}%")
+    print(f"Sharpe Ratio:        {results['sharpe_ratio']:.2f}")
+    print(f"{'='*70}")
     
-    # Export results
+    # Export
     if results['total_trades'] > 0:
         backtester.export_trades('data/backtest_trades.csv')
-        print("\nTrades exported to data/backtest_trades.csv")
-    
-    print("\nBacktester test completed!")
+        print("\n✓ Trades exported to data/backtest_trades.csv")
