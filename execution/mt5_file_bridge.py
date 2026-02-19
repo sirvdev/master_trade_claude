@@ -488,6 +488,18 @@ class MT5FileBridge:
         else:
             return []
 
+    def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
+        """
+        Fetch the closed deal record for a given position ticket from MT5 history.
+        Returns a dict with exit_price, profit, swap, commission, net_profit,
+        exit_reason, close_time, entry_price, volume.
+        """
+        return self._send_command({
+            "action"        : "get_deal_history",
+            "ticket"        : ticket,
+            "lookback_hours": lookback_hours,
+        })
+
     # ------------------------------------------------------------------
     # Helper: convert raw bar list to DataFrame
     # ------------------------------------------------------------------

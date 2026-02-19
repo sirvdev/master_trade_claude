@@ -7,6 +7,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time as _time
 from datetime import datetime, time
 from pathlib import Path
 import yaml
@@ -727,45 +728,55 @@ class TradingSystem:
                 await asyncio.sleep(10)
 
     async def _batch_update_mt5_positions(self, positions: dict):
-        """Update all MT5 positions in one call."""
+        """
+        Update all MT5 positions in one bridge call.
+        Relies on the updated MQ5 bridge that now returns:
+        ticket, symbol, volume, price (entry), current_price (live bid/ask),
+        sl, tp, type (0=BUY/1=SELL), profit
+        """
         try:
-            # Get ALL positions from MT5 in single call
             all_mt5_positions = await self.mt5_client.get_all_positions()
-            
-            # Create lookup by ticket
+
+            # Build lookup by ticket
             mt5_by_ticket = {
-                pos['ticket']: pos 
+                int(pos['ticket']): pos
                 for pos in all_mt5_positions
             }
-            
-            # Update each tracked position
+
             for trade_id, position in list(positions.items()):
                 ticket = position.get('ticket')
-                
-                # Check if position still exists
-                if ticket not in mt5_by_ticket:
-                    # Position was closed externally
-                    logger.warning(f"Position {trade_id} closed externally")
+                if ticket is None:
+                    continue
+
+                if int(ticket) not in mt5_by_ticket:
+                    # Position closed externally (SL/TP hit on broker side)
+                    logger.warning(
+                        f"[MONITOR] trade_id={trade_id} ticket={ticket} "
+                        f"not found on MT5 — closed externally"
+                    )
                     await self._handle_external_close(trade_id, position)
                     continue
-                
-                # Get current position data
-                current = mt5_by_ticket[ticket]
-                current_price = current.get('price', 0)
-                
-                # Check for stop loss hit (simplified check)
-                # In production, MT5 handles SL/TP automatically
-                # This is just for our tracking
-                
-                # Update trailing stop if needed
-                await self._update_trailing_stop_if_needed(
-                    trade_id, 
-                    position, 
-                    current_price
-                )
-                
+
+                current = mt5_by_ticket[int(ticket)]
+
+                # ── Use current_price (live bid/ask) — NOT price (entry price) ──
+                current_price = current.get('current_price') or current.get('price', 0)
+
+                # Refresh tracked position with live data from bridge
+                position['stop_loss']     = current.get('sl', position.get('stop_loss', 0))
+                position['take_profit_1'] = current.get('tp', position.get('take_profit_1', 0))
+                position['profit']        = current.get('profit', 0)
+                position['volume']        = current.get('volume', position.get('volume'))
+
+                # ── TP level checks ───────────────────────────────────────────────
+                position['current_price'] = current_price
+                self._check_and_handle_tp_levels_sync(trade_id, position, current_price)
+
+                # ── Trailing stop ─────────────────────────────────────────────────
+                await self._update_trailing_stop_if_needed(trade_id, position, current_price)
+
         except Exception as e:
-            logger.error(f"Error batch updating MT5 positions: {e}", exc_info=True)
+            logger.error(f"[MONITOR] Error batch updating MT5 positions: {e}", exc_info=True)
 
 
     async def _batch_update_binance_positions(self, positions: dict):
@@ -795,80 +806,83 @@ class TradingSystem:
             logger.error(f"Error batch updating Binance positions: {e}", exc_info=True)
 
 
-    def _update_trailing_stop_if_needed(self, position: dict) -> None:
+    async def _update_trailing_stop_if_needed(
+        self,
+        trade_id: str,
+        position: dict,
+        current_price: float,
+    ) -> None:
         """
-        Check whether the trailing stop should be moved for a live position and,
-        if so, compute the new SL with StopManager and send the modify call to MT5.
-
-        Expects position keys (now provided by the updated MQ5 bridge):
-            ticket        – MT5 position ticket (int)
-            symbol        – e.g. "XAUUSD"
-            type          – 0 = BUY, 1 = SELL
-            price         – entry price  (POSITION_PRICE_OPEN)
-            current_price – live bid (BUY) or ask (SELL) from MT5
-            sl            – current stop-loss value on MT5
-            tp            – current take-profit value on MT5
-            stop_loss     – our internal SL record (kept in sync after each modify)
-            entry_price   – copied from price on registration
-            trailing_active – bool, set True once activation threshold is crossed
-            last_sl_update  – timestamp of last SL modify (float, UTC epoch)
+        Update trailing stop for a live MT5 position if conditions are met.
+        Called from _batch_update_mt5_positions with the live current_price
+        already fetched from MT5 (current_price field from updated MQ5 bridge).
         """
-        cfg_trail  = self.config.get("risk", {}).get("trailing_stop", {})
-        trail_mode = cfg_trail.get("mode", "atr")          # "atr" | "percent"
-        rr_activate= cfg_trail.get("activation_rr", 1.0)   # activate at 1:1 by default
-        min_update_interval = cfg_trail.get("min_update_interval_seconds", 30)
+        import time as _time
 
-        ticket        = position["ticket"]
-        symbol        = position["symbol"]
-        direction     = position["type"]          # 0=BUY, 1=SELL
-        entry_price   = position.get("entry_price", position["price"])
-        current_price = position["current_price"]
-        current_sl    = position.get("stop_loss") or position["sl"]
-        current_tp    = position["tp"]
-
-        if current_sl == 0:
-            self.logger.warning(f"[TRAIL] Ticket {ticket} has SL=0, skipping trail check.")
+        cfg_trail           = self.config.get('risk_management', {}).get('trailing_stop', {})
+        if not cfg_trail.get('enabled', True):
             return
 
-        # ── Rate-limit: don't hammer MT5 with modify calls ──────────────────
-        last_update = position.get("last_sl_update", 0.0)
-        if (time.time() - last_update) < min_update_interval:
+        trail_mode          = cfg_trail.get('method', 'atr')        # 'atr' | 'percent'
+        rr_activate         = cfg_trail.get('activation_rr', 1.0)
+        min_update_interval = cfg_trail.get('min_update_interval_seconds', 30)
+
+        ticket      = position.get('ticket')
+        symbol      = position.get('symbol')
+        direction   = position.get('direction', 'long')             # 'long' | 'short'
+        entry_price = position.get('entry_price', 0.0)
+        current_sl  = position.get('stop_loss', 0.0)
+        current_tp  = position.get('take_profit_1') or position.get('take_profit', 0.0)
+
+        if not ticket or not symbol or not entry_price or not current_sl:
             return
 
-        # ── Determine initial risk distance ─────────────────────────────────
+        # Rate-limit: avoid hammering MT5 with modify calls
+        last_update = position.get('last_sl_update', 0.0)
+        if (_time.time() - last_update) < min_update_interval:
+            return
+
         initial_risk = abs(entry_price - current_sl)
         if initial_risk == 0:
             return
 
-        # ── Check trailing activation threshold (RR-based) ──────────────────
-        if direction == 0:  # BUY
+        # Determine profit move in price units
+        if direction == 'long':
             price_move = current_price - entry_price
-        else:               # SELL
+        else:
             price_move = entry_price - current_price
 
         achieved_rr = price_move / initial_risk if initial_risk > 0 else 0.0
 
-        if not position.get("trailing_active", False):
+        # ── Activation check ─────────────────────────────────────────────────
+        if not position.get('trailing_active', False):
             if achieved_rr < rr_activate:
-                return  # haven't reached activation threshold yet
-            # ── Break-even + buffer on first activation ──────────────────────
-            be_buffer = cfg_trail.get("breakeven_buffer_pips", 2) * self._pip_size(symbol)
-            if direction == 0:
-                breakeven_sl = entry_price + be_buffer
+                return  # Not yet profitable enough to trail
+
+            # Break-even move on first activation
+            be_cfg    = cfg_trail.get('breakeven', {})
+            buffer_pts = be_cfg.get('buffer_pips', 1) * self._pip_size(symbol)
+
+            if direction == 'long':
+                breakeven_sl = entry_price + buffer_pts
                 if current_sl < breakeven_sl:
-                    self._send_sl_modify(position, breakeven_sl, current_tp,
-                                        label="breakeven")
+                    await self._send_sl_modify(
+                        trade_id, position, breakeven_sl, current_tp, label='breakeven'
+                    )
             else:
-                breakeven_sl = entry_price - be_buffer
+                breakeven_sl = entry_price - buffer_pts
                 if current_sl > breakeven_sl:
-                    self._send_sl_modify(position, breakeven_sl, current_tp,
-                                        label="breakeven")
-            position["trailing_active"] = True
-            self.logger.info(
-                f"[TRAIL] Ticket {ticket} ({symbol}) trailing ACTIVATED at RR={achieved_rr:.2f}"
+                    await self._send_sl_modify(
+                        trade_id, position, breakeven_sl, current_tp, label='breakeven'
+                    )
+
+            position['trailing_active'] = True
+            logger.info(
+                f"[TRAIL] trade_id={trade_id} ticket={ticket} ({symbol}) "
+                f"trailing ACTIVATED at RR={achieved_rr:.2f}"
             )
 
-        # ── Compute new SL via StopManager ──────────────────────────────────
+        # ── Compute new SL via StopManager ───────────────────────────────────
         try:
             new_sl = self.stop_manager.compute_trailing_sl(
                 symbol        = symbol,
@@ -879,192 +893,228 @@ class TradingSystem:
                 config        = cfg_trail,
             )
         except Exception as exc:
-            self.logger.error(f"[TRAIL] StopManager error for {ticket}: {exc}")
+            logger.error(f"[TRAIL] StopManager error for ticket={ticket}: {exc}")
             return
 
         if new_sl is None:
             return
 
-        # ── Only move SL in the favourable direction (never widen it) ───────
-        if direction == 0 and new_sl <= current_sl:
+        # Only move SL in the favourable direction — never widen
+        if direction == 'long'  and new_sl <= current_sl:
             return
-        if direction == 1 and new_sl >= current_sl:
+        if direction == 'short' and new_sl >= current_sl:
             return
 
-        self._send_sl_modify(position, new_sl, current_tp, label="trail")
+        await self._send_sl_modify(trade_id, position, new_sl, current_tp, label='trail')
 
 
-    def _send_sl_modify(
+    async def _send_sl_modify(
         self,
+        trade_id: str,
         position: dict,
         new_sl: float,
         current_tp: float,
-        label: str = "modify",
+        label: str = 'modify',
     ) -> bool:
         """
-        Send a modify_position request to MT5 and update the local position record.
-        Returns True on success.
+        Send modify_position to MT5 and update the local position record on success.
+        Uses mt5_file_bridge.modify_position(ticket, stop_loss, take_profit).
         """
-        ticket = position["ticket"]
-        symbol = position["symbol"]
+        import time as _time
+
+        ticket = position.get('ticket')
+        symbol = position.get('symbol')
 
         try:
-            result = self.mt5_client.modify_position(
-                ticket = ticket,
-                sl     = round(new_sl, self._price_digits(symbol)),
-                tp     = current_tp,
+            result = await self.mt5_client.modify_position(
+                ticket      = ticket,
+                stop_loss   = round(new_sl, self._price_digits(symbol)),
+                take_profit = current_tp,
             )
         except Exception as exc:
-            self.logger.error(f"[MODIFY] Exception modifying ticket {ticket}: {exc}")
+            logger.error(f"[MODIFY] Exception modifying ticket={ticket}: {exc}")
             return False
 
-        if result.get("status") != "success":
-            self.logger.warning(
-                f"[MODIFY] MT5 rejected modify for {ticket}: {result.get('error')}"
+        if not result.get('success', False):
+            logger.warning(
+                f"[MODIFY] MT5 rejected modify for ticket={ticket}: {result.get('error')}"
             )
             return False
 
-        old_sl = position.get("stop_loss", position.get("sl"))
-        position["stop_loss"]     = new_sl
-        position["sl"]            = new_sl          # keep bridge mirror in sync
-        position["last_sl_update"] = time.time()
+        old_sl = position.get('stop_loss', 0.0)
+        position['stop_loss']      = new_sl
+        position['last_sl_update'] = _time.time()
 
-        self.logger.info(
-            f"[{label.upper()}] Ticket {ticket} ({symbol}) SL moved "
-            f"{old_sl:.5f} → {new_sl:.5f}"
+        # Persist SL change to database
+        try:
+            self.db.update_trade(trade_id, {'stop_loss': new_sl})
+        except Exception as exc:
+            logger.warning(f"[MODIFY] DB update failed for trade_id={trade_id}: {exc}")
+
+        logger.info(
+            f"[{label.upper()}] trade_id={trade_id} ticket={ticket} ({symbol}) "
+            f"SL moved {old_sl:.5f} → {new_sl:.5f}"
         )
-        self.audit_logger.log_event(
-            event_type = "sl_adjusted",
-            ticket     = ticket,
-            symbol     = symbol,
-            old_sl     = old_sl,
-            new_sl     = new_sl,
-            reason     = label,
-        )
+        try:
+            self.audit_logger.log_trade_event(
+                trade_id   = trade_id,
+                event_type = 'sl_adjusted',
+                details    = {
+                    'old_sl': old_sl,
+                    'new_sl': new_sl,
+                    'reason': label,
+                    'ticket': ticket,
+                }
+            )
+        except Exception:
+            pass  # Audit log failure must not block trading
+
         return True
 
 
     def _pip_size(self, symbol: str) -> float:
-        """Return one pip/point size for a symbol (configurable fallback)."""
-        pip_map = self.config.get("pip_sizes", {})
-        return pip_map.get(symbol, 0.01)   # XAUUSD = 0.01, FX pairs = 0.0001
+        """One pip/point for a symbol. Configurable via config pip_sizes map."""
+        return self.config.get('pip_sizes', {}).get(symbol, 0.01)
 
 
     def _price_digits(self, symbol: str) -> int:
-        """Return decimal precision for a symbol price."""
-        digits_map = self.config.get("price_digits", {})
-        return digits_map.get(symbol, 5)
+        """Decimal precision for a symbol price. Configurable via price_digits map."""
+        return self.config.get('price_digits', {}).get(symbol, 5)
 
 
-    def _handle_partial_close(
+    async def _partial_close_async(
         self,
+        trade_id: str,
         position: dict,
         close_fraction: float,
-        reason: str = "tp1",
+        reason: str = 'tp1',
     ) -> bool:
         """
-        Partially close a position by sending a close for `close_fraction` of its volume.
-        Updates internal position volume on success.
-
-        Args:
-            position:       live position dict (from self.open_positions)
-            close_fraction: e.g. 0.5 to close half the position
-            reason:         label for audit log ("tp1", "manual", etc.)
+        Partially close an MT5 position.
+        close_fraction=1.0 closes the entire remaining volume.
         """
-        ticket        = position["ticket"]
-        symbol        = position["symbol"]
-        current_volume= position["volume"]
-        close_volume  = round(current_volume * close_fraction, 2)
+        ticket         = position.get('ticket')
+        symbol         = position.get('symbol')
+        current_volume = position.get('position_size') or position.get('volume', 0)
+        close_volume   = round(current_volume * close_fraction, 2)
 
-        min_lot = self.config.get("execution", {}).get("min_lot_size", 0.01)
+        min_lot = self.config.get('execution', {}).get('min_lot_size', 0.01)
         if close_volume < min_lot:
-            self.logger.warning(
-                f"[PARTIAL] Ticket {ticket}: close volume {close_volume} < min lot {min_lot}, skipping."
+            logger.warning(
+                f"[PARTIAL] trade_id={trade_id}: close volume {close_volume} "
+                f"< min lot {min_lot}, skipping"
             )
             return False
 
         remaining = round(current_volume - close_volume, 2)
 
         try:
-            result = self.mt5_client.close_position(ticket=ticket, volume=close_volume)
+            result = await self.mt5_client.close_position(
+                ticket = ticket,
+                volume = close_volume,
+            )
         except Exception as exc:
-            self.logger.error(f"[PARTIAL] Exception closing ticket {ticket}: {exc}")
+            logger.error(f"[PARTIAL] Exception closing ticket={ticket}: {exc}")
             return False
 
-        if result.get("status") != "success":
-            self.logger.warning(
-                f"[PARTIAL] MT5 rejected partial close for {ticket}: {result.get('error')}"
+        if not result.get('success', False):
+            logger.warning(
+                f"[PARTIAL] MT5 rejected partial close for ticket={ticket}: "
+                f"{result.get('error')}"
             )
             return False
 
-        position["volume"] = remaining
-        self.logger.info(
-            f"[PARTIAL] Ticket {ticket} ({symbol}): closed {close_volume} lots "
-            f"({reason}), {remaining} lots remain."
-        )
-        self.audit_logger.log_event(
-            event_type     = "partial_close",
-            ticket         = ticket,
-            symbol         = symbol,
-            closed_volume  = close_volume,
-            remaining_volume = remaining,
-            reason         = reason,
-        )
+        position['position_size'] = remaining
+        position['volume']        = remaining
+
+        # If full close, remove from tracking
+        if remaining <= min_lot:
+            self.open_positions.pop(trade_id, None)
+            self.db.update_trade(trade_id, {
+                'status':       'closed',
+                'exit_reason':  reason,
+                'exit_time':    datetime.utcnow(),
+            })
+            logger.info(
+                f"[PARTIAL] trade_id={trade_id} ticket={ticket} ({symbol}) "
+                f"fully closed via {reason}"
+            )
+        else:
+            self.db.update_trade(trade_id, {'position_size': remaining})
+            logger.info(
+                f"[PARTIAL] trade_id={trade_id} ticket={ticket} ({symbol}): "
+                f"closed {close_volume} lots ({reason}), {remaining} lots remain"
+            )
+
+        try:
+            self.audit_logger.log_trade_event(
+                trade_id   = trade_id,
+                event_type = 'partial_close',
+                details    = {
+                    'closed_volume':   close_volume,
+                    'remaining_volume': remaining,
+                    'reason':          reason,
+                }
+            )
+        except Exception:
+            pass
+
         return True
 
-    def _check_and_handle_tp_levels(self, position: dict) -> None:
+    def _check_and_handle_tp_levels_sync(
+        self,
+        trade_id: str,
+        position: dict,
+        current_price: float,
+    ) -> None:
         """
-        Evaluate TP1 partial-close and TP2 trail-remainder logic for a position.
-
-        Expects position fields:
-            tp1_price    – first target price (set at registration)
-            tp1_hit      – bool flag
-            tp1_fraction – fraction to close at TP1 (default 0.5 from config)
-            tp2_price    – second target (optional; if absent, trail handles it)
-            tp2_hit      – bool flag
-            type         – 0=BUY, 1=SELL
-            current_price
+        Check TP1/TP2 targets and trigger partial closes synchronously.
+        (Actual close calls are fire-and-forget via asyncio.ensure_future.)
         """
-        direction     = position["type"]
-        current_price = position["current_price"]
-        ticket        = position["ticket"]
+        direction = position.get('direction', 'long')
+        ticket    = position.get('ticket')
 
-        tp1 = position.get("tp1_price")
-        tp2 = position.get("tp2_price")
+        tp1 = position.get('take_profit_1') or position.get('tp1_price')
+        tp2 = position.get('take_profit_2') or position.get('tp2_price')
 
         # ── TP1 ──────────────────────────────────────────────────────────────
-        if tp1 and not position.get("tp1_hit", False):
-            tp1_reached = (
-                (direction == 0 and current_price >= tp1) or
-                (direction == 1 and current_price <= tp1)
+        if tp1 and not position.get('tp1_hit', False):
+            hit = (
+                (direction == 'long'  and current_price >= tp1) or
+                (direction == 'short' and current_price <= tp1)
             )
-            if tp1_reached:
+            if hit:
                 fraction = position.get(
-                    "tp1_fraction",
-                    self.config.get("risk", {}).get("tp1_close_fraction", 0.5),
+                    'tp1_fraction',
+                    self.config.get('risk_management', {}).get(
+                        'take_profit', {}
+                    ).get('tp1_close_fraction', 0.5),
                 )
-                success = self._handle_partial_close(position, fraction, reason="tp1")
-                if success:
-                    position["tp1_hit"] = True
-                    # After TP1, activate trailing on the remainder immediately
-                    position["trailing_active"] = True
-                    self.logger.info(
-                        f"[TP1] Ticket {ticket} TP1 hit at {current_price:.5f}. "
-                        f"Trailing activated on remainder."
-                    )
+                logger.info(
+                    f"[TP1] trade_id={trade_id} ticket={ticket} hit TP1={tp1:.5f} "
+                    f"at price={current_price:.5f}, closing {fraction*100:.0f}%"
+                )
+                asyncio.ensure_future(
+                    self._partial_close_async(trade_id, position, fraction, reason='tp1')
+                )
+                position['tp1_hit']        = True
+                position['trailing_active'] = True  # activate trailing on the remainder
 
         # ── TP2 ──────────────────────────────────────────────────────────────
-        if tp2 and not position.get("tp2_hit", False) and position.get("tp1_hit", False):
-            tp2_reached = (
-                (direction == 0 and current_price >= tp2) or
-                (direction == 1 and current_price <= tp2)
+        if tp2 and position.get('tp1_hit', False) and not position.get('tp2_hit', False):
+            hit = (
+                (direction == 'long'  and current_price >= tp2) or
+                (direction == 'short' and current_price <= tp2)
             )
-            if tp2_reached:
-                # Close the rest of the position at TP2
-                success = self._handle_partial_close(position, 1.0, reason="tp2")
-                if success:
-                    position["tp2_hit"] = True
-                    self._close_and_unregister(position, reason="tp2_full_close")
+            if hit:
+                logger.info(
+                    f"[TP2] trade_id={trade_id} ticket={ticket} hit TP2={tp2:.5f} "
+                    f"— closing remainder"
+                )
+                asyncio.ensure_future(
+                    self._partial_close_async(trade_id, position, 1.0, reason='tp2')
+                )
+                position['tp2_hit'] = True
 
     def _sync_positions_with_mt5(self) -> None:
         """
@@ -1077,11 +1127,11 @@ class TradingSystem:
         try:
             response = self.mt5_client.get_all_positions()
         except Exception as exc:
-            self.logger.error(f"[SYNC] Failed to fetch MT5 positions: {exc}")
+            logger.error(f"[SYNC] Failed to fetch MT5 positions: {exc}")
             return
 
         if response.get("status") != "success":
-            self.logger.warning(f"[SYNC] get_all_positions error: {response.get('error')}")
+            logger.warning(f"[SYNC] get_all_positions error: {response.get('error')}")
             return
 
         mt5_positions: list[dict] = response.get("positions", [])
@@ -1091,7 +1141,7 @@ class TradingSystem:
         ghost_tickets = [t for t in list(self.open_positions) if t not in mt5_tickets]
         for ticket in ghost_tickets:
             pos = self.open_positions.pop(ticket)
-            self.logger.warning(
+            logger.warning(
                 f"[SYNC] Ghost position removed: ticket {ticket} ({pos.get('symbol')}). "
                 f"Likely closed externally."
             )
@@ -1120,7 +1170,7 @@ class TradingSystem:
                     self.open_positions[ticket]["stop_loss"] = mt5_pos["sl"]
             else:
                 # Unknown position — register it so we can manage it going forward
-                self.logger.info(
+                logger.info(
                     f"[SYNC] Discovered untracked position: ticket {ticket} "
                     f"({mt5_pos['symbol']}). Registering."
                 )
@@ -1210,7 +1260,7 @@ class TradingSystem:
             balance      = account_info.get("balance", 0)
             equity       = account_info.get("equity", balance)
         except Exception as exc:
-            self.logger.error(f"[DRAWDOWN] Cannot fetch account info: {exc}")
+            logger.error(f"[DRAWDOWN] Cannot fetch account info: {exc}")
             return True   # fail-open: don't block trading on connection error
 
         if balance <= 0:
@@ -1220,7 +1270,7 @@ class TradingSystem:
         dd_pct     = (-daily_pnl / balance) * 100 if daily_pnl < 0 else 0.0
 
         if dd_pct >= max_dd_pct:
-            self.logger.critical(
+            logger.critical(
                 f"[DRAWDOWN] Daily drawdown {dd_pct:.2f}% ≥ limit {max_dd_pct}%. "
                 f"Halting new entries."
             )
@@ -1251,17 +1301,17 @@ class TradingSystem:
         if self.consecutive_losses < max_losses:
             return True
 
-        elapsed = time.time() - self.last_loss_time
+        elapsed = _time.time() - self.last_loss_time
         if elapsed < cooldown_s:
             remaining = int(cooldown_s - elapsed)
-            self.logger.info(
+            logger.info(
                 f"[COOLDOWN] {self.consecutive_losses} consecutive losses. "
                 f"Cooldown active — {remaining}s remaining."
             )
             return False
 
         # Cooldown expired — reset counter
-        self.logger.info("[COOLDOWN] Cooldown expired, resuming entries.")
+        logger.info("[COOLDOWN] Cooldown expired, resuming entries.")
         self.consecutive_losses = 0
         return True
 
@@ -1270,7 +1320,7 @@ class TradingSystem:
         Immediately halt all new activity, close every open position, and
         set the kill-switch flag so the main loop exits cleanly.
         """
-        self.logger.critical(f"[SHUTDOWN] Emergency shutdown triggered: {reason}")
+        logger.critical(f"[SHUTDOWN] Emergency shutdown triggered: {reason}")
         self.kill_switch = True   # checked by run() loop
 
         self.audit_logger.log_event(
@@ -1286,7 +1336,7 @@ class TradingSystem:
             try:
                 result = self.mt5_client.close_position(ticket=ticket)
                 if result.get("status") == "success":
-                    self.logger.info(f"[SHUTDOWN] Closed MT5 position {ticket}.")
+                    logger.info(f"[SHUTDOWN] Closed MT5 position {ticket}.")
                     self.audit_logger.log_event(
                         event_type = "position_closed",
                         ticket     = ticket,
@@ -1294,81 +1344,92 @@ class TradingSystem:
                         reason     = "emergency_shutdown",
                     )
                 else:
-                    self.logger.error(
+                    logger.error(
                         f"[SHUTDOWN] Failed to close {ticket}: {result.get('error')}"
                     )
             except Exception as exc:
-                self.logger.error(f"[SHUTDOWN] Exception closing {ticket}: {exc}")
+                logger.error(f"[SHUTDOWN] Exception closing {ticket}: {exc}")
 
         # Close all Binance positions if applicable
         if hasattr(self, "binance_client"):
             try:
                 self.binance_client.close_all_positions(reason="emergency_shutdown")
             except Exception as exc:
-                self.logger.error(f"[SHUTDOWN] Binance close-all failed: {exc}")
+                logger.error(f"[SHUTDOWN] Binance close-all failed: {exc}")
 
         self.open_positions.clear()
-        self.logger.critical("[SHUTDOWN] Emergency shutdown complete.")
+        logger.critical("[SHUTDOWN] Emergency shutdown complete.")
 
     def _register_new_position(
         self,
+        trade_id: str,
         ticket: int,
         symbol: str,
-        direction: int,         # 0=BUY 1=SELL
+        direction: str,         # 'long' | 'short'  (matches rest of codebase)
         entry_price: float,
         volume: float,
         sl: float,
-        tp: float,
-        tp1_price: float | None = None,
-        tp2_price: float | None = None,
-        tp1_fraction: float     = 0.5,
+        tp1: float,
+        tp2: float | None = None,
+        tp1_fraction: float = 0.5,
+        platform: str = 'mt5',
         analysis_id: str | None = None,
     ) -> dict:
         """
-        Register a freshly filled order in self.open_positions with all
-        strategy metadata needed for trailing-stop and TP management.
+        Register a freshly filled order in self.open_positions.
+        Keyed by trade_id (string UUID) to match the rest of the codebase.
         """
-        position = {
-            "ticket"         : ticket,
-            "symbol"         : symbol,
-            "type"           : direction,
-            "price"          : entry_price,
-            "entry_price"    : entry_price,
-            "current_price"  : entry_price,   # will be updated on first sync
-            "volume"         : volume,
-            "sl"             : sl,
-            "stop_loss"      : sl,
-            "tp"             : tp,
-            "tp1_price"      : tp1_price,
-            "tp2_price"      : tp2_price,
-            "tp1_fraction"   : tp1_fraction,
-            "tp1_hit"        : False,
-            "tp2_hit"        : False,
-            "trailing_active": False,
-            "last_sl_update" : 0.0,
-            "profit"         : 0.0,
-            "analysis_id"    : analysis_id,
-            "open_time"      : time.time(),
-            "source"         : "strategy",
-        }
-        self.open_positions[ticket] = position
+        import time as _time
 
-        self.logger.info(
-            f"[REGISTER] Ticket {ticket} {symbol} "
-            f"{'BUY' if direction == 0 else 'SELL'} "
-            f"{volume} lots @ {entry_price:.5f} | SL={sl:.5f} TP={tp:.5f}"
+        position = {
+            'trade_id'       : trade_id,
+            'ticket'         : ticket,
+            'symbol'         : symbol,
+            'platform'       : platform,
+            'direction'      : direction,
+            'entry_price'    : entry_price,
+            'current_price'  : entry_price,
+            'position_size'  : volume,
+            'volume'         : volume,
+            'stop_loss'      : sl,
+            'take_profit_1'  : tp1,
+            'take_profit_2'  : tp2,
+            'tp1_fraction'   : tp1_fraction,
+            'tp1_hit'        : False,
+            'tp2_hit'        : False,
+            'trailing_active': False,
+            'last_sl_update' : 0.0,
+            'profit'         : 0.0,
+            'analysis_id'    : analysis_id,
+            'entry_time'     : datetime.utcnow(),
+            'open_time'      : _time.time(),
+        }
+        self.open_positions[trade_id] = position
+
+        logger.info(
+            f"[REGISTER] trade_id={trade_id} ticket={ticket} {symbol} "
+            f"{direction.upper()} {volume} lots @ {entry_price:.5f} "
+            f"| SL={sl:.5f} TP1={tp1:.5f}"
         )
-        self.audit_logger.log_event(
-            event_type   = "order_placed",
-            ticket       = ticket,
-            symbol       = symbol,
-            direction    = "BUY" if direction == 0 else "SELL",
-            entry_price  = entry_price,
-            volume       = volume,
-            sl           = sl,
-            tp           = tp,
-            analysis_id  = analysis_id,
-        )
+        try:
+            self.audit_logger.log_trade_event(
+                trade_id   = trade_id,
+                event_type = 'order_placed',
+                details    = {
+                    'ticket'     : ticket,
+                    'symbol'     : symbol,
+                    'direction'  : direction,
+                    'entry_price': entry_price,
+                    'volume'     : volume,
+                    'sl'         : sl,
+                    'tp1'        : tp1,
+                    'tp2'        : tp2,
+                    'analysis_id': analysis_id,
+                }
+            )
+        except Exception:
+            pass
+
         return position
 
     def _close_and_unregister(self, position: dict, reason: str = "strategy") -> bool:
@@ -1381,11 +1442,11 @@ class TradingSystem:
         try:
             result = self.mt5_client.close_position(ticket=ticket)
         except Exception as exc:
-            self.logger.error(f"[CLOSE] Exception for ticket {ticket}: {exc}")
+            logger.error(f"[CLOSE] Exception for ticket {ticket}: {exc}")
             return False
 
         if result.get("status") != "success":
-            self.logger.warning(
+            logger.warning(
                 f"[CLOSE] MT5 rejected close for {ticket}: {result.get('error')}"
             )
             return False
@@ -1395,11 +1456,11 @@ class TradingSystem:
 
         if profit < 0:
             self.consecutive_losses += 1
-            self.last_loss_time = time.time()
+            self.last_loss_time = _time.time()
         else:
             self.consecutive_losses = 0
 
-        self.logger.info(
+        logger.info(
             f"[CLOSE] Ticket {ticket} ({position.get('symbol')}) closed. "
             f"P&L={profit:.2f} | reason={reason}"
         )

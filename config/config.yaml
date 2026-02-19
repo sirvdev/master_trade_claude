@@ -23,7 +23,7 @@ symbols:
     entry_timeframe: 1m
   
   XAG/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes: [4H, 1H, 15m]
