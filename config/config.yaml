@@ -133,7 +133,7 @@ strategy:
     - pullback_to_sr
     - momentum_breakout
   
-  confluence_required: 2  # Min independent signals
+  confluence_required: 1  # Min independent signals
   
   filters:
     respect_higher_tf_bias: true  # Only long in bullish 1H, short in bearish
@@ -207,7 +207,7 @@ risk_management:
   global_limits:
     daily_max_drawdown_percent: 5.0
     max_concurrent_trades: 3
-    max_trades_per_day: 100
+    max_trades_per_day: 160
     max_risk_per_symbol_percent: 5.0
     
     cooldown_after_losses:
@@ -287,25 +287,38 @@ learning:
     max_versions: 10
 
 # =============================================================================
-# BACKTESTING
+# BACKTESTING  (replace the existing backtest: block in config/config.yaml)
 # =============================================================================
 backtest:
-  lookback_bars: 500
-  data_source: historical  # historical or csv
+  data_source: mt5          # mt5 (live fetch) or csv
+
+  # Date range for the TEST period.
+  # Pre-history is fetched automatically based on lookback_bars.
   date_range:
-    start: 2023-01-01
-    end: 2024-01-01
-  
+    start: 2026-02-08
+    end:   2026-02-13
+
+  # Number of bars sent to the strategy engine at each iteration.
+  # The SAME value is used for ALL timeframes (uniform window).
+  # Pre-history needed = lookback_bars × highest_timeframe_in_seconds
+  # Example: 500 bars of 1H = 500 hours ≈ 21 days fetched before start date.
+  lookback_bars: 500
+
+  # Timeframe configuration for the backtest loop
+  timeframes:
+    entry_timeframe:   15m  # Backtester iterates one step per this bar
+    minimum_timeframe: 1m   # Used for granular SL/TP detection within each step
+
   simulation:
-    realistic_slippage: true
-    slippage_percent: 0.05
-    commission_percent: 0.1
-    latency_bars: 1  # Delay in bars for execution
-  
+    realistic_slippage:  true
+    slippage_percent:    0.05
+    commission_percent:  0.1
+    latency_bars:        1   # Bars of delay before order fill
+
   output:
-    save_trades: true
+    save_trades:       true
     save_equity_curve: true
-    generate_report: true
+    generate_report:   true
 
 # =============================================================================
 # LOGGING & AUDIT

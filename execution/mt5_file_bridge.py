@@ -244,7 +244,7 @@ class MT5FileBridge:
         }
 
         # Large date ranges can take a few seconds — use longer timeout
-        response = await self._send_command(command, timeout=300.0)
+        response = await self._send_command(command, timeout=60.0)
 
         if response.get('status') != 'success':
             raise ValueError(
@@ -259,6 +259,234 @@ class MT5FileBridge:
             f"({df.index[0]} → {df.index[-1]})"
         )
         return df
+
+    # ------------------------------------------------------------------
+    # Live trading methods (order execution & position management)
+    # ------------------------------------------------------------------
+
+    async def get_current_price(self, symbol: str) -> Optional[Dict]:
+        """
+        Get current bid/ask prices for a symbol.
+        
+        Args:
+            symbol: Symbol (e.g. 'XAUUSD')
+            
+        Returns:
+            Dict with 'bid', 'ask', 'spread' or None on error
+        """
+        # Get the last bar to extract current price
+        try:
+            df = await self.fetch_historical(symbol, '1m', count=1)
+            if df.empty:
+                return None
+            
+            last_bar = df.iloc[-1]
+            # Approximate bid/ask from close (MT5 doesn't provide tick data via file bridge)
+            close = float(last_bar['close'])
+            # Typical gold spread is ~0.30, use that as approximation
+            spread = 0.30
+            
+            return {
+                'symbol': symbol,
+                'bid': close - spread / 2,
+                'ask': close + spread / 2,
+                'spread': spread,
+                'time': last_bar.name
+            }
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}")
+            return None
+
+    async def place_order(
+        self,
+        symbol: str,
+        direction: str,
+        volume: float,
+        order_type: str = 'market',
+        price: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        comment: Optional[str] = None
+    ) -> Dict:
+        """
+        Place an order on MT5.
+        
+        Args:
+            symbol:       e.g. 'XAUUSD'
+            direction:    'long' or 'short'
+            volume:       Lot size (e.g. 0.1)
+            order_type:   'market' or 'limit'
+            price:        Limit price (required for limit orders)
+            stop_loss:    SL price
+            take_profit:  TP price
+            comment:      Order comment
+            
+        Returns:
+            Result dict with 'success', 'ticket', 'filled_price', etc.
+        """
+        logger.info(
+            f"Placing MT5 order: {symbol} {direction} {volume} lots, "
+            f"SL: {stop_loss}, TP: {take_profit}"
+        )
+        
+        # Map direction to MT5 order type
+        if order_type == 'market':
+            mt5_order_type = 'ORDER_TYPE_BUY' if direction == 'long' else 'ORDER_TYPE_SELL'
+        else:
+            mt5_order_type = 'ORDER_TYPE_BUY_LIMIT' if direction == 'long' else 'ORDER_TYPE_SELL_LIMIT'
+        
+        command = {
+            'action':     'place_order',
+            'symbol':     symbol,
+            'order_type': mt5_order_type,
+            'volume':     volume,
+            'price':      price or 0,
+            'sl':         stop_loss or 0,
+            'tp':         take_profit or 0,
+            'comment':    comment or 'Python'
+        }
+        
+        response = await self._send_command(command, timeout=10.0)
+        
+        if response.get('status') == 'success':
+            result = {
+                'success':       True,
+                'order_id':      f"mt5_{response.get('ticket')}",
+                'ticket':        response.get('ticket'),
+                'filled_price':  response.get('price'),
+                'price':         response.get('price'),
+                'filled_volume': volume,
+                'timestamp':     datetime.utcnow().isoformat(),
+                'platform':      'mt5',
+                'demo_mode':     self.demo_mode
+            }
+            logger.info(f"Order placed: Ticket {result['ticket']}")
+        else:
+            result = {
+                'success':   False,
+                'error':     response.get('error', 'Unknown error'),
+                'timestamp': datetime.utcnow().isoformat(),
+                'platform':  'mt5'
+            }
+            logger.error(f"Order failed: {result['error']}")
+        
+        return result
+
+    async def modify_position(
+        self,
+        ticket: int,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None
+    ) -> Dict:
+        """
+        Modify position SL/TP.
+        
+        Args:
+            ticket:      MT5 position ticket
+            stop_loss:   New SL price
+            take_profit: New TP price
+            
+        Returns:
+            Modification result
+        """
+        logger.info(f"Modifying position {ticket}: SL={stop_loss}, TP={take_profit}")
+        
+        command = {
+            'action': 'modify_position',
+            'ticket': ticket,
+            'sl':     stop_loss or 0,
+            'tp':     take_profit or 0
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            logger.info(f"Position {ticket} modified")
+            return {'success': True, 'ticket': ticket}
+        else:
+            logger.error(f"Modify failed: {response.get('error')}")
+            return {'success': False, 'error': response.get('error')}
+
+    async def close_position(
+        self,
+        ticket: int,
+        volume: Optional[float] = None,
+        comment: Optional[str] = None
+    ) -> Dict:
+        """
+        Close position (full or partial).
+        
+        Args:
+            ticket:  MT5 position ticket
+            volume:  Volume to close (None = full close)
+            comment: Close comment
+            
+        Returns:
+            Close result
+        """
+        logger.info(f"Closing position {ticket}, volume: {volume or 'full'}")
+        
+        command = {
+            'action':  'close_position',
+            'ticket':  ticket,
+            'volume':  volume or 0,
+            'comment': comment or 'Python'
+        }
+        
+        response = await self._send_command(command, timeout=10.0)
+        
+        if response.get('status') == 'success':
+            logger.info(f"Position {ticket} closed")
+            return {
+                'success':       True,
+                'ticket':        ticket,
+                'closed_volume': volume or 0,
+                'profit':        response.get('profit', 0)
+            }
+        else:
+            logger.error(f"Close failed: {response.get('error')}")
+            return {'success': False, 'error': response.get('error')}
+
+    async def get_position_info(self, ticket: int) -> Optional[Dict]:
+        """
+        Get position information.
+        
+        Args:
+            ticket: MT5 position ticket
+            
+        Returns:
+            Position dict or None
+        """
+        command = {
+            'action': 'get_position',
+            'ticket': ticket
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            return response
+        else:
+            return None
+
+    async def get_all_positions(self) -> list:
+        """
+        Get all open positions.
+        
+        Returns:
+            List of position dicts
+        """
+        command = {
+            'action': 'get_all_positions',
+            'magic':  self.magic_number
+        }
+        
+        response = await self._send_command(command)
+        
+        if response.get('status') == 'success':
+            return response.get('positions', [])
+        else:
+            return []
 
     # ------------------------------------------------------------------
     # Helper: convert raw bar list to DataFrame

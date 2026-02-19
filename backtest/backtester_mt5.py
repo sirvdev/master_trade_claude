@@ -125,12 +125,14 @@ class Backtester:
         )
 
         self.timeframe_config = config.get('timeframes', {})
+        self._symbols_config  = config.get('symbols', {})
 
         # Runtime state (reset each run)
         self.trades:       List[BacktestTrade]      = []
         self.open_trades:  Dict[str, BacktestTrade] = {}
         self.equity_curve: List[float]              = []
         self.balance:      float                    = 0.0
+        self._platform:    str                      = 'mt5'   # resolved per symbol in run_from_mt5
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -160,12 +162,27 @@ class Backtester:
               f"Entry TF: {self.entry_tf}  |  Min TF: {self.min_tf}")
         print("=" * 70)
 
-        # Timeframes we need
-        all_tf = list({
-            self.timeframe_config.get('structure_timeframe', '1h'),
-            self.entry_tf,
-            self.min_tf,
-        })
+        # Resolve platform from symbol config (XAU/USD or XAUUSD both work)
+        sym_key = next(
+            (k for k in self._symbols_config
+             if k.replace('/', '') == symbol or k == symbol),
+            None
+        )
+        sym_cfg = self._symbols_config.get(sym_key, {}) if sym_key else {}
+        self._platform = sym_cfg.get('platform', 'mt5')
+
+        # Timeframes: use the symbol's configured list so we analyse exactly
+        # what's configured (e.g. [1H, 15m, 1m] for XAU/USD)
+        sym_tfs = sym_cfg.get('timeframes', [])
+        # Normalise to lowercase (config uses 1H, code uses 1h)
+        tf_normalise = {'1H': '1h', '4H': '4h', '1D': '1d',
+                        '15m': '15m', '5m': '5m', '1m': '1m', '30m': '30m'}
+        sym_tfs_norm = [tf_normalise.get(t, t.lower()) for t in sym_tfs]
+
+        # Always include entry and min TFs
+        all_tf = list(dict.fromkeys(
+            sym_tfs_norm + [self.entry_tf, self.min_tf]
+        ))
 
         # Extend fetch window to cover lookback before test start
         highest_tf_secs  = max(tf_to_seconds(tf) for tf in all_tf)
@@ -237,12 +254,26 @@ class Backtester:
             df = raw_data.get(tf)
             if df is None or df.empty:
                 raise ValueError(f"No data returned for {tf}")
-            if len(df) < self.lookback_bars:
+            
+            # Lenient check: we need SOME lookback, but not necessarily the full amount
+            # The real requirement is: can we start the backtest with a reasonable window?
+            # A practical minimum is 50 bars (enough for most indicators)
+            min_practical = min(50, self.lookback_bars // 2)
+            
+            if len(df) < min_practical:
                 raise ValueError(
                     f"{tf}: only {len(df)} bars available, "
-                    f"need at least {self.lookback_bars} for lookback. "
-                    f"Try an earlier start_date or reduce lookback_bars."
+                    f"need at least {min_practical} bars minimum. "
+                    f"Try an earlier start_date."
                 )
+            
+            # Warn if less than requested lookback (but don't fail)
+            if len(df) < self.lookback_bars:
+                logger.warning(
+                    f"{tf}: only {len(df)} bars available "
+                    f"(requested {self.lookback_bars}), will use what's available"
+                )
+            
             print(f"    {tf:>4s}: {len(df):>6,} bars  "
                   f"({df.index[0].strftime('%Y-%m-%d')} -> "
                   f"{df.index[-1].strftime('%Y-%m-%d')})")
@@ -298,6 +329,7 @@ class Backtester:
 
         progress      = ProgressBar(total_iters)
         trade_counter = 0
+        signal_counter = 0  # Track how many entry signals generated
 
         for idx, (current_ts, entry_bar) in enumerate(test_bars.iterrows()):
 
@@ -307,10 +339,13 @@ class Backtester:
             tf_snapshot: Dict[str, pd.DataFrame] = {}
             for tf, df in raw_data.items():
                 available = df[df.index <= current_ts]
-                if len(available) >= self.lookback_bars:
-                    tf_snapshot[tf] = available.iloc[-self.lookback_bars:]
+                # Take up to lookback_bars, but use whatever we have if less
+                bars_to_take = min(len(available), self.lookback_bars)
+                if bars_to_take > 0:
+                    tf_snapshot[tf] = available.iloc[-bars_to_take:]
                 else:
-                    tf_snapshot[tf] = available   # edge case at very start
+                    # Edge case: no data yet at this timestamp (shouldn't happen)
+                    continue
 
             # ── Granular SL/TP check using minimum TF bars ─────────────────────
             # Get the 1m bars that belong to THIS entry_tf bar's period
@@ -327,15 +362,37 @@ class Backtester:
                     analysis = strategy_engine.analyze_market(symbol, tf_snapshot)
 
                     if analysis.get('entry_signal'):
+                        signal_counter += 1
+                        logger.info(
+                            f"Entry signal: {analysis['direction']} {symbol} "
+                            f"(reason: {analysis.get('entry_reason')}, "
+                            f"confidence: {analysis.get('confidence_score'):.2f})"
+                        )
+                        
                         levels = strategy_engine.calculate_entry_levels(
                             analysis, tf_snapshot
                         )
+                        
+                        logger.debug(
+                            f"Entry levels: price={levels['entry_price']:.2f}, "
+                            f"SL={levels['stop_loss']:.2f}, "
+                            f"TP1={levels.get('take_profit_1')}"
+                        )
+                        
                         sizing = money_manager.calculate_position_size(
                             account_equity = self.balance,
                             entry_price    = levels['entry_price'],
                             stop_loss      = levels['stop_loss'],
                             symbol         = symbol,
                             direction      = analysis['direction'],
+                            platform       = self._platform,
+                        )
+                        
+                        logger.info(
+                            f"Entry signal: {analysis['direction'].upper()} @ "
+                            f"{levels['entry_price']:.2f}, SL={levels['stop_loss']:.2f}, "
+                            f"size={sizing.get('position_size')}, "
+                            f"risk={sizing.get('risk_percent', 0):.2f}%"
                         )
 
                         if sizing.get('approved') and sizing.get('position_size', 0) > 0:
@@ -372,6 +429,14 @@ class Backtester:
             )
 
         progress.finish()
+
+        # Log signal vs trade summary
+        logger.info(
+            f"\n=== Signal Summary ===\n"
+            f"Entry signals generated: {signal_counter}\n"
+            f"Trades executed:         {len(self.trades)}\n"
+            f"Signal-to-trade ratio:   {len(self.trades)/signal_counter if signal_counter > 0 else 0:.1%}"
+        )
 
         # Close remaining open trades at final price
         if self.open_trades:
@@ -686,67 +751,121 @@ class Backtester:
         print(f"\n  Trades exported to {filepath}")
 
 
-# ── Standalone test ────────────────────────────────────────────────────────────
+# ── Standalone runner ──────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     import sys
+    import argparse
     from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    import yaml
 
-    from indicators.indicators import TechnicalIndicators
+    # Ensure project root is importable
+    PROJECT_ROOT = Path(__file__).parent.parent
+    sys.path.insert(0, str(PROJECT_ROOT))
+
     from strategy.engine import StrategyEngine
     from risk_management.money_manager import MoneyManager
     from risk_management.stop_manager import StopManager
 
-    async def main():
-        config = {
-            'indicators': TechnicalIndicators._default_config(),
-            'strategy': {
-                'entry_types':        ['breakout_retest'],
-                'confluence_required': 2,
-                'filters':            {},
-            },
-            'timeframes': {
-                'structure_timeframe': '1h',
-                'entry_timeframe':     '15m',
-            },
-            'risk_management': {
-                'max_risk_percent_per_trade': 1.0,
-                'stop_loss':     {'method': 'conservative', 'atr_multiplier': 2.0},
-                'take_profit':   {'method': 'scaled', 'tp1_rr': 2.0, 'tp1_close_percent': 50},
-                'trailing_stop': {'enabled': True, 'activation_rr': 1.0},
-                'global_limits': {'max_concurrent_trades': 3},
-            },
-            'backtest': {
-                'lookback_bars': 500,
-                'timeframes': {
-                    'entry_timeframe':   '15m',
-                    'minimum_timeframe': '1m',
-                },
-                'simulation': {
-                    'slippage_percent':   0.05,
-                    'commission_percent': 0.1,
-                    'latency_bars':       1,
-                },
-            },
+    # ── CLI arguments ──────────────────────────────────────────────────────────
+    parser = argparse.ArgumentParser(description='Run backtest from config/config.yaml')
+    parser.add_argument('--symbol',  default=None,
+                        help='Symbol to backtest (e.g. XAUUSD). '
+                             'Defaults to first enabled MT5 symbol in config.')
+    parser.add_argument('--start',   default=None,
+                        help='Start date YYYY-MM-DD. Defaults to backtest.date_range.start in config.')
+    parser.add_argument('--end',     default=None,
+                        help='End date   YYYY-MM-DD. Defaults to backtest.date_range.end in config.')
+    parser.add_argument('--balance', type=float, default=None,
+                        help='Initial balance. Defaults to risk_management.initial_balance in config.')
+    parser.add_argument('--config',  default=str(PROJECT_ROOT / 'config' / 'config.yaml'),
+                        help='Path to config file (default: config/config.yaml)')
+    args = parser.parse_args()
+
+    # ── Load config ────────────────────────────────────────────────────────────
+    config_path = Path(args.config)
+    if not config_path.exists():
+        print(f"ERROR: Config file not found: {config_path}")
+        sys.exit(1)
+
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    # ── Resolve symbol ─────────────────────────────────────────────────────────
+    if args.symbol:
+        symbol = args.symbol.replace('/', '')   # normalise XAUUSD / XAU/USD
+    else:
+        # Pick first enabled MT5 symbol from config
+        symbol = None
+        for sym, sym_cfg in config.get('symbols', {}).items():
+            if sym_cfg.get('enabled') and sym_cfg.get('platform') == 'mt5':
+                symbol = sym.replace('/', '')
+                break
+        if not symbol:
+            print("ERROR: No enabled MT5 symbol found in config. "
+                  "Use --symbol XAUUSD or enable a symbol in config.yaml")
+            sys.exit(1)
+
+    # ── Resolve dates ──────────────────────────────────────────────────────────
+    bt_cfg     = config.get('backtest', {})
+    date_range = bt_cfg.get('date_range', {})
+
+    start_str = args.start or str(date_range.get('start', '2024-01-01'))
+    end_str   = args.end   or str(date_range.get('end',   '2024-01-31'))
+
+    start_date = datetime.strptime(start_str, '%Y-%m-%d')
+    end_date   = datetime.strptime(end_str,   '%Y-%m-%d')
+
+    # ── Resolve initial balance ────────────────────────────────────────────────
+    initial_balance = (
+        args.balance
+        or config.get('risk_management', {}).get('initial_balance', 10_000)
+    )
+
+    # ── Inject backtest timeframe config if not already present ────────────────
+    # The config uses 'timeframes' at top level; backtest needs entry + min TF.
+    # Derive from symbol config if backtest.timeframes block is absent.
+    if 'timeframes' not in bt_cfg:
+        # Find the symbol's configured timeframes
+        sym_key   = next((k for k in config.get('symbols', {}) if k.replace('/', '') == symbol), None)
+        sym_cfg   = config['symbols'].get(sym_key, {}) if sym_key else {}
+        entry_tf  = sym_cfg.get('entry_timeframe',
+                                config.get('timeframes', {}).get('entry_timeframe', '5m'))
+        # Minimum TF = lowest in the symbol's timeframe list, defaulting to 1m
+        tf_list   = sym_cfg.get('timeframes', ['1H', '15m', '5m'])
+        tf_order  = ['1m', '5m', '15m', '30m', '1H', '4H', '1D']
+        min_tf    = next((t for t in tf_order if t in tf_list), '1m')
+
+        config.setdefault('backtest', {})['timeframes'] = {
+            'entry_timeframe':   entry_tf,
+            'minimum_timeframe': min_tf,
         }
 
+    # ── Run ────────────────────────────────────────────────────────────────────
+    async def main():
         backtester      = Backtester(config)
         strategy_engine = StrategyEngine(config)
         money_manager   = MoneyManager(config)
         stop_manager    = StopManager(config)
 
+        print(f"\n  Config : {config_path}")
+        print(f"  Symbol : {symbol}")
+        print(f"  Period : {start_date.date()} -> {end_date.date()}")
+        print(f"  Balance: ${initial_balance:,.0f}")
+
         results = await backtester.run_from_mt5(
             strategy_engine = strategy_engine,
             money_manager   = money_manager,
             stop_manager    = stop_manager,
-            symbol          = 'XAUUSD',
-            start_date      = datetime(2026, 1, 1),
-            end_date        = datetime(2026, 1, 31),
-            initial_balance = 10_000,
+            symbol          = symbol,
+            start_date      = start_date,
+            end_date        = end_date,
+            initial_balance = initial_balance,
         )
 
         if results['total_trades'] > 0:
-            backtester.export_trades('data/backtest_trades.csv')
+            output_dir = PROJECT_ROOT / 'data'
+            output_dir.mkdir(exist_ok=True)
+            backtester.export_trades(str(output_dir / f'backtest_{symbol}_{start_str}_{end_str}.csv'))
 
     asyncio.run(main())
