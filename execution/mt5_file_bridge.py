@@ -488,16 +488,38 @@ class MT5FileBridge:
         else:
             return []
 
-    def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
+    async def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
         """
         Fetch the closed deal record for a given position ticket from MT5 history.
-        Returns a dict with exit_price, profit, swap, commission, net_profit,
-        exit_reason, close_time, entry_price, volume.
+
+        Calls the EA's get_deal_history action which scans HistorySelect for an
+        OUT deal whose DEAL_POSITION_ID matches the given position ticket.
+
+        Returns a dict with keys:
+            status, ticket, symbol, entry_price, exit_price, volume,
+            profit, swap, commission, net_profit, close_time, exit_reason
         """
-        return self._send_command({
-            "action"        : "get_deal_history",
-            "ticket"        : ticket,
-            "lookback_hours": lookback_hours,
+        if self.demo_mode:
+            # In demo mode there is no real history — return a neutral stub so
+            # _handle_external_close can still write a closed record without crashing.
+            return {
+                'status'     : 'success',
+                'ticket'     : ticket,
+                'entry_price': 0.0,
+                'exit_price' : 0.0,
+                'volume'     : 0.0,
+                'profit'     : 0.0,
+                'swap'       : 0.0,
+                'commission' : 0.0,
+                'net_profit' : 0.0,
+                'close_time' : 0,
+                'exit_reason': 'demo_close',
+            }
+
+        return await self._send_command({
+            'action'        : 'get_deal_history',
+            'ticket'        : ticket,
+            'lookback_hours': lookback_hours,
         })
 
     # ------------------------------------------------------------------

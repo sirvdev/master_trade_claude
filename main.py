@@ -148,6 +148,8 @@ class TradingSystem:
             'daily_drawdown_percent': 0,
             'starting_balance': 0
         }
+        self.consecutive_losses = 0
+        self.last_loss_time     = 0.0
         
         logger.info("Trading System initialized successfully")
         
@@ -1194,33 +1196,117 @@ class TradingSystem:
                 }
 
     async def _handle_external_close(self, trade_id: str, position: dict):
-        """Handle position closed outside our system."""
-        try:
-            logger.info(f"Recording external close for {trade_id}")
+            """
+            Handle a position that was closed outside our system (SL/TP hit by broker,
+            manual close on MT5 terminal, margin call, etc.).
 
-            # Update database
-            self.db.update_trade(trade_id, {
-            'status': 'closed',
-            'exit_time': datetime.utcnow(),
-            'exit_reason': 'external_close',
-            'exit_price': 0  # Unknown
-        })
-            
-            # Log the close
+            Fetches the actual closing deal from MT5 history so the database record
+            contains real exit_price, P&L, and exit_reason instead of zeros.
+            """
+            ticket      = position.get('ticket')
+            symbol      = position.get('symbol', '')
+            entry_price = position.get('entry_price', position.get('price', 0.0))
+            direction   = position.get('type', 0)       # 0=BUY, 1=SELL
+            sl          = position.get('stop_loss', 0.0)
+
+            logger.info(f"Recording external close for {trade_id} (ticket={ticket})")
+
+            # ── Fetch real deal data from MT5 history ────────────────────────────
+            exit_price  = 0.0
+            net_pnl     = 0.0
+            gross_profit= 0.0
+            swap        = 0.0
+            commission  = 0.0
+            exit_reason = 'external_close'
+            volume      = position.get('volume', 0.0)
+
+            if ticket:
+                try:
+                    lookback_hours = self.config.get('monitor', {}).get(
+                        'history_lookback_hours', 48
+                    )
+                    deal = await self.mt5_client.get_deal_history(
+                        ticket        = int(ticket),
+                        lookback_hours= lookback_hours,
+                    )
+
+                    if deal.get('status') == 'success':
+                        exit_price   = deal.get('exit_price',  0.0)
+                        gross_profit = deal.get('profit',      0.0)
+                        swap         = deal.get('swap',        0.0)
+                        commission   = deal.get('commission',  0.0)
+                        net_pnl      = deal.get('net_profit',  gross_profit + swap + commission)
+                        exit_reason  = deal.get('exit_reason', 'external_close')
+                        volume       = deal.get('volume',      volume)
+                        # Use deal entry_price only if we lost it locally
+                        if entry_price == 0.0:
+                            entry_price = deal.get('entry_price', 0.0)
+
+                        logger.info(
+                            f"[CLOSE] ticket={ticket} exit={exit_price:.5f} "
+                            f"net_pnl={net_pnl:.2f} reason={exit_reason}"
+                        )
+                    else:
+                        logger.warning(
+                            f"[CLOSE] get_deal_history failed for ticket={ticket}: "
+                            f"{deal.get('error')} — writing with zeros"
+                        )
+
+                except Exception as e:
+                    logger.error(
+                        f"[CLOSE] Exception fetching deal history for ticket={ticket}: {e}"
+                    )
+
+            # ── Compute realised R:R ─────────────────────────────────────────────
+            initial_risk = abs(entry_price - sl) if sl and entry_price else 0.0
+            realized_rr  = 0.0
+            if initial_risk > 0 and exit_price > 0 and entry_price > 0:
+                price_move  = (exit_price - entry_price) if direction == 0 \
+                            else (entry_price - exit_price)
+                realized_rr = price_move / initial_risk
+
+            # ── P&L as % of daily starting balance ──────────────────────────────
+            starting_balance = self.daily_stats.get('starting_balance') or 10_000.0
+            pnl_percent      = (net_pnl / starting_balance * 100) if starting_balance else 0.0
+
+            # ── Update daily drawdown stats ──────────────────────────────────────
+            if net_pnl < 0 and starting_balance:
+                self.daily_stats['daily_drawdown_percent'] = (
+                    self.daily_stats.get('daily_drawdown_percent', 0.0)
+                    + abs(pnl_percent)
+                )
+
+            # ── Consecutive loss tracking ────────────────────────────────────────
+            if net_pnl < 0:
+                self.consecutive_losses  = getattr(self, 'consecutive_losses', 0) + 1
+                self.last_loss_time      = _time.time()
+                logger.info(
+                    f"[CLOSE] Loss recorded — consecutive_losses={self.consecutive_losses}"
+                )
+            else:
+                self.consecutive_losses = 0
+
+            # ── Write to audit log + database (log_trade_exit handles db.update_trade) ──
             self.audit_logger.log_trade_exit(trade_id, {
-                'exit_price': 0,  # Unknown
-                'reason': 'external_close',
-                'pnl': 0,  # Would need to calculate
-                'pnl_percent': 0,
-                'realized_rr': 0
+                'exit_price'  : exit_price,
+                'reason'      : exit_reason,          # audit_logger expects key 'reason'
+                'pnl'         : round(net_pnl, 2),
+                'pnl_percent' : round(pnl_percent, 4),
+                'realized_rr' : round(realized_rr, 4),
             })
-            
-            # Remove from tracking
+
+            # ── Notification ─────────────────────────────────────────────────────
+            if hasattr(self, 'notifier'):
+                emoji = '✅' if net_pnl >= 0 else '❌'
+                self.notifier.send(
+                    f"{emoji} {symbol} closed ({exit_reason})\n"
+                    f"Exit: {exit_price:.5f} | Net P&L: {net_pnl:.2f} "
+                    f"| RR: {realized_rr:.2f}"
+                )
+
+            # ── Remove from open positions ────────────────────────────────────────
             if trade_id in self.open_positions:
                 del self.open_positions[trade_id]
-            
-        except Exception as e:
-            logger.error(f"Error handling external close: {e}")
                 
     async def _update_position(self, trade_id: str, position: dict):
         """Update single position."""
