@@ -165,7 +165,7 @@ strategy:
 # =============================================================================
 risk_management:
   # Position Sizing
-  max_risk_percent_per_trade: 0.30  # % of account equity
+  max_risk_percent_per_trade: 0.2  # % of account equity
   use_dynamic_sizing: true
   
   # Stop Loss
@@ -177,8 +177,8 @@ risk_management:
   # Take Profit
   take_profit:
     targets:
-      - {name: TP1, rr_ratio: 1, close_percent: 50}  # Close 50% at 1.5R
-      - {name: TP2, rr_ratio: 1.5, close_percent: 30}  # Close 30% at 3R
+      - {name: TP1, rr_ratio: 2, close_percent: 50}  # Close 50% at 1.5R
+      - {name: TP2, rr_ratio: 3, close_percent: 30}  # Close 30% at 3R
       - {name: TP3, rr_ratio: 999, close_percent: 20}  # Trail remainder
     
     dynamic_extension: true  # Extend TP on new structural highs
@@ -186,7 +186,7 @@ risk_management:
   # Trailing Stop
   trailing_stop:
     enabled: true
-    activation_rr: 0.5  # Activate trailing at 1:1 R:R
+    activation_rr: 0.3  # Activate trailing at 1:1 R:R
     method: atr  # atr or percentage
     atr_multiplier: 0.3
     percentage: 0.5  # If method is percentage
@@ -208,7 +208,7 @@ risk_management:
     daily_max_drawdown_percent: 5.0
     max_concurrent_trades: 5
     max_trades_per_day: 333
-    max_risk_per_symbol_percent: 5.0
+    max_risk_per_symbol_percent: 3.0
     
     cooldown_after_losses:
       enabled: true

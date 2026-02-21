@@ -104,9 +104,9 @@ class MoneyManager:
         
         # Calculate actual risk with final position size
         if platform == 'mt5':
-            # MT5: risk = lots × contract size × pip value × pip distance
-            # For XAUUSD: 1 lot = 100 oz, pip = $0.01, so risk = lots × 100 × distance
-            actual_risk = position_size * 100 * risk_distance
+            contract_size = self._get_mt5_contract_size(symbol)
+            actual_risk = position_size * contract_size * risk_distance
+
         else:
             actual_risk = position_size * risk_distance
         
@@ -114,7 +114,8 @@ class MoneyManager:
         
         # Calculate position value
         if platform == 'mt5':
-            position_value = position_size * 100 * entry_price  # lots × contract size × price
+            contract_size = self._get_mt5_contract_size(symbol)
+            position_value = position_size * contract_size * entry_price
         else:
             position_value = position_size * entry_price
         
@@ -150,34 +151,27 @@ class MoneyManager:
     ) -> float:
         """
         Calculate MT5 position size in lots.
-        
-        For XAUUSD (Gold):
-        - 1 lot = 100 troy ounces
-        - 1 pip = $0.01
-        - Risk = lots × 100 × price_distance
-        
-        Example:
-        - Risk $100, entry 2000, SL 1990 (10 point distance)
-        - Lots = 100 / (100 × 10) = 0.10 lots
+
+        Formula:  lots = max_risk / (contract_size × risk_distance)
+
+        Examples:
+          XAUUSD: $317 risk, $61 distance, contract=100
+                  → 317 / (100 × 61) = 0.052 lots ✓
+
+          BTCUSD: $317 risk, $61 distance, contract=1
+                  → 317 / (1 × 61) = 5.2 lots ✓
+
+          EURUSD: $100 risk, 0.0010 distance, contract=100000
+                  → 100 / (100000 × 0.001) = 1.0 lots ✓
         """
-        # Contract size (standard)
-        if 'XAU' in symbol or 'GOLD' in symbol.upper():
-            contract_size = 100  # 100 oz per lot
-        elif 'XAG' in symbol or 'SILVER' in symbol.upper():
-            contract_size = 5000  # 5000 oz per lot
-        else:
-            contract_size = 100000  # Standard forex lot
-        
-        # Calculate lots needed
-        # Risk = lots × contract_size × risk_distance
-        # Therefore: lots = risk / (contract_size × risk_distance)
+        contract_size = self._get_mt5_contract_size(symbol)
         lots = max_risk_amount / (contract_size * risk_distance)
-        
+
         logger.debug(
-            f"MT5 calculation: ${max_risk_amount:.2f} risk / "
-            f"({contract_size} × {risk_distance:.4f}) = {lots:.4f} lots"
+            f"MT5 sizing: ${max_risk_amount:.2f} risk / "
+            f"(contract={contract_size} × dist={risk_distance:.4f}) = {lots:.4f} lots"
         )
-        
+
         return lots
     
     def _apply_mt5_constraints(self, lots: float) -> float:
@@ -396,6 +390,49 @@ class MoneyManager:
             }
         
         return {'cooldown_active': False, 'consecutive_losses': consecutive_losses}
+
+    def _get_mt5_contract_size(self, symbol: str) -> float:
+        """
+        Return the MT5 contract size (units per lot) for a given symbol.
+
+        MT5 contract sizes vary by instrument:
+          - XAUUSD (Gold):   100 troy oz per lot
+          - XAGUSD (Silver): 5000 troy oz per lot
+          - BTCUSD / BTCUSD: 1 BTC per lot
+          - ETHUSD:          1 ETH per lot
+          - Other crypto:    1 coin per lot
+          - Forex pairs:     100,000 base currency units per lot (standard)
+
+        These can be overridden per-symbol in config:
+          risk_management:
+            mt5_contract_sizes:
+              BTCUSD: 1
+              XAUUSD: 100
+        """
+        # Allow per-symbol overrides from config
+        overrides = self.config.get('mt5_contract_sizes', {})
+        sym_upper = symbol.upper().replace('/', '')
+
+        for key, val in overrides.items():
+            if key.upper().replace('/', '') in sym_upper or sym_upper in key.upper().replace('/', ''):
+                return float(val)
+
+        # Built-in defaults
+        if any(x in sym_upper for x in ('XAU', 'GOLD')):
+            return 100.0      # 100 troy oz per lot
+        if any(x in sym_upper for x in ('XAG', 'SILVER')):
+            return 5000.0     # 5000 troy oz per lot
+        if any(x in sym_upper for x in ('BTC', 'BITCOIN')):
+            return 1.0        # 1 BTC per lot
+        if any(x in sym_upper for x in ('ETH', 'ETHEREUM')):
+            return 1.0        # 1 ETH per lot
+        if any(x in sym_upper for x in ('LTC', 'LITECOIN')):
+            return 1.0
+        if any(x in sym_upper for x in ('XRP', 'RIPPLE')):
+            return 1.0
+
+        # Default: standard forex lot
+        return 100000.0
 
 
 # Test the fixed calculation
