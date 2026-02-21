@@ -377,7 +377,13 @@ class MoneyManager:
         
         consecutive_losses = 0
         for trade in reversed(recent_trades):
-            if trade.get('pnl', 0) < 0:
+            pnl = trade.get('pnl')
+            if pnl is None:
+                # Trade was closed without a pnl record (e.g. broker-closed while
+                # system was down and deal history couldn't be fetched).
+                # Treat as neutral — don't count as a loss or break the streak.
+                continue
+            if pnl < 0:
                 consecutive_losses += 1
             else:
                 break

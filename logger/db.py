@@ -35,6 +35,7 @@ class DatabaseManager:
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # Enable column access by name
         self._initialize_schema()
+        self._run_migrations()
         
     def disconnect(self):
         """Close database connection."""
@@ -94,6 +95,7 @@ class DatabaseManager:
                 take_profit_2 REAL,
                 take_profit_3 REAL,
                 position_size REAL NOT NULL,
+                ticket INTEGER,  -- broker order/position ticket (MT5 ticket or Binance order ID)
                 status TEXT NOT NULL,  -- open, closed, partial
                 exit_reason TEXT,  -- tp1, tp2, tp3, sl, manual, trailing
                 pnl REAL,
@@ -193,6 +195,35 @@ class DatabaseManager:
         
         self.conn.commit()
         logger.info("Database schema initialized")
+
+    
+    def _run_migrations(self):
+        """
+        Apply any schema migrations needed for existing databases.
+        Safe to run every startup — each migration checks before applying.
+        """
+        cursor = self.conn.cursor()
+
+        # ── Migration 1: Add ticket column to trades ──────────────────────────
+        # Required for broker position tracking and restart recovery.
+        existing = {
+            row[1] for row in cursor.execute("PRAGMA table_info(trades)")
+        }
+        if 'ticket' not in existing:
+            cursor.execute("ALTER TABLE trades ADD COLUMN ticket INTEGER")
+            logger.info("Migration: added 'ticket' column to trades table")
+
+        # ── Migration 2: Add original_stop_loss column to trades ─────────────
+        # Used for correct RR calculation after breakeven/trailing moves.
+        if 'original_stop_loss' not in existing:
+            cursor.execute(
+                "ALTER TABLE trades ADD COLUMN original_stop_loss REAL"
+            )
+            logger.info(
+                "Migration: added 'original_stop_loss' column to trades table"
+            )
+
+        self.conn.commit()
         
     """
     Fixed log_analysis method and _convert_numpy_types in logger/db.py
