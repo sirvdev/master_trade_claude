@@ -27,13 +27,14 @@ from execution.binance_api import BinanceAPI
 from learning.learner import StrategyLearner
 
 # Setup logging
+_file_handler   = logging.FileHandler('logs/trading_system.log', encoding='utf-8')
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.stream.reconfigure(encoding='utf-8', errors='replace')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/trading_system.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[_file_handler, _stream_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,7 @@ class TradingSystem:
         
     def _init_execution_clients(self):
         """Initialize execution clients."""
-        demo_mode = self.config['general']['mode'] == 'demo'
+        demo_mode = self.config['general']['mode'] == 'live'
         
         # MT5
         mt5_config = {
@@ -298,39 +299,6 @@ class TradingSystem:
                 logger.error(f"Error in balance monitor: {e}", exc_info=True)
                 await asyncio.sleep(30)
 
-    async def _get_total_balance(self) -> float:
-        """Get total account balance across all platforms."""
-        total_equity = 0.0
-        
-        try:
-            # Get MT5 balance
-            if self.mt5_client and self.mt5_client.is_connected():
-                mt5_balance = await self.mt5_client.get_balance()
-                if mt5_balance.get('success'):
-                    total_equity += mt5_balance.get('equity', 0.0)
-                    logger.info(f"MT5 Equity: ${mt5_balance.get('equity', 0):.2f}")
-            
-            # Get Binance balance
-            if self.binance_client and self.binance_client.is_connected():
-                try:
-                    binance_balance = await self.binance_client.get_balance()
-                    # Binance returns different format
-                    total_equity += binance_balance.get('total_usd', 0.0)
-                    logger.info(f"Binance Equity: ${binance_balance.get('total_usd', 0):.2f}")
-                except Exception as e:
-                    logger.warning(f"Could not get Binance balance: {e}")
-            
-            # Update equity variable
-            self.current_equity = total_equity
-            
-            logger.info(f"Total Equity: ${total_equity:.2f}")
-            return total_equity
-            
-        except Exception as e:
-            logger.error(f"Error getting total balance: {e}")
-            # Return last known equity or default
-            return self.current_equity if self.current_equity > 0 else 10000.0
-
     async def _emergency_close_all(self):
         """Emergency close all positions."""
         logger.warning("EMERGENCY: Closing all positions!")
@@ -370,7 +338,7 @@ class TradingSystem:
         
         # Connect execution clients
         await self.mt5_client.connect()
-        await self.binance_client.connect()
+        # await self.binance_client.connect()
         
         # Get starting balance
         self.daily_stats['starting_balance'] = await self._get_total_balance()
@@ -396,48 +364,96 @@ class TradingSystem:
             await self.shutdown()
     
     async def _load_open_positions_from_db(self):
-        """Load open positions from database on startup."""
+        """
+        Load open positions from database on startup and verify each one
+        still exists on the broker.
+
+        - If the ticket is missing from DB (wasn't saved): log a warning and
+          mark closed — we cannot verify without a ticket.
+        - If the position is not found on MT5: call _handle_external_close so
+          deal history is fetched and P&L/exit data is populated properly.
+        - If found: restore the full position dict into open_positions.
+        """
         try:
             open_trades = self.db.get_open_trades()
-            
             logger.info(f"Loading {len(open_trades)} open positions from database")
-            
+
             for trade in open_trades:
                 trade_id = trade['trade_id']
-                
-                # Verify position still exists on broker
-                platform = trade['platform']
-                ticket = trade.get('ticket')
-                
-                if platform == 'mt5' and ticket:
-                    pos_info = await self.mt5_client.get_position_info(ticket)
+                platform = trade.get('platform', 'mt5')
+                ticket   = trade.get('ticket')
+
+                # ── Guard: ticket must be present to verify ───────────────────
+                if not ticket:
+                    logger.warning(
+                        f"[STARTUP] trade_id={trade_id} has no ticket saved — "
+                        f"cannot verify on broker, marking closed."
+                    )
+                    self.db.update_trade(trade_id, {
+                        'status'     : 'closed',
+                        'exit_reason': 'missing_ticket_on_restart',
+                        'exit_time'  : datetime.utcnow(),
+                    })
+                    continue
+
+                # ── MT5 verification ──────────────────────────────────────────
+                if platform == 'mt5':
+                    pos_info = await self.mt5_client.get_position_info(int(ticket))
+
                     if not pos_info:
-                        logger.warning(f"Position {trade_id} not found on MT5, marking closed")
-                        self.db.update_trade(trade_id, {
-                            'status': 'closed',
-                            'exit_reason': 'not_found_on_broker',
-                            'exit_time': datetime.utcnow()
-                        })
+                        logger.warning(
+                            f"[STARTUP] trade_id={trade_id} ticket={ticket} "
+                            f"not found on MT5 — was closed while system was down."
+                        )
+                        # Build a minimal position dict so _handle_external_close
+                        # has the data it needs for the deal history lookup
+                        ghost_position = {
+                            'ticket'             : ticket,
+                            'symbol'             : trade.get('symbol'),
+                            'direction'          : trade.get('direction'),
+                            'entry_price'        : trade.get('entry_price', 0.0),
+                            'stop_loss'          : trade.get('stop_loss', 0.0),
+                            'original_stop_loss' : trade.get('stop_loss', 0.0),
+                            'take_profit_1'      : trade.get('take_profit_1', 0.0),
+                            'volume'             : trade.get('position_size', 0.0),
+                            'position_size'      : trade.get('position_size', 0.0),
+                            'entry_time'         : trade.get('entry_time'),
+                            'platform'           : platform,
+                            'max_favorable_excursion': None,
+                            'max_adverse_excursion'  : None,
+                        }
+                        await self._handle_external_close(trade_id, ghost_position)
                         continue
-                
-                # Add to tracking
+
+                # ── Position confirmed alive — restore into tracking ───────────
                 self.open_positions[trade_id] = {
-                    'trade_id': trade_id,
-                    'symbol': trade['symbol'],
-                    'platform': trade['platform'],
-                    'direction': trade['direction'],
-                    'entry_price': trade['entry_price'],
-                    'stop_loss': trade['stop_loss'],
-                    'take_profit_1': trade.get('take_profit_1'),
-                    'take_profit_2': trade.get('take_profit_2'),
-                    'position_size': trade['position_size'],
-                    'ticket': ticket,
-                    'entry_time': trade['entry_time'],
-                    'analysis_id': trade.get('analysis_id')
+                    'trade_id'           : trade_id,
+                    'ticket'             : ticket,
+                    'symbol'             : trade.get('symbol'),
+                    'platform'           : platform,
+                    'direction'          : trade.get('direction'),
+                    'entry_price'        : trade.get('entry_price', 0.0),
+                    'current_price'      : trade.get('entry_price', 0.0),
+                    'stop_loss'          : trade.get('stop_loss', 0.0),
+                    'original_stop_loss' : trade.get('stop_loss', 0.0),
+                    'take_profit_1'      : trade.get('take_profit_1'),
+                    'take_profit_2'      : trade.get('take_profit_2'),
+                    'position_size'      : trade.get('position_size', 0.0),
+                    'volume'             : trade.get('position_size', 0.0),
+                    'entry_time'         : trade.get('entry_time'),
+                    'analysis_id'        : trade.get('analysis_id'),
+                    'trailing_active'    : False,
+                    'tp1_hit'            : False,
+                    'tp2_hit'            : False,
+                    'last_sl_update'     : 0.0,
+                    'high_since_entry'   : trade.get('entry_price', 0.0),
+                    'low_since_entry'    : trade.get('entry_price', 0.0),
+                    'max_favorable_excursion': 0.0,
+                    'max_adverse_excursion'  : 0.0,
                 }
-            
-            logger.info(f" Loaded {len(self.open_positions)} active positions")
-            
+
+            logger.info(f"Loaded {len(self.open_positions)} active positions")
+
         except Exception as e:
             logger.error(f"Error loading open positions: {e}", exc_info=True)
 
@@ -459,7 +475,7 @@ class TradingSystem:
                         f"Skipping analysis - at max positions "
                         f"({current_positions}/{max_concurrent})"
                     )
-                    await asyncio.sleep(960)
+                    await asyncio.sleep(903)
                     continue
                 
                 # Get enabled symbols
@@ -537,11 +553,11 @@ class TradingSystem:
                         continue
                 
                 # Wait before next iteration
-                await asyncio.sleep(960)
+                await asyncio.sleep(303)
                 
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
-                await asyncio.sleep(960)
+                await asyncio.sleep(60)
                 
     async def _process_entry_signal(self, symbol: str, symbol_config: dict,
                                 analysis: dict, multi_tf_data: dict):
@@ -669,7 +685,7 @@ class TradingSystem:
                 
                 # Update with ticket
                 self.db.update_trade(trade_id, {
-                    # 'ticket': ticket,
+                    'ticket': ticket,
                     'status': 'open'
                 })
                 
@@ -770,6 +786,29 @@ class TradingSystem:
                 position['profit']        = current.get('profit', 0)
                 position['volume']        = current.get('volume', position.get('volume'))
 
+                # ── Track Max Favorable / Adverse Excursion ───────────────────
+                entry_price   = position.get('entry_price', 0.0)
+                direction     = position.get('direction', 'long')
+
+                if entry_price and current_price:
+                    if direction == 'long':
+                        favorable = current_price - entry_price
+                        adverse   = entry_price - current_price
+                    else:
+                        favorable = entry_price - current_price
+                        adverse   = current_price - entry_price
+
+                    # MFE: best the trade has looked (highest favorable move)
+                    position['max_favorable_excursion'] = max(
+                        position.get('max_favorable_excursion', 0.0),
+                        favorable
+                    )
+                    # MAE: worst the trade has looked (highest adverse move, stored positive)
+                    position['max_adverse_excursion'] = max(
+                        position.get('max_adverse_excursion', 0.0),
+                        adverse
+                    )
+
                 # ── TP level checks ───────────────────────────────────────────────
                 position['current_price'] = current_price
                 self._check_and_handle_tp_levels_sync(trade_id, position, current_price)
@@ -813,30 +852,31 @@ class TradingSystem:
         trade_id: str,
         position: dict,
         current_price: float,
-    ) -> None:
+    ):
         """
-        Update trailing stop for a live MT5 position if conditions are met.
-        Called from _batch_update_mt5_positions with the live current_price
-        already fetched from MT5 (current_price field from updated MQ5 bridge).
-        """
-        import time as _time
+        Check whether the trailing stop should be moved and, if so, send the
+        modify call to MT5.
 
-        cfg_trail           = self.config.get('risk_management', {}).get('trailing_stop', {})
+        Uses StopManager.compute_trailing_sl() which wraps the existing
+        _calculate_atr_trailing_stop / _calculate_percentage_trailing_stop.
+        """
+        cfg_trail   = self.config.get('risk_management', {}).get('trailing_stop', {})
         if not cfg_trail.get('enabled', True):
             return
 
-        trail_mode          = cfg_trail.get('method', 'atr')        # 'atr' | 'percent'
         rr_activate         = cfg_trail.get('activation_rr', 1.0)
         min_update_interval = cfg_trail.get('min_update_interval_seconds', 30)
 
         ticket      = position.get('ticket')
-        symbol      = position.get('symbol')
-        direction   = position.get('direction', 'long')             # 'long' | 'short'
+        symbol      = position.get('symbol', '')
+        direction   = position.get('direction', 'long')   # 'long' | 'short'
         entry_price = position.get('entry_price', 0.0)
+        # Use original SL for RR calc — current_sl may have moved to breakeven
+        original_sl = position.get('original_stop_loss') or position.get('stop_loss', 0.0)
         current_sl  = position.get('stop_loss', 0.0)
-        current_tp  = position.get('take_profit_1') or position.get('take_profit', 0.0)
+        current_tp  = position.get('take_profit_1', 0.0) or 0.0
 
-        if not ticket or not symbol or not entry_price or not current_sl:
+        if not entry_price or not current_sl:
             return
 
         # Rate-limit: avoid hammering MT5 with modify calls
@@ -844,17 +884,14 @@ class TradingSystem:
         if (_time.time() - last_update) < min_update_interval:
             return
 
-        initial_risk = abs(entry_price - current_sl)
+        # Initial risk uses ORIGINAL SL so RR is always relative to entry risk
+        initial_risk = abs(entry_price - original_sl)
         if initial_risk == 0:
             return
 
-        # Determine profit move in price units
-        if direction == 'long':
-            price_move = current_price - entry_price
-        else:
-            price_move = entry_price - current_price
-
-        achieved_rr = price_move / initial_risk if initial_risk > 0 else 0.0
+        price_move = (current_price - entry_price) if direction == 'long' \
+                     else (entry_price - current_price)
+        achieved_rr = price_move / initial_risk
 
         # ── Activation check ─────────────────────────────────────────────────
         if not position.get('trailing_active', False):
@@ -862,7 +899,7 @@ class TradingSystem:
                 return  # Not yet profitable enough to trail
 
             # Break-even move on first activation
-            be_cfg    = cfg_trail.get('breakeven', {})
+            be_cfg     = cfg_trail.get('breakeven', {})
             buffer_pts = be_cfg.get('buffer_pips', 1) * self._pip_size(symbol)
 
             if direction == 'long':
@@ -884,27 +921,49 @@ class TradingSystem:
                 f"trailing ACTIVATED at RR={achieved_rr:.2f}"
             )
 
-        # ── Compute new SL via StopManager ───────────────────────────────────
+        # ── Fetch ATR for trail calculation ───────────────────────────────────
+        # Use the ATR already computed during the last analysis pass if cached,
+        # otherwise fall back to a simple price-based estimate.
+        atr = position.get('last_atr')
+        if not atr or atr <= 0:
+            # Rough fallback: 0.1% of price — keeps trailing functional if
+            # no ATR is cached yet
+            atr = current_price * 0.001
+            logger.debug(
+                f"[TRAIL] No cached ATR for {symbol}, using fallback {atr:.4f}"
+            )
+
+        # Track high/low since entry on the position dict
+        if direction == 'long':
+            position['high_since_entry'] = max(
+                position.get('high_since_entry', entry_price), current_price
+            )
+            position['low_since_entry'] = min(
+                position.get('low_since_entry', entry_price), current_price
+            )
+        else:
+            position['high_since_entry'] = max(
+                position.get('high_since_entry', entry_price), current_price
+            )
+            position['low_since_entry'] = min(
+                position.get('low_since_entry', entry_price), current_price
+            )
+
+        # ── Call the real StopManager method ─────────────────────────────────
         try:
             new_sl = self.stop_manager.compute_trailing_sl(
-                symbol        = symbol,
-                direction     = direction,
-                current_price = current_price,
-                current_sl    = current_sl,
-                mode          = trail_mode,
-                config        = cfg_trail,
+                direction        = direction,
+                current_price    = current_price,
+                current_sl       = current_sl,
+                high_since_entry = position['high_since_entry'],
+                low_since_entry  = position['low_since_entry'],
+                atr              = atr,
             )
         except Exception as exc:
             logger.error(f"[TRAIL] StopManager error for ticket={ticket}: {exc}")
             return
 
         if new_sl is None:
-            return
-
-        # Only move SL in the favourable direction — never widen
-        if direction == 'long'  and new_sl <= current_sl:
-            return
-        if direction == 'short' and new_sl >= current_sl:
             return
 
         await self._send_sl_modify(trade_id, position, new_sl, current_tp, label='trail')
@@ -1196,117 +1255,156 @@ class TradingSystem:
                 }
 
     async def _handle_external_close(self, trade_id: str, position: dict):
-            """
-            Handle a position that was closed outside our system (SL/TP hit by broker,
-            manual close on MT5 terminal, margin call, etc.).
+        """
+        Handle a position that was closed outside our system (SL/TP hit by broker,
+        manual close on MT5 terminal, margin call, etc.).
 
-            Fetches the actual closing deal from MT5 history so the database record
-            contains real exit_price, P&L, and exit_reason instead of zeros.
-            """
-            ticket      = position.get('ticket')
-            symbol      = position.get('symbol', '')
-            entry_price = position.get('entry_price', position.get('price', 0.0))
-            direction   = position.get('type', 0)       # 0=BUY, 1=SELL
-            sl          = position.get('stop_loss', 0.0)
+        Fetches the actual closing deal from MT5 history so the database record
+        contains real exit_price, P&L, duration, commission, slippage, MFE/MAE
+        and exit_reason instead of zeros.
+        """
+        ticket      = position.get('ticket')
+        symbol      = position.get('symbol', '')
+        entry_price = position.get('entry_price', 0.0)
+        direction   = position.get('direction', 'long')
+        sl          = position.get('stop_loss', 0.0)
+        tp1         = position.get('take_profit_1', 0.0)
+        entry_time  = position.get('entry_time')      # datetime stored at registration
 
-            logger.info(f"Recording external close for {trade_id} (ticket={ticket})")
+        logger.info(f"Recording external close for {trade_id} (ticket={ticket})")
 
-            # ── Fetch real deal data from MT5 history ────────────────────────────
-            exit_price  = 0.0
-            net_pnl     = 0.0
-            gross_profit= 0.0
-            swap        = 0.0
-            commission  = 0.0
-            exit_reason = 'external_close'
-            volume      = position.get('volume', 0.0)
+        # ── Fetch real deal data from MT5 history ────────────────────────────
+        exit_price   = 0.0
+        net_pnl      = 0.0
+        gross_profit = 0.0
+        swap         = 0.0
+        commission   = 0.0
+        exit_reason  = 'external_close'
+        volume       = position.get('volume', position.get('position_size', 0.0))
+        close_time   = None     # will be set from deal if available
 
-            if ticket:
-                try:
-                    lookback_hours = self.config.get('monitor', {}).get(
-                        'history_lookback_hours', 48
-                    )
-                    deal = await self.mt5_client.get_deal_history(
-                        ticket        = int(ticket),
-                        lookback_hours= lookback_hours,
-                    )
-
-                    if deal.get('status') == 'success':
-                        exit_price   = deal.get('exit_price',  0.0)
-                        gross_profit = deal.get('profit',      0.0)
-                        swap         = deal.get('swap',        0.0)
-                        commission   = deal.get('commission',  0.0)
-                        net_pnl      = deal.get('net_profit',  gross_profit + swap + commission)
-                        exit_reason  = deal.get('exit_reason', 'external_close')
-                        volume       = deal.get('volume',      volume)
-                        # Use deal entry_price only if we lost it locally
-                        if entry_price == 0.0:
-                            entry_price = deal.get('entry_price', 0.0)
-
-                        logger.info(
-                            f"[CLOSE] ticket={ticket} exit={exit_price:.5f} "
-                            f"net_pnl={net_pnl:.2f} reason={exit_reason}"
-                        )
-                    else:
-                        logger.warning(
-                            f"[CLOSE] get_deal_history failed for ticket={ticket}: "
-                            f"{deal.get('error')} — writing with zeros"
-                        )
-
-                except Exception as e:
-                    logger.error(
-                        f"[CLOSE] Exception fetching deal history for ticket={ticket}: {e}"
-                    )
-
-            # ── Compute realised R:R ─────────────────────────────────────────────
-            initial_risk = abs(entry_price - sl) if sl and entry_price else 0.0
-            realized_rr  = 0.0
-            if initial_risk > 0 and exit_price > 0 and entry_price > 0:
-                price_move  = (exit_price - entry_price) if direction == 0 \
-                            else (entry_price - exit_price)
-                realized_rr = price_move / initial_risk
-
-            # ── P&L as % of daily starting balance ──────────────────────────────
-            starting_balance = self.daily_stats.get('starting_balance') or 10_000.0
-            pnl_percent      = (net_pnl / starting_balance * 100) if starting_balance else 0.0
-
-            # ── Update daily drawdown stats ──────────────────────────────────────
-            if net_pnl < 0 and starting_balance:
-                self.daily_stats['daily_drawdown_percent'] = (
-                    self.daily_stats.get('daily_drawdown_percent', 0.0)
-                    + abs(pnl_percent)
+        if ticket:
+            try:
+                lookback_hours = self.config.get('monitor', {}).get(
+                    'history_lookback_hours', 48
+                )
+                deal = await self.mt5_client.get_deal_history(
+                    ticket        = int(ticket),
+                    lookback_hours= lookback_hours,
                 )
 
-            # ── Consecutive loss tracking ────────────────────────────────────────
-            if net_pnl < 0:
-                self.consecutive_losses  = getattr(self, 'consecutive_losses', 0) + 1
-                self.last_loss_time      = _time.time()
-                logger.info(
-                    f"[CLOSE] Loss recorded — consecutive_losses={self.consecutive_losses}"
+                if deal.get('status') == 'success':
+                    exit_price   = deal.get('exit_price',  0.0)
+                    gross_profit = deal.get('profit',      0.0)
+                    swap         = deal.get('swap',        0.0)
+                    commission   = deal.get('commission',  0.0)
+                    net_pnl      = deal.get('net_profit',  gross_profit + swap + commission)
+                    exit_reason  = deal.get('exit_reason', 'external_close')
+                    volume       = deal.get('volume',      volume)
+                    close_time   = deal.get('close_time',  None)   # unix epoch int
+
+                    if entry_price == 0.0:
+                        entry_price = deal.get('entry_price', 0.0)
+
+                    logger.info(
+                        f"[CLOSE] ticket={ticket} exit={exit_price:.5f} "
+                        f"net_pnl={net_pnl:.2f} commission={commission:.2f} "
+                        f"reason={exit_reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"[CLOSE] get_deal_history failed for ticket={ticket}: "
+                        f"{deal.get('error')} — writing with available data"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"[CLOSE] Exception fetching deal history for ticket={ticket}: {e}"
                 )
+
+        # ── Duration ─────────────────────────────────────────────────────────
+        duration_minutes = None
+        if entry_time:
+            # entry_time is a datetime; close_time from deal is a unix epoch int
+            if close_time and close_time > 0:
+                exit_dt = datetime.utcfromtimestamp(close_time)
             else:
-                self.consecutive_losses = 0
+                exit_dt = datetime.utcnow()
 
-            # ── Write to audit log + database (log_trade_exit handles db.update_trade) ──
-            self.audit_logger.log_trade_exit(trade_id, {
-                'exit_price'  : exit_price,
-                'reason'      : exit_reason,          # audit_logger expects key 'reason'
-                'pnl'         : round(net_pnl, 2),
-                'pnl_percent' : round(pnl_percent, 4),
-                'realized_rr' : round(realized_rr, 4),
-            })
+            if isinstance(entry_time, datetime):
+                delta = exit_dt - entry_time
+                duration_minutes = round(delta.total_seconds() / 60, 1)
 
-            # ── Notification ─────────────────────────────────────────────────────
-            if hasattr(self, 'notifier'):
-                emoji = '✅' if net_pnl >= 0 else '❌'
-                self.notifier.send(
-                    f"{emoji} {symbol} closed ({exit_reason})\n"
-                    f"Exit: {exit_price:.5f} | Net P&L: {net_pnl:.2f} "
-                    f"| RR: {realized_rr:.2f}"
-                )
+        # ── Slippage (exit): difference between the reference price and actual fill ──
+        # For SL hits: reference = stop_loss level
+        # For TP hits: reference = take_profit_1 level
+        # For everything else: 0
+        slippage = 0.0
+        if exit_price > 0:
+            if exit_reason == 'stop_loss' and sl:
+                slippage = round(abs(exit_price - sl), 5)
+            elif exit_reason == 'take_profit' and tp1:
+                slippage = round(abs(exit_price - tp1), 5)
 
-            # ── Remove from open positions ────────────────────────────────────────
-            if trade_id in self.open_positions:
-                del self.open_positions[trade_id]
+        # ── Realised R:R — use ORIGINAL SL, not the current (post-breakeven) SL ──
+        original_sl  = position.get('original_stop_loss') or sl
+        initial_risk = abs(entry_price - original_sl) if original_sl and entry_price else 0.0
+        realized_rr  = 0.0
+        if initial_risk > 0 and exit_price > 0 and entry_price > 0:
+            price_move  = (exit_price - entry_price) if direction == 'long' \
+                          else (entry_price - exit_price)
+            realized_rr = price_move / initial_risk
+
+        # ── P&L as % of current live equity (not hardcoded config value) ─────
+        equity      = self.current_equity if self.current_equity > 0 else 10_000.0
+        pnl_percent = round((net_pnl / equity * 100), 4) if equity else 0.0
+
+        # ── Update daily drawdown stats ──────────────────────────────────────
+        if net_pnl < 0 and self.daily_stats.get('starting_balance', 0) > 0:
+            self.daily_stats['daily_drawdown_percent'] = (
+                self.daily_stats.get('daily_drawdown_percent', 0.0)
+                + abs(pnl_percent)
+            )
+
+        # ── Consecutive loss tracking ────────────────────────────────────────
+        if net_pnl < 0:
+            self.consecutive_losses = getattr(self, 'consecutive_losses', 0) + 1
+            self.last_loss_time     = _time.time()
+            logger.info(
+                f"[CLOSE] Loss — consecutive_losses={self.consecutive_losses}"
+            )
+        else:
+            self.consecutive_losses = 0
+
+        # ── Write everything to audit log + database ──────────────────────────
+        # audit_logger.log_trade_exit now passes all fields through to db.update_trade
+        self.audit_logger.log_trade_exit(trade_id, {
+            'exit_price'             : exit_price,
+            'reason'                 : exit_reason,
+            'pnl'                    : round(net_pnl, 2),
+            'pnl_percent'            : pnl_percent,
+            'realized_rr'            : round(realized_rr, 4),
+            'duration_minutes'       : duration_minutes,
+            'commission'             : round(commission, 2),
+            'slippage'               : slippage,
+            'max_favorable_excursion': position.get('max_favorable_excursion'),
+            'max_adverse_excursion'  : position.get('max_adverse_excursion'),
+        })
+
+        # ── Notification ─────────────────────────────────────────────────────
+        if hasattr(self, 'notifier'):
+            emoji = '✅' if net_pnl >= 0 else '❌'
+            dur_str = f"{duration_minutes:.0f}m" if duration_minutes else "?"
+            self.notifier.send(
+                f"{emoji} {symbol} closed ({exit_reason})\n"
+                f"Exit: {exit_price:.5f} | Net P&L: {net_pnl:.2f} "
+                f"| RR: {realized_rr:.2f} | Duration: {dur_str}"
+            )
+
+        # ── Remove from open positions ────────────────────────────────────────
+        if trade_id in self.open_positions:
+            del self.open_positions[trade_id]
+
                 
     async def _update_position(self, trade_id: str, position: dict):
         """Update single position."""
@@ -1478,6 +1576,7 @@ class TradingSystem:
             'position_size'  : volume,
             'volume'         : volume,
             'stop_loss'      : sl,
+            'original_stop_loss': sl,
             'take_profit_1'  : tp1,
             'take_profit_2'  : tp2,
             'tp1_fraction'   : tp1_fraction,
@@ -1608,16 +1707,72 @@ class TradingSystem:
                 logger.error(f"Error in daily summary: {e}", exc_info=True)
                 
     async def _get_total_balance(self) -> float:
-        """Get total account balance across platforms."""
-        total = 10000.0  # Default/demo
-        
-        try:
-            # Would get real balances here
-            pass
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}")
-            
-        return total
+            """
+            Fetch live account equity across all connected platforms.
+
+            MT5  → authenticate action → returns balance + equity (we use equity
+                so unrealised P&L is included in risk calculations).
+            Binance → fetch_balance → returns total_usd.
+
+            Falls back to the last cached self.current_equity if a platform call
+            fails, so a temporary disconnect doesn't zero-out the risk engine.
+            In demo mode the MT5 bridge returns the simulated equity from
+            _simulate_command, so no special-casing is needed here.
+            """
+            total_equity = 0.0
+            any_platform_succeeded = False
+
+            # ── MT5 ──────────────────────────────────────────────────────────────
+            if self.mt5_client and self.mt5_client.is_connected():
+                try:
+                    mt5_balance = await self.mt5_client.get_balance()
+                    if mt5_balance.get('success'):
+                        mt5_equity = mt5_balance.get('equity', 0.0)
+                        total_equity += mt5_equity
+                        any_platform_succeeded = True
+                        # logger.info(f"MT5 equity: ${mt5_equity:,.2f}")
+                    else:
+                        logger.warning(
+                            f"MT5 get_balance returned failure: {mt5_balance}"
+                        )
+                except Exception as e:
+                    logger.error(f"Error fetching MT5 balance: {e}")
+            else:
+                logger.debug("MT5 client not connected — skipping MT5 balance fetch")
+
+            # ── Binance ───────────────────────────────────────────────────────────
+            if self.binance_client and self.binance_client.is_connected():
+                try:
+                    binance_balance = await self.binance_client.get_balance()
+                    binance_equity  = binance_balance.get('total_usd', 0.0)
+                    if binance_equity > 0:
+                        total_equity += binance_equity
+                        any_platform_succeeded = True
+                        logger.info(f"Binance equity: ${binance_equity:,.2f}")
+                except Exception as e:
+                    logger.warning(f"Error fetching Binance balance: {e}")
+            else:
+                logger.debug("Binance client not connected — skipping Binance balance fetch")
+
+            # ── Fallback ──────────────────────────────────────────────────────────
+            if not any_platform_succeeded:
+                if self.current_equity > 0:
+                    logger.warning(
+                        f"All balance fetches failed — using last known equity: "
+                        f"${self.current_equity:,.2f}"
+                    )
+                    return self.current_equity
+                else:
+                    logger.error(
+                        "All balance fetches failed and no cached equity available. "
+                        "Returning 0.0 — risk calculations will be blocked."
+                    )
+                    return 0.0
+
+            # ── Cache and return ──────────────────────────────────────────────────
+            self.current_equity = total_equity
+            # logger.info(f"Total equity: ${total_equity:,.2f}")
+            return total_equity
         
     def _get_current_exposure(self) -> dict:
         """Get current exposure summary."""

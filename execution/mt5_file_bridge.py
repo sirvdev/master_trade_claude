@@ -39,6 +39,7 @@ class MT5FileBridge:
         self._connected = False
         self.request_counter = 0
         self.last_read_position = 0
+        self._command_lock = asyncio.Lock()
 
         self.demo_orders    = {}
         self.demo_positions = {}
@@ -98,33 +99,42 @@ class MT5FileBridge:
     # ------------------------------------------------------------------
 
     async def _send_command(self, command: Dict, timeout: float = 30.0) -> Dict:
-        """Send command with unique ID and wait for response."""
+        """
+        Send command with unique ID and wait for matching response.
+
+        An asyncio.Lock serialises all callers so only one command is
+        in-flight at a time. The MT5 EA is single-threaded and uses a
+        single command file — concurrent writes corrupt each other.
+        """
         if self.demo_mode:
             return await self._simulate_command(command)
 
-        self.request_counter += 1
-        request_id = f"{self.session_id}_{self.request_counter}"
-        command['request_id'] = request_id
+        async with self._command_lock:
+            self.request_counter += 1
+            request_id = f"{self.session_id}_{self.request_counter}"
+            command['request_id'] = request_id
 
-        try:
-            command_json = json.dumps(command, ensure_ascii=True)
-            self.command_file.write_text(command_json, encoding='utf-8')
-            logger.debug(f"Sent command {request_id}: {command.get('action')}")
+            try:
+                command_json = json.dumps(command, ensure_ascii=True)
+                self.command_file.write_text(command_json, encoding='utf-8')
+                logger.debug(f"Sent command {request_id}: {command.get('action')}")
 
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                response = await self._read_response_for_id(request_id)
-                if response:
-                    logger.debug(f"Received response {request_id}: {response.get('status')}")
-                    return response
-                await asyncio.sleep(0.05)
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    response = await self._read_response_for_id(request_id)
+                    if response:
+                        logger.debug(
+                            f"Received response {request_id}: {response.get('status')}"
+                        )
+                        return response
+                    await asyncio.sleep(0.05)
 
-            logger.error(f"Command {request_id} timed out after {timeout}s")
-            return {'status': 'error', 'error': 'timeout'}
+                logger.error(f"Command {request_id} timed out after {timeout}s")
+                return {'status': 'error', 'error': 'timeout'}
 
-        except Exception as e:
-            logger.error(f"Error sending command: {e}", exc_info=True)
-            return {'status': 'error', 'error': str(e)}
+            except Exception as e:
+                logger.error(f"Error sending command: {e}", exc_info=True)
+                return {'status': 'error', 'error': str(e)}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
         try:
@@ -488,6 +498,27 @@ class MT5FileBridge:
         else:
             return []
 
+    async def get_balance(self) -> Dict:
+            """
+            Fetch live account balance and equity from MT5 via the authenticate action.
+            The EA's HandleAuthenticate() returns account, balance, and equity.
+
+            Returns:
+                Dict with keys: success (bool), balance (float), equity (float), account (int)
+            """
+            response = await self._send_command({'action': 'authenticate'})
+
+            if response.get('status') == 'success':
+                return {
+                    'success': True,
+                    'balance': response.get('balance', 0.0),
+                    'equity' : response.get('equity',  0.0),
+                    'account': response.get('account', 0),
+                }
+            else:
+                logger.warning(f"get_balance failed: {response.get('error')}")
+                return {'success': False, 'balance': 0.0, 'equity': 0.0}
+
     async def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
         """
         Fetch the closed deal record for a given position ticket from MT5 history.
@@ -632,5 +663,24 @@ class MT5FileBridge:
         if action == 'get_all_positions':
             positions = list(self.demo_positions.values())
             return {'status': 'success', 'positions': positions}
+
+        if action == 'get_deal_history':
+            ticket = command.get('ticket', 0)
+            return {
+                'status'     : 'success',
+                'ticket'     : ticket,
+                'entry_price': 0.0,
+                'exit_price' : 0.0,
+                'volume'     : 0.0,
+                'profit'     : 0.0,
+                'swap'       : 0.0,
+                'commission' : 0.0,
+                'net_profit' : 0.0,
+                'close_time' : 0,
+                'exit_reason': 'demo_close',
+            }
+
+        if action == 'authenticate':
+            return {'status': 'success', 'account': 99999, 'balance': 10000.0, 'equity': 10000.0}
 
         return {'status': 'error', 'error': f'Unknown action: {action}'}

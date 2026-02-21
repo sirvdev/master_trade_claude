@@ -250,6 +250,56 @@ class StopManager:
             'trigger_reason': f'Trailing activated at {current_rr:.2f}R',
             'method': trailing_method
         }
+    
+    def compute_trailing_sl(
+        self,
+        direction: str,
+        current_price: float,
+        current_sl: float,
+        high_since_entry: float,
+        low_since_entry: float,
+        atr: float,
+    ) -> Optional[float]:
+        """
+        Compute the new trailing stop-loss price using the configured method
+        (atr or percentage). Returns None if no update is warranted.
+
+        Args:
+            direction:         'long' or 'short'
+            current_price:     Live bid/ask price
+            current_sl:        Current stop-loss on the position
+            high_since_entry:  Highest price seen since entry (for ATR trail)
+            low_since_entry:   Lowest price seen since entry (for ATR trail)
+            atr:               Current ATR value for the symbol
+
+        Returns:
+            New SL price, or None if the trail would not improve the SL.
+        """
+        method = self.trailing_config.get('method', 'atr')
+
+        if method == 'atr':
+            new_sl = self._calculate_atr_trailing_stop(
+                direction        = direction,
+                high             = high_since_entry,
+                low              = low_since_entry,
+                atr              = atr,
+            )
+        else:  # percentage
+            percentage = self.trailing_config.get('percentage', 0.5)
+            new_sl = self._calculate_percentage_trailing_stop(
+                direction  = direction,
+                high       = high_since_entry,
+                low        = low_since_entry,
+                percentage = percentage,
+            )
+
+        # Only return a value if it actually improves the SL
+        if direction == 'long'  and new_sl > current_sl:
+            return new_sl
+        if direction == 'short' and new_sl < current_sl:
+            return new_sl
+
+        return None
         
     def _check_breakeven_move(
         self,

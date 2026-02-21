@@ -118,39 +118,59 @@ class AuditLogger:
         
     def log_trade_exit(self, trade_id: str, exit_data: Dict[str, Any]):
         """
-        Log trade exit.
-        
-        Args:
-            trade_id: Trade identifier
-            exit_data: Exit data including price, reason, PnL
+        Log trade exit and write all closed-trade fields to the database.
+
+        Expects exit_data keys:
+            exit_price, reason, pnl, pnl_percent, realized_rr   (required)
+            duration_minutes, commission, slippage               (optional)
+            max_favorable_excursion, max_adverse_excursion       (optional)
         """
-        # Update database
-        self.db.update_trade(trade_id, {
-            'exit_time': datetime.utcnow(),
-            'exit_price': exit_data.get('exit_price'),
-            'exit_reason': exit_data.get('reason'),
-            'pnl': exit_data.get('pnl'),
-            'pnl_percent': exit_data.get('pnl_percent'),
-            'realized_rr': exit_data.get('realized_rr'),
-            'status': 'closed'
-        })
-        
-        # Create JSON log
+        # Build the full update dict — every column the trades table has for a close
+        db_update = {
+            'exit_time'              : datetime.utcnow(),
+            'exit_price'             : exit_data.get('exit_price'),
+            'exit_reason'            : exit_data.get('reason'),
+            'pnl'                    : exit_data.get('pnl'),
+            'pnl_percent'            : exit_data.get('pnl_percent'),
+            'realized_rr'            : exit_data.get('realized_rr'),
+            'status'                 : 'closed',
+            # Fields that were silently dropped before
+            'duration_minutes'       : exit_data.get('duration_minutes'),
+            'commission'             : exit_data.get('commission'),
+            'slippage'               : exit_data.get('slippage'),
+            'max_favorable_excursion': exit_data.get('max_favorable_excursion'),
+            'max_adverse_excursion'  : exit_data.get('max_adverse_excursion'),
+        }
+
+        # Strip None values so we don't overwrite existing data with NULL
+        db_update = {k: v for k, v in db_update.items() if v is not None}
+
+        self.db.update_trade(trade_id, db_update)
+
+        # JSON audit log
         entry = self._create_log_entry('trade_exit', {
-            'trade_id': trade_id,
-            'exit_price': exit_data.get('exit_price'),
-            'exit_reason': exit_data.get('reason'),
-            'pnl': exit_data.get('pnl'),
-            'pnl_percent': exit_data.get('pnl_percent'),
-            'realized_rr': exit_data.get('realized_rr')
+            'trade_id'               : trade_id,
+            'exit_price'             : exit_data.get('exit_price'),
+            'exit_reason'            : exit_data.get('reason'),
+            'pnl'                    : exit_data.get('pnl'),
+            'pnl_percent'            : exit_data.get('pnl_percent'),
+            'realized_rr'            : exit_data.get('realized_rr'),
+            'duration_minutes'       : exit_data.get('duration_minutes'),
+            'commission'             : exit_data.get('commission'),
+            'slippage'               : exit_data.get('slippage'),
+            'max_favorable_excursion': exit_data.get('max_favorable_excursion'),
+            'max_adverse_excursion'  : exit_data.get('max_adverse_excursion'),
         })
         self._write_json_log(entry)
-        
+
+        pnl_val     = exit_data.get('pnl') or 0.0
+        pnl_pct_val = exit_data.get('pnl_percent') or 0.0
         self.logger.warning(
             f"TRADE EXIT: {trade_id} - {exit_data.get('reason')} "
-            f"PnL: {exit_data.get('pnl'):.2f} ({exit_data.get('pnl_percent'):.2f}%)"
+            f"PnL: {pnl_val:.2f} ({pnl_pct_val:.2f}%)"
         )
-        
+
+ 
     def log_partial_exit(self, trade_id: str, partial_data: Dict[str, Any]):
         """
         Log partial position close.
