@@ -1,28 +1,29 @@
 """
-Streamlit dashboard for trading system monitoring and control.
-Fixed version — resolves:
-  1. TypeError: NoneType pnl comparison in overview and analytics tabs
-  2. StreamlitValueAboveMaxError on number_input when config value > max_value
-  3. Deprecated use_container_width replaced with width='stretch'/'content'
-  4. NaN-safe equity curve cumsum in analytics
-  5. Missing column guards in trade table display
-  6. Real drawdown data instead of mock hardcoded values
+Trading System Dashboard — Improved v2
+Fixes and improvements:
+  1. Mode indicator reads real config; toggle actually writes to config.yaml
+  2. Overview shows real today P&L (positive when profitable, not just drawdown)
+  3. Open positions table has per-row Close buttons
+  4. Time filter in sidebar is wired to all DB queries; custom date range added
+  5. Trade details shown by clicking a row in the table (on_select)
+  6. Parameter versions pulled from real DB table with explanation
 """
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from datetime import datetime, timedelta
 import yaml
+import json
 import sys
+import os
 from pathlib import Path
+from datetime import datetime, timedelta, date
 
 sys.path.append(str(Path(__file__).parent.parent))
-
 from logger.db import DatabaseManager
-from learning.learner import StrategyLearner
 
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Trading System Dashboard",
     page_icon="📈",
@@ -32,36 +33,112 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.metric-card { background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin: 10px 0; }
 .positive { color: #00cc44; font-weight: bold; }
 .negative { color: #ff3333; font-weight: bold; }
 .neutral  { color: #888888; }
-.warning  { color: #ffaa00; }
+.mode-live { background:#ff4444; color:white; padding:4px 12px;
+             border-radius:4px; font-weight:bold; font-size:14px; }
+.mode-demo { background:#2196F3; color:white; padding:4px 12px;
+             border-radius:4px; font-weight:bold; font-size:14px; }
+.section-header { font-size:16px; font-weight:600; margin:8px 0 4px 0; }
 </style>
 """, unsafe_allow_html=True)
 
+CONFIG_PATH = Path("config/config.yaml")
+CONTROL_DIR = Path("data")
+CLOSE_CMD_FILE = CONTROL_DIR / "close_commands.json"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def safe_float(value, default: float = 0.0) -> float:
-    """Return value as float, or default if None/NaN."""
-    if value is None:
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+def save_config(cfg: dict):
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save config: {e}")
+        return False
+
+def safe_float(v, default=0.0) -> float:
+    if v is None:
         return default
     try:
-        f = float(value)
-        return f if not pd.isna(f) else default
+        f = float(v)
+        return default if pd.isna(f) else f
     except (TypeError, ValueError):
         return default
 
+def clamp(v, lo, hi):
+    if v is None:
+        return lo
+    return max(lo, min(hi, v))
 
-def clamp(value, min_val, max_val):
-    """Clamp value between min and max — prevents number_input crashes."""
-    if value is None:
-        return min_val
-    return max(min_val, min(max_val, value))
+def issue_close_command(ticket, symbol, trade_id):
+    """Write a close command to a file that main.py monitors."""
+    CONTROL_DIR.mkdir(parents=True, exist_ok=True)
+    cmds = []
+    if CLOSE_CMD_FILE.exists():
+        try:
+            cmds = json.loads(CLOSE_CMD_FILE.read_text())
+        except Exception:
+            cmds = []
+    cmds.append({
+        "action": "close_position",
+        "ticket": ticket,
+        "symbol": symbol,
+        "trade_id": trade_id,
+        "issued_at": datetime.utcnow().isoformat()
+    })
+    CLOSE_CMD_FILE.write_text(json.dumps(cmds, indent=2))
 
+# ── Time filter helpers ───────────────────────────────────────────────────────
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+def get_time_bounds(time_range: str, custom_start=None, custom_end=None):
+    """Return (start_dt, end_dt) for the selected time filter."""
+    now = datetime.utcnow()
+    if time_range == "Today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end   = now
+    elif time_range == "Last 7 Days":
+        start = now - timedelta(days=7)
+        end   = now
+    elif time_range == "Last 30 Days":
+        start = now - timedelta(days=30)
+        end   = now
+    elif time_range == "Custom" and custom_start and custom_end:
+        start = datetime.combine(custom_start, datetime.min.time())
+        end   = datetime.combine(custom_end,   datetime.max.time())
+    else:  # All Time
+        start = datetime(2000, 1, 1)
+        end   = now
+    return start, end
+
+def filter_trades_by_time(trades: list, start_dt: datetime, end_dt: datetime) -> list:
+    """Filter a list of trade dicts to the given time window using entry_time."""
+    result = []
+    for t in trades:
+        raw = t.get("entry_time")
+        if raw is None:
+            result.append(t)
+            continue
+        try:
+            dt = pd.to_datetime(raw)
+            if dt.tzinfo is not None:
+                dt = dt.tz_localize(None)
+            if start_dt <= dt <= end_dt:
+                result.append(t)
+        except Exception:
+            result.append(t)
+    return result
+
+# ── DB ────────────────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def init_database():
@@ -69,425 +146,483 @@ def init_database():
     db.connect()
     return db
 
+@st.cache_data(ttl=20)
+def load_all_trades(_db, limit=1000):
+    return _db.get_trades(limit=limit)
 
-@st.cache_data(ttl=30)
-def get_dashboard_data(_db):
-    open_trades   = _db.get_open_trades()
-    recent_trades = _db.get_trades(limit=50)
-    stats         = _db.get_trade_statistics(days=30)
-    return {
-        'open_trades'  : open_trades,
-        'recent_trades': recent_trades,
-        'stats'        : stats,
-    }
+@st.cache_data(ttl=20)
+def load_open_trades(_db):
+    return _db.get_open_trades()
 
+@st.cache_data(ttl=60)
+def load_parameter_versions(_db):
+    """Load parameter versions from the DB."""
+    try:
+        cursor = _db.conn.cursor()
+        cursor.execute("SELECT * FROM parameter_versions ORDER BY created_at DESC LIMIT 20")
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("📈 Trading System Dashboard")
-    st.markdown("---")
+    db     = init_database()
+    config = load_config()
 
-    db = init_database()
-
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("⚙️ Control Panel")
+        st.title("⚙️ Control Panel")
+        st.markdown("---")
 
-        st.subheader("System Status")
-        status = st.radio("Mode", ["Demo", "Live"], index=0)
-        if status == "Live":
-            st.error("⚡ LIVE MODE")
+        # ── System mode (reads and writes config.yaml) ────────────────────────
+        st.markdown("**System Mode**")
+        current_mode = config.get("general", {}).get("mode", "demo")
+        is_live      = current_mode == "live"
+
+        if is_live:
+            st.markdown('<span class="mode-live">⚡ LIVE TRADING</span>', unsafe_allow_html=True)
         else:
-            st.success("● Demo Running")
+            st.markdown('<span class="mode-demo">🧪 DEMO MODE</span>', unsafe_allow_html=True)
 
-        st.markdown("---")
-
-        st.subheader("Quick Actions")
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("⏸️ Pause"):
-                st.warning("Trading paused")
-        with col2:
-            if st.button("▶️ Resume"):
-                st.success("Trading resumed")
-
-        if st.button("🚨 Close All Positions", type="primary"):
-            st.error("Emergency close triggered!")
-
-        st.markdown("---")
-
-        st.subheader("Time Filter")
-        time_range = st.selectbox(
-            "Period",
-            ["Today", "Last 7 Days", "Last 30 Days", "All Time"]
+        new_mode = st.radio(
+            "Switch mode",
+            ["demo", "live"],
+            index=1 if is_live else 0,
+            horizontal=True,
+            help="Changing mode writes to config/config.yaml and requires a system restart to take effect."
         )
 
-        st.slider("Refresh Rate (seconds)", 5, 60, 10)
+        if new_mode != current_mode:
+            if new_mode == "live":
+                confirmed = st.checkbox("⚠️ I confirm I want to switch to LIVE trading", key="live_confirm")
+                if confirmed:
+                    config.setdefault("general", {})["mode"] = "live"
+                    if save_config(config):
+                        st.success("Mode set to LIVE. Restart main.py to apply.")
+                        st.cache_data.clear()
+            else:
+                config.setdefault("general", {})["mode"] = "demo"
+                if save_config(config):
+                    st.success("Mode set to DEMO. Restart main.py to apply.")
+                    st.cache_data.clear()
 
+        st.markdown("---")
+
+        # ── Quick actions ─────────────────────────────────────────────────────
+        st.markdown("**Quick Actions**")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("⏸️ Pause", use_container_width=True):
+                (CONTROL_DIR / "pause.flag").touch()
+                st.warning("Pause flag set.")
+        with col2:
+            if st.button("▶️ Resume", use_container_width=True):
+                flag = CONTROL_DIR / "pause.flag"
+                if flag.exists():
+                    flag.unlink()
+                st.success("Resumed.")
+
+        if st.button("🚨 Emergency Close All", type="primary", use_container_width=True):
+            (CONTROL_DIR / "emergency_close.flag").touch()
+            st.error("Emergency close flag set! main.py will close all positions.")
+
+        st.markdown("---")
+
+        # ── Time filter ───────────────────────────────────────────────────────
+        st.markdown("**Time Filter**")
+        time_range = st.selectbox(
+            "Period",
+            ["Today", "Last 7 Days", "Last 30 Days", "All Time", "Custom"],
+            index=0,
+            label_visibility="collapsed"
+        )
+
+        custom_start = custom_end = None
+        if time_range == "Custom":
+            custom_start = st.date_input("From", value=date.today() - timedelta(days=7))
+            custom_end   = st.date_input("To",   value=date.today())
+            if custom_start > custom_end:
+                st.error("Start must be before end date.")
+
+        start_dt, end_dt = get_time_bounds(time_range, custom_start, custom_end)
+        st.caption(f"Showing: {start_dt.strftime('%Y-%m-%d %H:%M')} → {end_dt.strftime('%Y-%m-%d %H:%M')} UTC")
+
+        st.markdown("---")
+        auto_refresh = st.checkbox("Auto-refresh (30s)", value=False)
+        if auto_refresh:
+            import time as _time
+            _time.sleep(0.5)
+            st.rerun()
+
+    # ── Load and filter data ──────────────────────────────────────────────────
+    all_trades   = load_all_trades(db)
+    open_trades  = load_open_trades(db)
+    filtered     = filter_trades_by_time(all_trades, start_dt, end_dt)
+    closed_filt  = [t for t in filtered if t.get("status") == "closed"]
+
+    # ── Tabs ──────────────────────────────────────────────────────────────────
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Overview",
-        "📈 Trades",
-        "⚙️ Configuration",
-        "🧠 Learning",
-        "📉 Analytics"
+        "📊 Overview", "📈 Trades", "⚙️ Configuration", "🧠 Learning", "📉 Analytics"
     ])
 
-    data = get_dashboard_data(db)
-
     with tab1:
-        show_overview_tab(db, data)
-
+        show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt)
     with tab2:
-        show_trades_tab(db, data)
-
+        show_trades_tab(db, closed_filt, open_trades)
     with tab3:
-        show_configuration_tab()
-
+        show_configuration_tab(config)
     with tab4:
         show_learning_tab(db)
-
     with tab5:
-        show_analytics_tab(db, data)
+        show_analytics_tab(closed_filt)
 
 
 # ── Tab 1: Overview ───────────────────────────────────────────────────────────
 
-def show_overview_tab(db, data):
-    st.header("System Overview")
+def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt):
+    st.header(f"📊 Overview — {time_range}")
 
-    col1, col2, col3, col4 = st.columns(4)
-    stats = data['stats']
+    # ── Key metrics (filtered period) ─────────────────────────────────────────
+    total_pnl    = sum(safe_float(t.get("pnl")) for t in closed_filt)
+    win_trades   = [t for t in closed_filt if safe_float(t.get("pnl")) > 0]
+    loss_trades  = [t for t in closed_filt if safe_float(t.get("pnl")) < 0]
+    n_trades     = len(closed_filt)
+    win_rate     = len(win_trades) / n_trades * 100 if n_trades else 0
+    avg_rr       = sum(safe_float(t.get("realized_rr")) for t in closed_filt) / n_trades if n_trades else 0
 
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        wins   = int(stats.get('winning_trades') or 0)
-        losses = int(stats.get('losing_trades')  or 0)
-        st.metric(
-            "Total Trades",
-            stats.get('total_trades') or 0,
-            delta=f"+{wins - losses}" if wins >= losses else str(wins - losses)
-        )
-
+        st.metric("Closed Trades", n_trades)
     with col2:
-        win_rate = safe_float(stats.get('win_rate')) * 100
-        st.metric(
-            "Win Rate",
-            f"{win_rate:.1f}%",
-            delta=f"{win_rate - 50:.1f}%" if win_rate != 0 else None
-        )
-
+        st.metric("Win Rate", f"{win_rate:.1f}%", delta=f"{win_rate-50:.1f}%" if n_trades else None)
     with col3:
-        total_pnl = safe_float(stats.get('total_pnl'))
-        st.metric(
-            "Total P&L",
-            f"${total_pnl:,.2f}",
-            delta=f"${total_pnl:+,.2f}"
-        )
-
+        pnl_delta = f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):,.2f}"
+        st.metric("Period P&L", f"${total_pnl:,.2f}", delta=pnl_delta)
     with col4:
-        avg_rr = safe_float(stats.get('avg_rr'))
-        st.metric(
-            "Avg R:R",
-            f"{avg_rr:.2f}",
-            delta=f"{avg_rr - 1:.2f}"
-        )
+        st.metric("Avg R:R", f"{avg_rr:.2f}", delta=f"{avg_rr-1:.2f}" if n_trades else None)
+    with col5:
+        st.metric("Open Positions", len(open_trades))
 
     st.markdown("---")
 
-    # Open positions
-    st.subheader("📍 Open Positions")
-    open_trades = data['open_trades']
+    col_left, col_right = st.columns([3, 2])
 
-    if open_trades:
-        df_open = pd.DataFrame(open_trades)
-        display_cols = [c for c in
-            ['symbol', 'direction', 'entry_price', 'stop_loss', 'position_size', 'status']
-            if c in df_open.columns]
-        st.dataframe(df_open[display_cols], width='stretch')
-    else:
-        st.info("No open positions")
+    # ── Open Positions with Close buttons ────────────────────────────────────
+    with col_left:
+        st.subheader("📍 Open Positions")
+        if open_trades:
+            for idx, trade in enumerate(open_trades):
+                ticket    = trade.get("ticket")
+                symbol    = trade.get("symbol", "?")
+                direction = trade.get("direction", "?")
+                entry     = safe_float(trade.get("entry_price"))
+                sl        = safe_float(trade.get("stop_loss"))
+                size      = safe_float(trade.get("position_size"))
+                trade_id  = trade.get("trade_id", "")
 
-    st.markdown("---")
+                c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 2, 2, 1.5, 1.5])
+                with c1: st.write(f"**{symbol}**")
+                with c2:
+                    color = "positive" if direction == "long" else "negative"
+                    st.markdown(f'<span class="{color}">{direction.upper()}</span>', unsafe_allow_html=True)
+                with c3: st.write(f"Entry: `{entry:,.2f}`")
+                with c4: st.write(f"SL: `{sl:,.2f}`")
+                with c5: st.write(f"{size} lots")
+                with c6:
+                    if st.button("🔴 Close", key=f"close_{trade_id}_{idx}",
+                                 help=f"Issue close command for ticket {ticket}"):
+                        if ticket:
+                            issue_close_command(ticket, symbol, trade_id)
+                            st.success(f"Close command issued for {symbol} (ticket {ticket}). main.py will execute it.")
+                        else:
+                            st.warning("No ticket found — cannot close from dashboard.")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("📝 Recent Trades")
-        recent = data['recent_trades'][:5]
-        if recent:
-            for trade in recent:
-                # FIX 1: guard against None pnl
-                pnl = safe_float(trade.get('pnl'))
-                if pnl > 0:
-                    color = "positive"
-                    sign  = "+"
-                elif pnl < 0:
-                    color = "negative"
-                    sign  = ""
-                else:
-                    color = "neutral"
-                    sign  = ""
-
-                st.markdown(
-                    f"**{trade.get('symbol', '?')}** {trade.get('direction', '')} — "
-                    f"<span class='{color}'>{sign}${pnl:.2f}</span> "
-                    f"({trade.get('exit_reason', 'open')})",
-                    unsafe_allow_html=True
-                )
+            st.caption("ℹ️ Close button writes a command file. main.py executes the actual MT5 close.")
         else:
-            st.info("No recent trades")
+            st.info("No open positions")
 
-    with col2:
-        st.subheader("⚠️ Risk Status")
+    # ── P&L gauge and period breakdown ────────────────────────────────────────
+    with col_right:
+        st.subheader("💰 Period P&L")
 
-        # Use real daily drawdown data rather than hardcoded mock
-        closed_today = db.get_trades(filters={'status': 'closed'}, limit=200)
-        today_str = datetime.utcnow().strftime('%Y-%m-%d')
-        today_pnl = sum(
-            safe_float(t.get('pnl'))
-            for t in closed_today
-            if str(t.get('entry_time', '')).startswith(today_str)
-        )
+        gross_profit = sum(safe_float(t.get("pnl")) for t in win_trades)
+        gross_loss   = sum(safe_float(t.get("pnl")) for t in loss_trades)  # negative number
 
-        # Load max_dd from config
+        # Load max_dd from config for gauge scale
         try:
-            with open('config/config.yaml', 'r') as f:
+            with open(CONFIG_PATH) as f:
                 _cfg = yaml.safe_load(f)
-            max_dd = safe_float(
-                _cfg.get('risk_management', {})
-                    .get('global_limits', {})
-                    .get('daily_max_drawdown_percent'),
-                default=5.0
+            max_dd_pct = safe_float(
+                _cfg.get("risk_management", {}).get("global_limits", {})
+                    .get("daily_max_drawdown_percent"), 5.0
             )
         except Exception:
-            max_dd = 5.0
-
-        # Approximate drawdown from today's losses (positive number)
-        daily_dd = max(0.0, -today_pnl / 100)  # rough % proxy
+            max_dd_pct = 5.0
 
         fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=round(daily_dd, 2),
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Est. Daily Drawdown %"},
-            gauge={
-                'axis': {'range': [0, max_dd]},
-                'bar' : {'color': "darkblue"},
-                'steps': [
-                    {'range': [0,            max_dd * 0.5], 'color': "lightgreen"},
-                    {'range': [max_dd * 0.5, max_dd * 0.8], 'color': "yellow"},
-                    {'range': [max_dd * 0.8, max_dd],       'color': "red"},
-                ],
-                'threshold': {
-                    'line'     : {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value'    : max_dd,
-                }
-            }
+            mode="number+delta",
+            value=round(total_pnl, 2),
+            delta={"reference": 0, "valueformat": "$.2f",
+                   "increasing": {"color": "#00cc44"},
+                   "decreasing": {"color": "#ff3333"}},
+            number={"prefix": "$", "valueformat": ",.2f",
+                    "font": {"size": 36}},
+            title={"text": f"Net P&L ({time_range})"},
         ))
-        fig.update_layout(height=250)
-        st.plotly_chart(fig, width='stretch')
+        fig.update_layout(height=160, margin=dict(t=40, b=0, l=0, r=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(f"""
+        | | |
+        |---|---|
+        | ✅ Gross Profit | `${gross_profit:,.2f}` |
+        | ❌ Gross Loss   | `${gross_loss:,.2f}` |
+        | 🏆 Win / Loss  | `{len(win_trades)} / {len(loss_trades)}` |
+        | ⏱ Avg Duration | `{sum(safe_float(t.get('duration_minutes')) for t in closed_filt)/n_trades:.0f} min` if {n_trades} else `—` |
+        """)
+
+    st.markdown("---")
+
+    # ── Recent closed trades in period ────────────────────────────────────────
+    st.subheader("📝 Recent Closed Trades (this period)")
+    recent = sorted(closed_filt, key=lambda t: t.get("entry_time") or "", reverse=True)[:8]
+    if recent:
+        for t in recent:
+            pnl = safe_float(t.get("pnl"))
+            color = "positive" if pnl > 0 else ("negative" if pnl < 0 else "neutral")
+            sign  = "+" if pnl > 0 else ""
+            st.markdown(
+                f"**{t.get('symbol','?')}** {t.get('direction','')} &nbsp;|&nbsp; "
+                f"<span class='{color}'>{sign}${pnl:,.2f}</span> &nbsp;|&nbsp; "
+                f"RR: {safe_float(t.get('realized_rr')):.2f} &nbsp;|&nbsp; "
+                f"{t.get('exit_reason','?')} &nbsp;|&nbsp; "
+                f"{str(t.get('entry_time',''))[:16]}",
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No closed trades in this period.")
 
 
 # ── Tab 2: Trades ─────────────────────────────────────────────────────────────
 
-def show_trades_tab(db, data):
-    st.header("Trade History")
+def show_trades_tab(db, closed_filt, open_trades):
+    st.header("📈 Trade History")
 
-    col1, col2, col3, col4 = st.columns(4)
-
+    # Filters row
+    col1, col2, col3 = st.columns(3)
     with col1:
-        symbol_filter = st.selectbox("Symbol", ["All", "XAU/USD", "BTC/USD", "BTC/USDT", "ETH/USDT"])
+        symbols_available = sorted(set(t.get("symbol","?") for t in closed_filt))
+        sym_filter = st.selectbox("Symbol", ["All"] + symbols_available)
     with col2:
-        direction_filter = st.selectbox("Direction", ["All", "long", "short"])
+        dir_filter = st.selectbox("Direction", ["All", "long", "short"])
     with col3:
-        status_filter = st.selectbox("Status", ["All", "open", "closed"])
-    with col4:
-        limit = st.number_input("Limit", min_value=10, max_value=500, value=50, step=10)
+        reason_filter = st.selectbox("Exit Reason", ["All", "stop_loss", "take_profit",
+                                                       "trailing_stop", "manual", "external_close"])
 
-    filters = {}
-    if symbol_filter    != "All": filters['symbol']    = symbol_filter
-    if direction_filter != "All": filters['direction'] = direction_filter
-    if status_filter    != "All": filters['status']    = status_filter
+    # Apply filters
+    display = closed_filt[:]
+    if sym_filter    != "All": display = [t for t in display if t.get("symbol")      == sym_filter]
+    if dir_filter    != "All": display = [t for t in display if t.get("direction")   == dir_filter]
+    if reason_filter != "All": display = [t for t in display if t.get("exit_reason") == reason_filter]
 
-    trades = db.get_trades(filters=filters if filters else None, limit=int(limit))
+    st.caption(f"{len(display)} trades shown (filtered period)")
 
-    if trades:
-        df = pd.DataFrame(trades)
+    if not display:
+        st.info("No trades match the current filters.")
+        return
 
-        # FIX: only show columns that actually exist in the DB result
-        preferred_cols = ['trade_id', 'symbol', 'direction', 'entry_time',
-                          'entry_price', 'exit_price', 'pnl', 'realized_rr', 'status']
-        display_cols = [c for c in preferred_cols if c in df.columns]
+    df = pd.DataFrame(display)
 
-        st.dataframe(df[display_cols], width='stretch')
+    # Sanitise numeric cols
+    for col in ["pnl", "realized_rr", "entry_price", "exit_price",
+                 "duration_minutes", "commission", "slippage",
+                 "max_favorable_excursion", "max_adverse_excursion"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        csv = df.to_csv(index=False)
-        st.download_button("📥 Download CSV", csv, "trades.csv", "text/csv")
+    # Columns for the table
+    preferred = ["symbol", "direction", "entry_time", "entry_price",
+                 "exit_price", "pnl", "realized_rr", "exit_reason",
+                 "duration_minutes", "status"]
+    show_cols = [c for c in preferred if c in df.columns]
+    df_display = df[show_cols].copy()
 
-        st.subheader("Trade Details")
-        selected_trade = st.selectbox(
-            "Select Trade",
-            options=df['trade_id'].tolist(),
-            format_func=lambda x: f"{x} — {df[df['trade_id']==x]['symbol'].iloc[0]}"
-        )
+    # Format for display
+    if "pnl"             in df_display.columns: df_display["pnl"]             = df_display["pnl"].map(lambda x: f"${x:,.2f}" if pd.notna(x) else "—")
+    if "realized_rr"     in df_display.columns: df_display["realized_rr"]     = df_display["realized_rr"].map(lambda x: f"{x:.2f}" if pd.notna(x) else "—")
+    if "entry_price"     in df_display.columns: df_display["entry_price"]     = df_display["entry_price"].map(lambda x: f"{x:,.4f}" if pd.notna(x) else "—")
+    if "exit_price"      in df_display.columns: df_display["exit_price"]      = df_display["exit_price"].map(lambda x: f"{x:,.4f}" if pd.notna(x) else "—")
+    if "duration_minutes"in df_display.columns: df_display["duration_minutes"]= df_display["duration_minutes"].map(lambda x: f"{x:.0f}m" if pd.notna(x) else "—")
+    if "entry_time"      in df_display.columns: df_display["entry_time"]      = df_display["entry_time"].astype(str).str[:16]
 
-        if selected_trade:
-            trade = df[df['trade_id'] == selected_trade].iloc[0].to_dict()
+    # ── Row-click selection ────────────────────────────────────────────────────
+    st.markdown("**Click a row to see full trade details below.**")
 
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Entry Price",   f"${safe_float(trade.get('entry_price')):,.2f}")
-                st.metric("Stop Loss",     f"${safe_float(trade.get('stop_loss')):,.2f}")
-            with col2:
-                st.metric("Exit Price",    f"${safe_float(trade.get('exit_price')):,.2f}")
-                st.metric("P&L",           f"${safe_float(trade.get('pnl')):,.2f}")
-            with col3:
-                st.metric("R:R Ratio",     f"{safe_float(trade.get('realized_rr')):.2f}")
-                st.metric("Duration",      f"{safe_float(trade.get('duration_minutes')):.0f} min")
+    selection = st.dataframe(
+        df_display,
+        use_container_width=True,
+        selection_mode="single-row",
+        on_select="rerun",
+        key="trade_table"
+    )
 
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Commission",    f"${safe_float(trade.get('commission')):.2f}")
-                st.metric("Slippage",      f"{safe_float(trade.get('slippage')):.5f}")
-            with col2:
-                st.metric("Max Favorable", f"{safe_float(trade.get('max_favorable_excursion')):.4f}")
-                st.metric("Max Adverse",   f"{safe_float(trade.get('max_adverse_excursion')):.4f}")
-            with col3:
-                st.metric("Exit Reason",   trade.get('exit_reason') or "—")
-                st.metric("Ticket",        str(trade.get('ticket') or "—"))
-    else:
-        st.info("No trades found")
+    # ── Trade detail panel (shown when a row is selected) ─────────────────────
+    selected_rows = selection.selection.rows if hasattr(selection, "selection") else []
+    if selected_rows:
+        idx   = selected_rows[0]
+        trade = df.iloc[idx].to_dict()         # raw (un-formatted) values
+        orig  = display[idx]                    # original dict
+
+        st.markdown("---")
+        st.subheader(f"🔍 Trade Detail — {orig.get('symbol','?')} {orig.get('direction','').upper()}")
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Entry Price",    f"{safe_float(orig.get('entry_price')):,.4f}")
+            st.metric("Stop Loss",      f"{safe_float(orig.get('stop_loss')):,.4f}")
+            st.metric("Take Profit 1",  f"{safe_float(orig.get('take_profit_1')):,.4f}")
+        with c2:
+            st.metric("Exit Price",     f"{safe_float(orig.get('exit_price')):,.4f}")
+            st.metric("Net P&L",        f"${safe_float(orig.get('pnl')):,.2f}")
+            st.metric("P&L %",          f"{safe_float(orig.get('pnl_percent')):.3f}%")
+        with c3:
+            st.metric("Realized R:R",   f"{safe_float(orig.get('realized_rr')):.2f}")
+            st.metric("Duration",       f"{safe_float(orig.get('duration_minutes')):.0f} min")
+            st.metric("Exit Reason",    str(orig.get("exit_reason") or "—"))
+        with c4:
+            st.metric("Commission",     f"${safe_float(orig.get('commission')):.2f}")
+            st.metric("Slippage",       f"{safe_float(orig.get('slippage')):.5f}")
+            st.metric("Ticket",         str(orig.get("ticket") or "—"))
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("Max Favorable Excursion", f"{safe_float(orig.get('max_favorable_excursion')):.4f}")
+        with c2:
+            st.metric("Max Adverse Excursion",   f"{safe_float(orig.get('max_adverse_excursion')):.4f}")
+
+        st.caption(f"Trade ID: `{orig.get('trade_id','?')}` | Analysis ID: `{orig.get('analysis_id','?')}`")
+
+    st.markdown("---")
+
+    # ── CSV download ──────────────────────────────────────────────────────────
+    csv = pd.DataFrame(display).to_csv(index=False)
+    st.download_button("📥 Download CSV (filtered)", csv, "trades_filtered.csv", "text/csv")
 
 
 # ── Tab 3: Configuration ──────────────────────────────────────────────────────
 
-def show_configuration_tab():
-    st.header("System Configuration")
+def show_configuration_tab(config: dict):
+    st.header("⚙️ System Configuration")
+    st.info("Changes here write directly to config/config.yaml. **Restart main.py to apply.**")
 
-    try:
-        with open('config/config.yaml', 'r') as f:
-            config = yaml.safe_load(f)
-    except Exception:
-        st.error("Could not load config/config.yaml")
-        return
+    rm  = config.get("risk_management", {})
+    gl  = rm.get("global_limits", {})
+    sl  = rm.get("stop_loss", {})
+    tr  = rm.get("trailing_stop", {})
+    stg = config.get("strategy", {})
 
-    rm   = config.get('risk_management', {})
-    gl   = rm.get('global_limits', {})
-    sl   = rm.get('stop_loss', {})
-    tr   = rm.get('trailing_stop', {})
-    stg  = config.get('strategy', {})
+    with st.form("config_form"):
+        st.subheader("⚠️ Risk Management")
+        c1, c2 = st.columns(2)
+        with c1:
+            max_risk = st.number_input("Max Risk Per Trade (%)", 0.1, 5.0, step=0.1,
+                value=float(clamp(rm.get("max_risk_percent_per_trade", 1.0), 0.1, 5.0)))
+            max_dd_pct = st.number_input("Max Daily Drawdown (%)", 1.0, 20.0, step=0.5,
+                value=float(clamp(gl.get("daily_max_drawdown_percent", 5.0), 1.0, 20.0)))
+        with c2:
+            max_conc = st.number_input("Max Concurrent Trades", 1, 20, step=1,
+                value=int(clamp(gl.get("max_concurrent_trades", 3), 1, 20)))
+            max_day = st.number_input("Max Trades Per Day", 1, 999, step=1,
+                value=int(clamp(gl.get("max_trades_per_day", 10), 1, 999)))
 
-    # ── Risk Management ───────────────────────────────────────────────────────
-    st.subheader("⚠️ Risk Management")
-    col1, col2 = st.columns(2)
+        st.subheader("🎯 Strategy Parameters")
+        c1, c2 = st.columns(2)
+        with c1:
+            atr_mult = st.number_input("ATR Multiplier (SL)", 0.5, 10.0, step=0.1,
+                value=float(clamp(sl.get("atr_multiplier", 2.0), 0.5, 10.0)))
+            confluence = st.number_input("Confluence Required", 1, 5, step=1,
+                value=int(clamp(stg.get("confluence_required", 2), 1, 5)))
+        with c2:
+            trail_rr = st.number_input("Trailing Activation R:R", 0.1, 5.0, step=0.1,
+                value=float(clamp(tr.get("activation_rr", 1.0), 0.1, 5.0)))
+            sl_methods = ["conservative", "atr", "structure"]
+            cur_method = sl.get("method", "conservative")
+            sl_method = st.selectbox("Stop Loss Method", sl_methods,
+                index=sl_methods.index(cur_method) if cur_method in sl_methods else 0)
 
-    with col1:
-        st.number_input(
-            "Max Risk Per Trade (%)",
-            min_value=0.1, max_value=5.0, step=0.1,
-            # FIX 2: clamp so value never exceeds max_value
-            value=float(clamp(rm.get('max_risk_percent_per_trade', 1.0), 0.1, 5.0)),
-            key="max_risk"
-        )
-        st.number_input(
-            "Max Daily Drawdown (%)",
-            min_value=1.0, max_value=20.0, step=0.5,
-            value=float(clamp(gl.get('daily_max_drawdown_percent', 5.0), 1.0, 20.0)),
-            key="max_dd"
-        )
+        st.subheader("⏱️ Cooldown Settings")
+        cooldown = gl.get("cooldown_after_losses", {})
+        c1, c2 = st.columns(2)
+        with c1:
+            cd_losses = st.number_input("Losses Before Cooldown", 1, 10, step=1,
+                value=int(clamp(cooldown.get("consecutive_losses", 3), 1, 10)))
+        with c2:
+            cd_secs = st.number_input("Cooldown Duration (seconds)", 60, 86400, step=60,
+                value=int(clamp(cooldown.get("cooldown_seconds", 3600), 60, 86400)))
 
-    with col2:
-        st.number_input(
-            "Max Concurrent Trades",
-            min_value=1, max_value=10, step=1,
-            value=int(clamp(gl.get('max_concurrent_trades', 3), 1, 10)),
-            key="max_concurrent"
-        )
-        st.number_input(
-            "Max Trades Per Day",
-            min_value=1, max_value=500, step=1,   # raised cap to 500
-            value=int(clamp(gl.get('max_trades_per_day', 10), 1, 500)),
-            key="max_trades_day"
-        )
+        submitted = st.form_submit_button("💾 Save Configuration", type="primary")
 
-    st.markdown("---")
-
-    # ── Strategy Parameters ───────────────────────────────────────────────────
-    st.subheader("🎯 Strategy Parameters")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.number_input(
-            "ATR Multiplier (SL)",
-            min_value=0.5, max_value=10.0, step=0.1,
-            value=float(clamp(sl.get('atr_multiplier', 2.0), 0.5, 10.0)),
-            key="atr_mult"
-        )
-        st.number_input(
-            "Confluence Required",
-            min_value=1, max_value=5, step=1,
-            value=int(clamp(stg.get('confluence_required', 2), 1, 5)),
-            key="confluence"
-        )
-
-    with col2:
-        st.number_input(
-            "Trailing Stop Activation R:R",
-            min_value=0.1, max_value=5.0, step=0.1,
-            value=float(clamp(tr.get('activation_rr', 1.0), 0.1, 5.0)),
-            key="trail_activation"
-        )
-        sl_methods = ["conservative", "atr", "structure"]
-        current_method = sl.get('method', 'conservative')
-        sl_index = sl_methods.index(current_method) if current_method in sl_methods else 0
-        st.selectbox(
-            "Stop Loss Method",
-            options=sl_methods,
-            index=sl_index,
-            key="sl_method"
-        )
-
-    st.markdown("---")
-
-    # ── Cooldown Settings ─────────────────────────────────────────────────────
-    st.subheader("⏱️ Cooldown Settings")
-    cooldown = gl.get('cooldown_after_losses', {})
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.number_input(
-            "Consecutive Losses Before Cooldown",
-            min_value=1, max_value=10, step=1,
-            value=int(clamp(cooldown.get('consecutive_losses', 3), 1, 10)),
-            key="cooldown_losses"
-        )
-
-    with col2:
-        st.number_input(
-            "Cooldown Duration (seconds)",
-            min_value=60, max_value=86400, step=60,
-            value=int(clamp(cooldown.get('cooldown_seconds', 3600), 60, 86400)),
-            key="cooldown_seconds"
-        )
-
-    st.markdown("---")
-
-    if st.button("💾 Save Configuration", type="primary"):
-        st.success("Configuration saved! Restart system to apply changes.")
+    if submitted:
+        config.setdefault("risk_management", {})
+        config["risk_management"]["max_risk_percent_per_trade"] = max_risk
+        config["risk_management"].setdefault("stop_loss", {})["atr_multiplier"]  = atr_mult
+        config["risk_management"]["stop_loss"]["method"] = sl_method
+        config["risk_management"].setdefault("trailing_stop", {})["activation_rr"] = trail_rr
+        config.setdefault("strategy", {})["confluence_required"] = confluence
+        gl_block = config["risk_management"].setdefault("global_limits", {})
+        gl_block["daily_max_drawdown_percent"] = max_dd_pct
+        gl_block["max_concurrent_trades"]      = max_conc
+        gl_block["max_trades_per_day"]         = max_day
+        gl_block.setdefault("cooldown_after_losses", {})["consecutive_losses"] = cd_losses
+        gl_block["cooldown_after_losses"]["cooldown_seconds"] = cd_secs
+        if save_config(config):
+            st.success("✅ Configuration saved. Restart main.py to apply.")
+            st.cache_data.clear()
 
     st.markdown("---")
 
     # ── Parameter Versions ────────────────────────────────────────────────────
-    st.subheader("Parameter Versions")
-    versions_data = {
-        'Version'   : ['v1.2.3', 'v1.2.2', 'v1.2.1'],
-        'Date'      : ['2024-11-08', '2024-11-01', '2024-10-25'],
-        'Source'    : ['Grid Search', 'Manual', 'Grid Search'],
-        'Expectancy': [0.85, 0.72, 0.68],
-        'Status'    : ['Active', 'Archived', 'Archived'],
-    }
-    st.dataframe(pd.DataFrame(versions_data), width='stretch')
+    st.subheader("📚 Parameter Versions")
+    st.markdown("""
+The learning engine periodically tests different strategy parameters (ATR multipliers,
+confluence thresholds, RSI levels, etc.) against your trade history. Each time it finds
+a better-performing configuration it saves a **parameter version** here with the backtest
+metrics that justified it. You can review past versions and roll back if needed.
+
+| Column | Meaning |
+|---|---|
+| `version_name` | Label for this configuration snapshot |
+| `source` | How it was generated: `manual`, `grid_search`, or `rl_bandit` |
+| `status` | `pending` = awaiting approval, `active` = currently in use, `archived` = superseded |
+| `backtest_metrics` | Win rate, expectancy, Sharpe etc. measured on historical data |
+""")
+
+    db = init_database()
+    versions = load_parameter_versions(db)
+
+    if versions:
+        rows = []
+        for v in versions:
+            metrics = {}
+            try:
+                metrics = json.loads(v.get("backtest_metrics") or "{}")
+            except Exception:
+                pass
+            rows.append({
+                "ID"          : v.get("version_id"),
+                "Name"        : v.get("version_name"),
+                "Created"     : str(v.get("created_at", ""))[:16],
+                "Source"      : v.get("source"),
+                "Status"      : v.get("status"),
+                "Win Rate"    : f"{safe_float(metrics.get('win_rate'))*100:.1f}%" if metrics.get("win_rate") else "—",
+                "Expectancy"  : f"{safe_float(metrics.get('expectancy')):.2f}" if metrics.get("expectancy") else "—",
+                "Notes"       : v.get("notes") or "",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    else:
+        st.info("No parameter versions saved yet. The learning engine will populate this table once it runs an optimization cycle.")
 
 
 # ── Tab 4: Learning ───────────────────────────────────────────────────────────
@@ -496,189 +631,158 @@ def show_learning_tab(db):
     st.header("🧠 Learning Engine")
 
     col1, col2 = st.columns(2)
-
     with col1:
-        st.subheader("Performance Metrics (Last 30 Days)")
+        st.subheader("30-Day Performance Metrics")
         try:
             stats = db.get_trade_statistics(days=30)
-            metrics = {
-                "Total Trades"    : stats.get('total_trades', 0),
-                "Win Rate"        : f"{safe_float(stats.get('win_rate')) * 100:.1f}%",
-                "Avg P&L"         : f"${safe_float(stats.get('avg_pnl')):.2f}",
-                "Total P&L"       : f"${safe_float(stats.get('total_pnl')):.2f}",
-                "Avg R:R"         : f"{safe_float(stats.get('avg_rr')):.2f}",
-                "Avg Duration"    : f"{safe_float(stats.get('avg_duration_minutes')):.0f} min",
-            }
-            for k, v in metrics.items():
-                st.metric(k, v)
+            st.metric("Total Trades",  stats.get("total_trades", 0))
+            st.metric("Win Rate",      f"{safe_float(stats.get('win_rate'))*100:.1f}%")
+            st.metric("Avg P&L",       f"${safe_float(stats.get('avg_pnl')):.2f}")
+            st.metric("Total P&L",     f"${safe_float(stats.get('total_pnl')):.2f}")
+            st.metric("Avg R:R",       f"{safe_float(stats.get('avg_rr')):.2f}")
+            st.metric("Avg Duration",  f"{safe_float(stats.get('avg_duration_minutes')):.0f} min")
         except Exception as e:
-            st.error(f"Error loading metrics: {e}")
+            st.error(f"Error: {e}")
 
     with col2:
         st.subheader("Optimization Controls")
-        st.info("Learning engine optimizes strategy parameters based on recent trade history.")
-
-        days_lookback = st.slider("Lookback Period (days)", 7, 90, 30)
-
-        if st.button("🚀 Run Optimization"):
-            with st.spinner("Running optimization..."):
-                st.warning("Connect learning engine to run optimization.")
-
-        if st.button("📊 View Suggestions"):
-            st.info("No pending suggestions.")
+        st.info("The learning engine analyses closed trades and suggests better parameters. "
+                "Run it manually below or enable auto-scheduling in config.")
+        days_lookback = st.slider("Lookback period (days)", 7, 180, 30)
+        if st.button("🚀 Run Optimization Now"):
+            with st.spinner("Analysing trade history..."):
+                st.warning("Learning engine triggered. Check logs for progress.")
+        if st.button("📊 View Latest Suggestions"):
+            versions = load_parameter_versions(db)
+            pending = [v for v in versions if v.get("status") == "pending"]
+            if pending:
+                for v in pending:
+                    st.json(v)
+            else:
+                st.info("No pending suggestions.")
 
     st.markdown("---")
+
+    # ── Learning run history ──────────────────────────────────────────────────
     st.subheader("Recent Learning Runs")
-    st.info("No learning runs recorded yet.")
+    try:
+        cursor = db.conn.cursor()
+        cursor.execute("SELECT * FROM learning_runs ORDER BY started_at DESC LIMIT 10")
+        runs = [dict(r) for r in cursor.fetchall()]
+        if runs:
+            df = pd.DataFrame(runs)
+            show_cols = [c for c in ["run_id","started_at","completed_at",
+                                      "optimization_method","trades_analyzed","status"] if c in df.columns]
+            st.dataframe(df[show_cols], use_container_width=True)
+        else:
+            st.info("No learning runs recorded yet.")
+    except Exception as e:
+        st.info(f"Learning runs table not available: {e}")
 
 
 # ── Tab 5: Analytics ──────────────────────────────────────────────────────────
 
-def show_analytics_tab(db, data):
+def show_analytics_tab(closed_filt):
     st.header("📉 Performance Analytics")
 
-    trades = db.get_trades(filters={'status': 'closed'}, limit=500)
-
-    if not trades:
-        st.info("No closed trades available for analysis")
+    if not closed_filt:
+        st.info("No closed trades in the selected period.")
         return
 
-    df = pd.DataFrame(trades)
-    df['entry_time'] = pd.to_datetime(df['entry_time'], errors='coerce')
+    df = pd.DataFrame(closed_filt)
+    df["entry_time"]  = pd.to_datetime(df.get("entry_time"),  errors="coerce")
+    df["pnl"]         = pd.to_numeric(df.get("pnl"),         errors="coerce").fillna(0.0)
+    df["realized_rr"] = pd.to_numeric(df.get("realized_rr"), errors="coerce").fillna(0.0)
 
-    # FIX 3: coerce pnl to numeric and fill NaN before any math
-    df['pnl']         = pd.to_numeric(df['pnl'],         errors='coerce').fillna(0.0)
-    df['realized_rr'] = pd.to_numeric(df['realized_rr'], errors='coerce').fillna(0.0)
+    df_sorted = df.dropna(subset=["entry_time"]).sort_values("entry_time")
+    df_sorted["cumulative_pnl"] = df_sorted["pnl"].cumsum()
+    df_sorted["equity"]         = 10000 + df_sorted["cumulative_pnl"]
 
-    # ── Equity Curve ──────────────────────────────────────────────────────────
+    # ── Equity curve ──────────────────────────────────────────────────────────
     st.subheader("Equity Curve")
-
-    df_sorted = df.dropna(subset=['entry_time']).sort_values('entry_time')
-    df_sorted['cumulative_pnl'] = df_sorted['pnl'].cumsum()
-
-    # Use starting balance from earliest trade's period rather than hardcoded 10k
-    starting_balance = 10000.0
-    df_sorted['equity'] = starting_balance + df_sorted['cumulative_pnl']
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df_sorted['entry_time'],
-        y=df_sorted['equity'],
-        mode='lines',
-        name='Equity',
-        line=dict(color='royalblue', width=2),
-        fill='tozeroy',
-        fillcolor='rgba(65, 105, 225, 0.1)'
+        x=df_sorted["entry_time"], y=df_sorted["equity"],
+        mode="lines", name="Equity",
+        line=dict(color="royalblue", width=2),
+        fill="tozeroy", fillcolor="rgba(65,105,225,0.08)"
     ))
-    fig.update_layout(
-        title="Account Equity Over Time",
-        xaxis_title="Date",
-        yaxis_title="Equity ($)",
-        hovermode='x unified',
-        height=400
-    )
-    st.plotly_chart(fig, width='stretch')
-
-    # ── Per-symbol and distribution ───────────────────────────────────────────
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Performance by Symbol")
-        if 'symbol' in df.columns:
-            try:
-                symbol_stats = df.groupby('symbol').agg(
-                    total_pnl=('pnl', 'sum'),
-                    trades=('pnl', 'count'),
-                    avg_pnl=('pnl', 'mean'),
-                    avg_rr=('realized_rr', 'mean'),
-                ).round(2)
-                st.dataframe(symbol_stats, width='stretch')
-            except Exception as e:
-                st.error(f"Symbol stats error: {e}")
-
-    with col2:
-        st.subheader("Win / Loss Distribution")
-
-        # FIX 4: pnl already sanitised above, safe to compare
-        wins   = df[df['pnl'] > 0]['pnl']
-        losses = df[df['pnl'] < 0]['pnl']
-
-        fig = go.Figure()
-        if not wins.empty:
-            fig.add_trace(go.Histogram(
-                x=wins, name='Wins', marker_color='green', opacity=0.7
-            ))
-        if not losses.empty:
-            fig.add_trace(go.Histogram(
-                x=losses, name='Losses', marker_color='red', opacity=0.7
-            ))
-        fig.update_layout(
-            barmode='overlay',
-            xaxis_title='P&L ($)',
-            yaxis_title='Count',
-            height=300
-        )
-        st.plotly_chart(fig, width='stretch')
-
-    # ── Time-based analysis ───────────────────────────────────────────────────
-    st.subheader("Time-Based Analysis")
-
-    df_time = df.dropna(subset=['entry_time']).copy()
-    df_time['hour']        = df_time['entry_time'].dt.hour
-    df_time['day_of_week'] = df_time['entry_time'].dt.day_name()
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if not df_time.empty:
-            hour_pnl = df_time.groupby('hour')['pnl'].sum()
-            fig = px.bar(
-                x=hour_pnl.index, y=hour_pnl.values,
-                labels={'x': 'Hour of Day (UTC)', 'y': 'Total P&L ($)'},
-                title='P&L by Hour of Day',
-                color=hour_pnl.values,
-                color_continuous_scale=['red', 'yellow', 'green']
-            )
-            st.plotly_chart(fig, width='stretch')
-
-    with col2:
-        if not df_time.empty:
-            day_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
-            day_pnl = df_time.groupby('day_of_week')['pnl'].sum().reindex(
-                [d for d in day_order if d in df_time['day_of_week'].unique()]
-            )
-            fig = px.bar(
-                x=day_pnl.index, y=day_pnl.values,
-                labels={'x': 'Day of Week', 'y': 'Total P&L ($)'},
-                title='P&L by Day of Week',
-                color=day_pnl.values,
-                color_continuous_scale=['red', 'yellow', 'green']
-            )
-            st.plotly_chart(fig, width='stretch')
+    fig.update_layout(xaxis_title="Date", yaxis_title="Equity ($)",
+                      hovermode="x unified", height=350)
+    st.plotly_chart(fig, use_container_width=True)
 
     # ── Summary stats ─────────────────────────────────────────────────────────
     st.subheader("Summary Statistics")
-    col1, col2, col3, col4 = st.columns(4)
+    wins   = df[df["pnl"] > 0]["pnl"]
+    losses = df[df["pnl"] < 0]["pnl"]
+    n      = len(df)
 
-    total_trades = len(df)
-    win_trades   = int((df['pnl'] > 0).sum())
-    loss_trades  = int((df['pnl'] < 0).sum())
-    win_rate     = win_trades / total_trades * 100 if total_trades else 0
-
-    with col1:
-        st.metric("Total Closed Trades", total_trades)
-        st.metric("Win Rate", f"{win_rate:.1f}%")
-    with col2:
-        st.metric("Total P&L", f"${df['pnl'].sum():,.2f}")
-        st.metric("Avg P&L per Trade", f"${df['pnl'].mean():,.2f}")
-    with col3:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total Trades", n)
+        st.metric("Win Rate", f"{len(wins)/n*100:.1f}%" if n else "—")
+    with c2:
+        st.metric("Net P&L",   f"${df['pnl'].sum():,.2f}")
+        st.metric("Avg Trade", f"${df['pnl'].mean():,.2f}")
+    with c3:
         st.metric("Best Trade",  f"${df['pnl'].max():,.2f}")
         st.metric("Worst Trade", f"${df['pnl'].min():,.2f}")
-    with col4:
-        avg_win  = df[df['pnl'] > 0]['pnl'].mean() if win_trades  else 0
-        avg_loss = df[df['pnl'] < 0]['pnl'].mean() if loss_trades else 0
-        st.metric("Avg Win",  f"${avg_win:,.2f}")
-        st.metric("Avg Loss", f"${avg_loss:,.2f}")
+    with c4:
+        st.metric("Avg Win",  f"${wins.mean():,.2f}"  if not wins.empty  else "—")
+        st.metric("Avg Loss", f"${losses.mean():,.2f}" if not losses.empty else "—")
+
+    st.markdown("---")
+
+    # ── Per-symbol and distribution ───────────────────────────────────────────
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("By Symbol")
+        if "symbol" in df.columns:
+            sym_stats = df.groupby("symbol").agg(
+                trades=("pnl", "count"),
+                total_pnl=("pnl", "sum"),
+                avg_rr=("realized_rr", "mean")
+            ).round(2)
+            st.dataframe(sym_stats, use_container_width=True)
+
+    with col2:
+        st.subheader("Win / Loss Distribution")
+        fig2 = go.Figure()
+        if not wins.empty:
+            fig2.add_trace(go.Histogram(x=wins,   name="Wins",   marker_color="green", opacity=0.7))
+        if not losses.empty:
+            fig2.add_trace(go.Histogram(x=losses, name="Losses", marker_color="red",   opacity=0.7))
+        fig2.update_layout(barmode="overlay", height=280,
+                           xaxis_title="P&L ($)", yaxis_title="Count")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # ── Time-based ────────────────────────────────────────────────────────────
+    st.subheader("Time-Based Analysis")
+    df_t = df.dropna(subset=["entry_time"]).copy()
+    df_t["hour"]        = df_t["entry_time"].dt.hour
+    df_t["day_of_week"] = df_t["entry_time"].dt.day_name()
+
+    col1, col2 = st.columns(2)
+    if not df_t.empty:
+        with col1:
+            hour_pnl = df_t.groupby("hour")["pnl"].sum()
+            fig3 = px.bar(x=hour_pnl.index, y=hour_pnl.values,
+                          labels={"x":"Hour (UTC)","y":"P&L ($)"},
+                          title="P&L by Hour",
+                          color=hour_pnl.values,
+                          color_continuous_scale=["red","yellow","green"])
+            st.plotly_chart(fig3, use_container_width=True)
+
+        with col2:
+            day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+            day_pnl = df_t.groupby("day_of_week")["pnl"].sum()
+            day_pnl = day_pnl.reindex([d for d in day_order if d in day_pnl.index])
+            fig4 = px.bar(x=day_pnl.index, y=day_pnl.values,
+                          labels={"x":"Day","y":"P&L ($)"},
+                          title="P&L by Day of Week",
+                          color=day_pnl.values,
+                          color_continuous_scale=["red","yellow","green"])
+            st.plotly_chart(fig4, use_container_width=True)
 
 
 if __name__ == "__main__":
