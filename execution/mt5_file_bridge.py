@@ -16,6 +16,18 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ── Module-level singleton — shared across ALL MT5FileBridge instances ─────────
+# This is critical: both the execution bridge and the market data bridge
+# create separate instances but use the same physical command/response files.
+# Without a shared lock they corrupt each other's commands under concurrency.
+_MT5_GLOBAL_LOCK: Optional[asyncio.Lock] = None
+
+def _get_mt5_global_lock() -> asyncio.Lock:
+    """Lazy-init the shared lock (must be called from inside a running event loop)."""
+    global _MT5_GLOBAL_LOCK
+    if _MT5_GLOBAL_LOCK is None:
+        _MT5_GLOBAL_LOCK = asyncio.Lock()
+    return _MT5_GLOBAL_LOCK
 
 class MT5FileBridge:
     """
@@ -39,7 +51,7 @@ class MT5FileBridge:
         self._connected = False
         self.request_counter = 0
         self.last_read_position = 0
-        self._command_lock = asyncio.Lock()
+
 
         self.demo_orders    = {}
         self.demo_positions = {}
@@ -93,48 +105,46 @@ class MT5FileBridge:
 
     def is_connected(self) -> bool:
         return self._connected
+        
 
     # ------------------------------------------------------------------
     # Core command/response layer
     # ------------------------------------------------------------------
 
     async def _send_command(self, command: Dict, timeout: float = 30.0) -> Dict:
-        """
-        Send command with unique ID and wait for matching response.
-
-        An asyncio.Lock serialises all callers so only one command is
-        in-flight at a time. The MT5 EA is single-threaded and uses a
-        single command file — concurrent writes corrupt each other.
-        """
+        """Send command — serialised via module-level lock, one retry on timeout."""
         if self.demo_mode:
             return await self._simulate_command(command)
 
-        async with self._command_lock:
-            self.request_counter += 1
-            request_id = f"{self.session_id}_{self.request_counter}"
-            command['request_id'] = request_id
+        for attempt in range(2):   # try twice
+            async with _get_mt5_global_lock():
+                self.request_counter += 1
+                request_id = f"{self.session_id}_{self.request_counter}"
+                command['request_id'] = request_id
 
-            try:
-                command_json = json.dumps(command, ensure_ascii=True)
-                self.command_file.write_text(command_json, encoding='utf-8')
-                logger.debug(f"Sent command {request_id}: {command.get('action')}")
+                try:
+                    command_json = json.dumps(command, ensure_ascii=True)
+                    self.command_file.write_text(command_json, encoding='utf-8')
+                    logger.debug(f"Sent command {request_id}: {command.get('action')} (attempt {attempt+1})")
 
-                start_time = time.time()
-                while time.time() - start_time < timeout:
-                    response = await self._read_response_for_id(request_id)
-                    if response:
-                        logger.debug(
-                            f"Received response {request_id}: {response.get('status')}"
-                        )
-                        return response
-                    await asyncio.sleep(0.05)
+                    start_time = time.time()
+                    while time.time() - start_time < timeout:
+                        response = await self._read_response_for_id(request_id)
+                        if response:
+                            return response
+                        await asyncio.sleep(0.05)
 
-                logger.error(f"Command {request_id} timed out after {timeout}s")
-                return {'status': 'error', 'error': 'timeout'}
+                    logger.error(f"Command {request_id} timed out after {timeout}s (attempt {attempt+1})")
 
-            except Exception as e:
-                logger.error(f"Error sending command: {e}", exc_info=True)
-                return {'status': 'error', 'error': str(e)}
+                except Exception as e:
+                    logger.error(f"Error sending command: {e}", exc_info=True)
+                    return {'status': 'error', 'error': str(e)}
+
+            if attempt == 0:
+                logger.warning(f"Retrying command {command.get('action')} after timeout...")
+                await asyncio.sleep(1.0)   # brief pause before retry
+
+        return {'status': 'error', 'error': 'timeout'}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
         try:

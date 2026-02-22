@@ -363,33 +363,76 @@ class MoneyManager:
     
     def check_consecutive_losses(self, recent_trades: list) -> Dict:
         """Check for consecutive losses and apply cooldown if needed."""
+        import time as _time
+        from datetime import datetime, timezone
+
         cooldown_config = self.global_limits.get('cooldown_after_losses', {})
         if not cooldown_config.get('enabled', True):
             return {'cooldown_active': False}
-        
+
         max_consecutive = cooldown_config.get('consecutive_losses', 3)
-        
+        cooldown_seconds = cooldown_config.get('cooldown_seconds', 3600)
+
         consecutive_losses = 0
+        last_loss_trade = None
+
         for trade in reversed(recent_trades):
             pnl = trade.get('pnl')
             if pnl is None:
-                # Trade was closed without a pnl record (e.g. broker-closed while
-                # system was down and deal history couldn't be fetched).
-                # Treat as neutral — don't count as a loss or break the streak.
                 continue
             if pnl < 0:
                 consecutive_losses += 1
+                if last_loss_trade is None:
+                    last_loss_trade = trade   # most recent loss
             else:
                 break
-        
-        if consecutive_losses >= max_consecutive:
-            return {
-                'cooldown_active': True,
-                'consecutive_losses': consecutive_losses,
-                'reason': f"{consecutive_losses} consecutive losses"
-            }
-        
-        return {'cooldown_active': False, 'consecutive_losses': consecutive_losses}
+
+        if consecutive_losses < max_consecutive:
+            return {'cooldown_active': False, 'consecutive_losses': consecutive_losses}
+
+        # ── Threshold hit — check if cooldown has expired ─────────────────────
+        if last_loss_trade:
+            raw_time = last_loss_trade.get('exit_time') or last_loss_trade.get('entry_time')
+            if raw_time:
+                try:
+                    import pandas as pd
+                    loss_dt = pd.to_datetime(raw_time)
+                    # Make both naive UTC for comparison
+                    if loss_dt.tzinfo is not None:
+                        loss_dt = loss_dt.tz_localize(None)
+                    elapsed = (datetime.utcnow() - loss_dt).total_seconds()
+
+                    if elapsed >= cooldown_seconds:
+                        logger.info(
+                            f"[COOLDOWN] Expired after {elapsed:.0f}s "
+                            f"({consecutive_losses} consecutive losses). Resuming."
+                        )
+                        return {
+                            'cooldown_active'    : False,
+                            'consecutive_losses' : consecutive_losses,
+                            'expired'            : True,
+                        }
+
+                    remaining = int(cooldown_seconds - elapsed)
+                    logger.info(
+                        f"[COOLDOWN] Active — {consecutive_losses} consecutive losses, "
+                        f"{remaining}s remaining."
+                    )
+                    return {
+                        'cooldown_active'    : True,
+                        'consecutive_losses' : consecutive_losses,
+                        'reason'             : f"{consecutive_losses} consecutive losses",
+                        'remaining_seconds'  : remaining,
+                    }
+                except Exception as e:
+                    logger.warning(f"[COOLDOWN] Could not parse loss time: {e}")
+
+        # Fallback — no timestamp available, block conservatively
+        return {
+            'cooldown_active'   : True,
+            'consecutive_losses': consecutive_losses,
+            'reason'            : f"{consecutive_losses} consecutive losses (no timestamp)",
+        }
 
     def _get_mt5_contract_size(self, symbol: str) -> float:
         """
