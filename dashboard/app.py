@@ -214,17 +214,17 @@ def main():
         st.markdown("**Quick Actions**")
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("⏸️ Pause", use_container_width=True):
+            if st.button("⏸️ Pause"):
                 (CONTROL_DIR / "pause.flag").touch()
                 st.warning("Pause flag set.")
         with col2:
-            if st.button("▶️ Resume", use_container_width=True):
+            if st.button("▶️ Resume"):
                 flag = CONTROL_DIR / "pause.flag"
                 if flag.exists():
                     flag.unlink()
                 st.success("Resumed.")
 
-        if st.button("🚨 Emergency Close All", type="primary", use_container_width=True):
+        if st.button("🚨 Emergency Close All", type="primary"):
             (CONTROL_DIR / "emergency_close.flag").touch()
             st.error("Emergency close flag set! main.py will close all positions.")
 
@@ -253,7 +253,7 @@ def main():
         auto_refresh = st.checkbox("Auto-refresh (30s)", value=False)
         if auto_refresh:
             import time as _time
-            _time.sleep(0.5)
+            _time.sleep(0.5)  # Small delay to allow UI to update before refresh
             st.rerun()
 
     # ── Load and filter data ──────────────────────────────────────────────────
@@ -262,21 +262,30 @@ def main():
     filtered     = filter_trades_by_time(all_trades, start_dt, end_dt)
     closed_filt  = [t for t in filtered if t.get("status") == "closed"]
 
-    # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Overview", "📈 Trades", "⚙️ Configuration", "🧠 Learning", "📉 Analytics"
-    ])
+    # ── Page navigation (session_state keeps selected page across reruns) ────
+    PAGES = {
+        "📊 Overview"      : lambda: show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt),
+        "📈 Trades"        : lambda: show_trades_tab(db, closed_filt, open_trades),
+        "⚙️ Configuration" : lambda: show_configuration_tab(config),
+        "🧠 Learning"      : lambda: show_learning_tab(db),
+        "📉 Analytics"     : lambda: show_analytics_tab(closed_filt),
+    }
 
-    with tab1:
-        show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt)
-    with tab2:
-        show_trades_tab(db, closed_filt, open_trades)
-    with tab3:
-        show_configuration_tab(config)
-    with tab4:
-        show_learning_tab(db)
-    with tab5:
-        show_analytics_tab(closed_filt)
+    # Inject nav into sidebar (below the time filter already there)
+    with st.sidebar:
+        st.markdown("---")
+        st.markdown("**Navigation**")
+        page = st.radio(
+            "Go to",
+            list(PAGES.keys()),
+            index=list(PAGES.keys()).index(st.session_state.get("active_page", "📊 Overview")),
+            label_visibility="collapsed",
+            key="nav_radio",
+        )
+        st.session_state["active_page"] = page
+
+    # Render selected page
+    PAGES[page]()
 
 
 # ── Tab 1: Overview ───────────────────────────────────────────────────────────
@@ -372,7 +381,7 @@ def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt
             title={"text": f"Net P&L ({time_range})"},
         ))
         fig.update_layout(height=160, margin=dict(t=40, b=0, l=0, r=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig)
 
         st.markdown(f"""
         | | |
@@ -462,7 +471,7 @@ def show_trades_tab(db, closed_filt, open_trades):
 
     selection = st.dataframe(
         df_display,
-        use_container_width=True,
+        width='stretch',
         selection_mode="single-row",
         on_select="rerun",
         key="trade_table"
@@ -620,7 +629,7 @@ metrics that justified it. You can review past versions and roll back if needed.
                 "Expectancy"  : f"{safe_float(metrics.get('expectancy')):.2f}" if metrics.get("expectancy") else "—",
                 "Notes"       : v.get("notes") or "",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), width='stretch')
     else:
         st.info("No parameter versions saved yet. The learning engine will populate this table once it runs an optimization cycle.")
 
@@ -673,7 +682,7 @@ def show_learning_tab(db):
             df = pd.DataFrame(runs)
             show_cols = [c for c in ["run_id","started_at","completed_at",
                                       "optimization_method","trades_analyzed","status"] if c in df.columns]
-            st.dataframe(df[show_cols], use_container_width=True)
+            st.dataframe(df[show_cols], width='stretch')
         else:
             st.info("No learning runs recorded yet.")
     except Exception as e:
@@ -709,7 +718,7 @@ def show_analytics_tab(closed_filt):
     ))
     fig.update_layout(xaxis_title="Date", yaxis_title="Equity ($)",
                       hovermode="x unified", height=350)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     # ── Summary stats ─────────────────────────────────────────────────────────
     st.subheader("Summary Statistics")
@@ -743,7 +752,7 @@ def show_analytics_tab(closed_filt):
                 total_pnl=("pnl", "sum"),
                 avg_rr=("realized_rr", "mean")
             ).round(2)
-            st.dataframe(sym_stats, use_container_width=True)
+            st.dataframe(sym_stats, width='stretch')
 
     with col2:
         st.subheader("Win / Loss Distribution")
@@ -754,7 +763,7 @@ def show_analytics_tab(closed_filt):
             fig2.add_trace(go.Histogram(x=losses, name="Losses", marker_color="red",   opacity=0.7))
         fig2.update_layout(barmode="overlay", height=280,
                            xaxis_title="P&L ($)", yaxis_title="Count")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2)
 
     # ── Time-based ────────────────────────────────────────────────────────────
     st.subheader("Time-Based Analysis")
@@ -771,7 +780,7 @@ def show_analytics_tab(closed_filt):
                           title="P&L by Hour",
                           color=hour_pnl.values,
                           color_continuous_scale=["red","yellow","green"])
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3)
 
         with col2:
             day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
@@ -782,7 +791,7 @@ def show_analytics_tab(closed_filt):
                           title="P&L by Day of Week",
                           color=day_pnl.values,
                           color_continuous_scale=["red","yellow","green"])
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4)
 
 
 if __name__ == "__main__":
