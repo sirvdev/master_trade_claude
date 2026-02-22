@@ -253,7 +253,7 @@ def main():
         auto_refresh = st.checkbox("Auto-refresh (30s)", value=False)
         if auto_refresh:
             import time as _time
-            _time.sleep(0.5)  # Small delay to allow UI to update before refresh
+            _time.sleep(0.5)
             st.rerun()
 
     # ── Load and filter data ──────────────────────────────────────────────────
@@ -389,7 +389,7 @@ def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt
         | ✅ Gross Profit | `${gross_profit:,.2f}` |
         | ❌ Gross Loss   | `${gross_loss:,.2f}` |
         | 🏆 Win / Loss  | `{len(win_trades)} / {len(loss_trades)}` |
-        | ⏱ Avg Duration | `{sum(safe_float(t.get('duration_minutes')) for t in closed_filt)/n_trades:.0f} min` if {n_trades} else `—` |
+        | ⏱ Avg Duration | `{f"{sum(safe_float(t.get('duration_minutes')) for t in closed_filt)/n_trades:.0f} min" if n_trades else "—"}` |
         """)
 
     st.markdown("---")
