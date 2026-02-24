@@ -8,7 +8,6 @@ Get your trading system up and running in 5 minutes.
 - pip package manager
 - 500MB disk space
 - (Optional) MT5 account for metals trading
-- (Optional) Binance account for crypto trading
 
 ## 🚀 Installation (5 Steps)
 
@@ -95,25 +94,6 @@ Max Drawdown: -2.3%
 
 ## 🔧 Configuration
 
-### Enable Binance (Testnet)
-
-1. Get testnet API keys: https://testnet.binance.vision
-2. Update `.env`:
-```bash
-BINANCE_API_KEY=your_testnet_key
-BINANCE_API_SECRET=your_testnet_secret
-BINANCE_MODE=testnet
-```
-
-3. Enable crypto in `config/config.yaml`:
-```yaml
-symbols:
-  BTC/USDT:
-    enabled: true
-    platform: binance
-    mode: demo
-```
-
 ### Enable MT5
 
 1. Setup MT5 EA bridge (see docs/MT5_SETUP.md)
@@ -195,7 +175,6 @@ Before placing order:
 ### 4. Execution
 Order placed via configured platform:
 - MT5: Socket bridge to EA
-- Binance: REST API call
 - Demo: Simulated execution
 
 ### 5. Position Management

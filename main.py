@@ -23,7 +23,6 @@ from strategy.engine import StrategyEngine
 from risk_management.money_manager import MoneyManager
 from risk_management.stop_manager import StopManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
-from execution.binance_api import BinanceAPI
 from learning.learner import StrategyLearner
 from utils.market_hours import MarketHoursChecker
 
@@ -54,7 +53,6 @@ class TradingSystem:
         money_manager (MoneyManager): Position sizing and risk validation engine
         stop_manager (StopManager): Stop loss and take profit management
         mt5_client (MT5Bridge): MetaTrader 5 execution and data client
-        binance_client (BinanceAPI): Binance exchange execution and data client
         learner (StrategyLearner): Machine learning engine for strategy optimization
         running (bool): System execution state flag
         open_positions (dict): Dictionary of currently open trades tracked by trade_id
@@ -67,11 +65,11 @@ class TradingSystem:
         _init_database() -> None:
             Initialize database connection and audit logging.
         _init_market_clients() -> None:
-            Initialize multi-market data clients (Binance, MT5).
+            Initialize multi-market data clients (MT5).
         _init_strategy_components() -> None:
             Initialize technical indicators, strategy engine, money manager, and stop manager.
         _init_execution_clients() -> None:
-            Initialize order execution clients for both MT5 and Binance platforms.
+            Initialize order execution clients for both MT5 platforms.
         _init_learning_engine() -> None:
             Initialize machine learning engine if enabled in configuration.
         start() -> Coroutine:
@@ -88,8 +86,6 @@ class TradingSystem:
             Monitor open positions with batched API calls for efficiency.
         _batch_update_mt5_positions(positions: dict) -> Coroutine:
             Update all MT5 positions in a single API call.
-        _batch_update_binance_positions(positions: dict) -> Coroutine:
-            Update all Binance positions in a single API call.
         _update_trailing_stop_if_needed(trade_id: str, position: dict, 
                                        current_price: float) -> Coroutine:
             Update trailing stop loss for a position if conditions are met.
@@ -185,12 +181,6 @@ class TradingSystem:
     def _init_market_clients(self):
         """Initialize market data clients."""
         market_config = {
-            'binance': {
-                'api_key': os.getenv('BINANCE_API_KEY'),
-                'api_secret': os.getenv('BINANCE_API_SECRET'),
-                'mode': os.getenv('BINANCE_MODE', 'testnet'),
-                'use_futures': os.getenv('BINANCE_USE_FUTURES', 'false').lower() == 'true'
-            },
             'mt5': {
                 'host': os.getenv('MT5_BRIDGE_HOST', 'localhost'),
                 'port': int(os.getenv('MT5_BRIDGE_PORT', 9090)),
@@ -228,14 +218,6 @@ class TradingSystem:
         self.mt5_client = MT5Bridge(mt5_config, demo_mode=False)
 
         self.market_hours = MarketHoursChecker(self.mt5_client)
-        
-        # Binance
-        binance_config = {
-            'api_key': os.getenv('BINANCE_API_KEY'),
-            'api_secret': os.getenv('BINANCE_API_SECRET'),
-            'use_futures': os.getenv('BINANCE_USE_FUTURES', 'false').lower() == 'true'
-        }
-        self.binance_client = BinanceAPI(binance_config, demo_mode=demo_mode)
         
         logger.info(f"Execution clients initialized ({'DEMO' if demo_mode else 'LIVE'} mode)")
         
@@ -315,9 +297,6 @@ class TradingSystem:
                 if platform == 'mt5' and ticket:
                     result = await self.mt5_client.close_position(ticket)
                     logger.info(f"Emergency closed MT5 position {ticket}: {result}")
-                elif platform == 'binance':
-                    result = await self.binance_client.close_position(symbol)
-                    logger.info(f"Emergency closed Binance position {symbol}: {result}")
                 
                 # Log the closure
                 self.audit_logger.log_trade_exit(trade_id, {
@@ -341,7 +320,6 @@ class TradingSystem:
         
         # Connect execution clients
         await self.mt5_client.connect()
-        # await self.binance_client.connect()
         
         # Get starting balance
         self.daily_stats['starting_balance'] = await self._get_total_balance()
@@ -604,10 +582,6 @@ class TradingSystem:
                     current_price = price_data['bid']
                 
                 logger.info(f"Current price from MT5: {current_price:.4f}")
-            else:
-                ticker = await self.binance_client.get_ticker(symbol)
-                current_price = ticker['last']
-                logger.info(f"Current price from Binance: {current_price:.4f}")
             
             # Calculate stops with current price
             entry_tf = symbol_config['timeframes'][-1]
@@ -665,15 +639,7 @@ class TradingSystem:
                     take_profit=take_profit_1,
                     comment=f"Analysis_{analysis_id[:8]}" if analysis_id != 'unknown' else "Python"
                 )
-            else:
-                result = await self.binance_client.place_order(
-                    symbol=symbol,
-                    direction=analysis['direction'],
-                    amount=sizing['position_size'],
-                    order_type='market',
-                    stop_loss=stop_loss,
-                    take_profit=take_profit_1
-                )
+            
             
             if result['success']:
                 executed_price = result.get('filled_price') or result.get('price') or current_price
@@ -733,21 +699,14 @@ class TradingSystem:
                 
                 # Group positions by platform for batch checking
                 mt5_positions = {}
-                binance_positions = {}
                 
                 for trade_id, position in list(self.open_positions.items()):
                     if position['platform'] == 'mt5':
                         mt5_positions[trade_id] = position
-                    else:
-                        binance_positions[trade_id] = position
                 
                 # Batch check MT5 positions (single API call)
                 if mt5_positions:
                     await self._batch_update_mt5_positions(mt5_positions)
-                
-                # Batch check Binance positions (single API call)
-                if binance_positions:
-                    await self._batch_update_binance_positions(binance_positions)
                 
                 # Wait before next check
                 await asyncio.sleep(10)
@@ -829,33 +788,6 @@ class TradingSystem:
 
         except Exception as e:
             logger.error(f"[MONITOR] Error batch updating MT5 positions: {e}", exc_info=True)
-
-
-    async def _batch_update_binance_positions(self, positions: dict):
-        """Update all Binance positions in one call."""
-        try:
-            # Get all positions from Binance
-            all_binance_positions = await self.binance_client.get_all_positions()
-            
-            # Create lookup by symbol
-            binance_by_symbol = {
-                pos['symbol']: pos
-                for pos in all_binance_positions
-            }
-            
-            for trade_id, position in list(positions.items()):
-                symbol = position['symbol']
-                
-                if symbol not in binance_by_symbol:
-                    logger.warning(f"Position {trade_id} not found on Binance")
-                    await self._handle_external_close(trade_id, position)
-                    continue
-                
-                current = binance_by_symbol[symbol]
-                # Update trailing stops etc.
-                
-        except Exception as e:
-            logger.error(f"Error batch updating Binance positions: {e}", exc_info=True)
 
 
     async def _update_trailing_stop_if_needed(
@@ -1426,8 +1358,7 @@ class TradingSystem:
             # Get current price
             if platform == 'mt5':
                 pos_info = await self.mt5_client.get_position_info(position['ticket'])
-            else:
-                pos_info = await self.binance_client.get_position(symbol)
+            
                 
             if not pos_info:
                 # Position may have been closed
@@ -1544,13 +1475,6 @@ class TradingSystem:
                     )
             except Exception as exc:
                 logger.error(f"[SHUTDOWN] Exception closing {ticket}: {exc}")
-
-        # Close all Binance positions if applicable
-        if hasattr(self, "binance_client"):
-            try:
-                self.binance_client.close_all_positions(reason="emergency_shutdown")
-            except Exception as exc:
-                logger.error(f"[SHUTDOWN] Binance close-all failed: {exc}")
 
         self.open_positions.clear()
         logger.critical("[SHUTDOWN] Emergency shutdown complete.")
@@ -1723,7 +1647,6 @@ class TradingSystem:
 
             MT5  → authenticate action → returns balance + equity (we use equity
                 so unrealised P&L is included in risk calculations).
-            Binance → fetch_balance → returns total_usd.
 
             Falls back to the last cached self.current_equity if a platform call
             fails, so a temporary disconnect doesn't zero-out the risk engine.
@@ -1750,20 +1673,6 @@ class TradingSystem:
                     logger.error(f"Error fetching MT5 balance: {e}")
             else:
                 logger.debug("MT5 client not connected — skipping MT5 balance fetch")
-
-            # ── Binance ───────────────────────────────────────────────────────────
-            if self.binance_client and self.binance_client.is_connected():
-                try:
-                    binance_balance = await self.binance_client.get_balance()
-                    binance_equity  = binance_balance.get('total_usd', 0.0)
-                    if binance_equity > 0:
-                        total_equity += binance_equity
-                        any_platform_succeeded = True
-                        logger.info(f"Binance equity: ${binance_equity:,.2f}")
-                except Exception as e:
-                    logger.warning(f"Error fetching Binance balance: {e}")
-            else:
-                logger.debug("Binance client not connected — skipping Binance balance fetch")
 
             # ── Fallback ──────────────────────────────────────────────────────────
             if not any_platform_succeeded:
@@ -1828,19 +1737,12 @@ class TradingSystem:
                 try:
                     if position['platform'] == 'mt5':
                         await self.mt5_client.close_position(position['ticket'])
-                    else:
-                        await self.binance_client.close_position(position['symbol'])
                 except Exception as e:
                     logger.error(f"Error closing position: {e}")
                     
         # Close connections
         try:
             await self.mt5_client.disconnect()
-        except:
-            pass
-            
-        try:
-            await self.binance_client.close()
         except:
             pass
             

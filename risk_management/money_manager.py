@@ -34,7 +34,7 @@ class MoneyManager:
         stop_loss: float,
         symbol: str,
         direction: str,
-        platform: str = 'binance',  # ADD THIS PARAMETER
+        platform: str = 'mt5',  # ADD THIS PARAMETER
         current_exposure: Optional[Dict] = None
     ) -> Dict:
         """
@@ -46,7 +46,7 @@ class MoneyManager:
             stop_loss: Stop loss price
             symbol: Trading symbol
             direction: 'long' or 'short'
-            platform: 'mt5' or 'binance'
+            platform: 'mt5' 
             current_exposure: Optional dict of current positions
             
         Returns:
@@ -76,9 +76,6 @@ class MoneyManager:
                 risk_distance,
                 symbol
             )
-        else:  # binance or other
-            # Binance: position size is in base currency (BTC, ETH, etc.)
-            position_size = max_risk_amount / risk_distance
         
         # Apply dynamic sizing adjustments
         if self.use_dynamic_sizing:
@@ -106,9 +103,6 @@ class MoneyManager:
         if platform == 'mt5':
             contract_size = self._get_mt5_contract_size(symbol)
             actual_risk = position_size * contract_size * risk_distance
-
-        else:
-            actual_risk = position_size * risk_distance
         
         actual_risk_percent = (actual_risk / account_equity) * 100
         
@@ -116,8 +110,6 @@ class MoneyManager:
         if platform == 'mt5':
             contract_size = self._get_mt5_contract_size(symbol)
             position_value = position_size * contract_size * entry_price
-        else:
-            position_value = position_size * entry_price
         
         leverage_used = position_value / account_equity if account_equity > 0 else 0
         
@@ -270,7 +262,7 @@ class MoneyManager:
         stop_loss: float,
         symbol: str,
         direction: str,
-        platform: str = 'binance',
+        platform: str = 'mt5',
         current_exposure: Optional[Dict] = None,
         daily_stats: Optional[Dict] = None,
         recent_trades: Optional[list] = None

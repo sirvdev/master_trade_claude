@@ -38,23 +38,6 @@ symbols:
     primary_timeframe: 4H
     entry_timeframe: 15m
   
-  BTC/USDT:
-    enabled: false
-    platform: binance
-    mode: demo
-    market_type: futures  # spot or futures
-    timeframes: [4H, 15m, 5m]
-    primary_timeframe: 1H
-    entry_timeframe: 15m
-  
-  ETH/USDT:
-    enabled: false
-    platform: binance
-    mode: demo
-    market_type: futures
-    timeframes: [1H, 15m, 5m]
-    primary_timeframe: 1H
-    entry_timeframe: 5m
 
 # =============================================================================
 # TIMEFRAME ANALYSIS
@@ -237,11 +220,6 @@ execution:
     magic_number: 123456
     deviation_points: 10
     fill_policy: FOK  # FOK or IOC
-  
-  binance:
-    use_websocket: true
-    order_type: LIMIT  # LIMIT or MARKET
-    time_in_force: GTC  # GTC, IOC, FOK
 
 # =============================================================================
 # LEARNING ENGINE

@@ -1,6 +1,6 @@
 # Production Trading System
 
-A comprehensive, modular Python trading system with multi-timeframe analysis, automated learning, and dual-platform execution (MT5 for metals, Binance for crypto).
+A comprehensive, modular Python trading system with multi-timeframe analysis, automated learning, and dual-platform execution (MT5 for metals).
 
 ## 🚀 Features
 
@@ -9,7 +9,6 @@ A comprehensive, modular Python trading system with multi-timeframe analysis, au
 - **15+ Technical Indicators**: EMA, RSI, MACD, SuperTrend, Bollinger Bands, ATR, and more
 - **Dual Platform Execution**: 
   - MT5 via Socket/EA Bridge for metals (XAU/USD)
-  - Binance REST & WebSocket for crypto (BTC, ETH, etc.)
 - **Advanced Risk Management**:
   - Dynamic position sizing
   - Trailing stops with RR activation
@@ -44,7 +43,6 @@ trader_project/
 │   └── stop_manager.py         # SL/TP/trailing stop logic
 ├── execution/
 │   ├── mt5_bridge.py           # MT5 Socket/EA bridge
-│   └── binance_api.py          # Binance REST & WebSocket
 ├── logger/
 │   ├── db.py                   # SQLite database manager
 │   └── audit_logger.py         # Structured logging
@@ -89,11 +87,6 @@ nano .env  # or use your preferred editor
 Required environment variables:
 
 ```bash
-# Binance
-BINANCE_API_KEY=your_api_key
-BINANCE_API_SECRET=your_api_secret
-BINANCE_MODE=testnet  # or live
-
 # MT5 Bridge
 MT5_BRIDGE_HOST=localhost
 MT5_BRIDGE_PORT=9090
@@ -343,29 +336,6 @@ MT5_BRIDGE_PORT=9090
   "sl": 2040.0,
   "tp": 2060.0
 }
-```
-
-## 📈 Binance Integration
-
-### Testnet Setup
-
-1. Create testnet account: https://testnet.binance.vision
-2. Generate API keys
-3. Configure in `.env`:
-
-```bash
-BINANCE_MODE=testnet
-BINANCE_API_KEY=your_testnet_key
-BINANCE_API_SECRET=your_testnet_secret
-```
-
-### Live Trading
-
-```bash
-BINANCE_MODE=live
-BINANCE_API_KEY=your_live_key
-BINANCE_API_SECRET=your_live_secret
-```
 
 **⚠️ Warning**: Use extreme caution with live keys. Start with small amounts.
 

@@ -12,9 +12,9 @@ pandas_ta_classic==0.1.0
 # sqlite3  # Built-in 
 
 # API Clients
-ccxt>=4.2.0  # Unified crypto exchange API (includes Binance)
-python-binance>=1.0.19  # Binance-specific client
-websockets>=12.0
+# ccxt>=4.2.0  # Unified crypto exchange API (includes Binance)
+# python-binance>=1.0.19  # Binance-specific client
+# websockets>=12.0
 aiohttp>=3.9.1
 requests>=2.31.0
 

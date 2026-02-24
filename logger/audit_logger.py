@@ -417,8 +417,8 @@ if __name__ == "__main__":
     # Test trade entry
     trade_id = audit.log_trade_entry({
         'analysis_id': analysis_id,
-        'symbol': 'BTC/USDT',
-        'platform': 'binance',
+        'symbol': 'BTC/USD',
+        'platform': 'mt5',
         'direction': 'long',
         'entry_price': 42000.0,
         'stop_loss': 41500.0,

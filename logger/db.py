@@ -84,7 +84,7 @@ class DatabaseManager:
                 trade_id TEXT PRIMARY KEY,
                 analysis_id TEXT,
                 symbol TEXT NOT NULL,
-                platform TEXT NOT NULL,  -- mt5 or binance
+                platform TEXT NOT NULL,  -- mt5
                 direction TEXT NOT NULL,  -- long or short
                 entry_time TIMESTAMP NOT NULL,
                 exit_time TIMESTAMP,
@@ -95,7 +95,7 @@ class DatabaseManager:
                 take_profit_2 REAL,
                 take_profit_3 REAL,
                 position_size REAL NOT NULL,
-                ticket INTEGER,  -- broker order/position ticket (MT5 ticket or Binance order ID)
+                ticket INTEGER,  -- MT5 broker position ticket
                 status TEXT NOT NULL,  -- open, closed, partial
                 exit_reason TEXT,  -- tp1, tp2, tp3, sl, manual, trailing
                 pnl REAL,
