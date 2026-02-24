@@ -209,7 +209,7 @@ class TradingSystem:
         self.strategy_engine = StrategyEngine(self.config)
         self.money_manager = MoneyManager(self.config)
         self.stop_manager = StopManager(self.config)
-        self.market_hours = MarketHoursChecker(self.config)
+        self.market_hours = MarketHoursChecker(self.mt5_client)
         
         logger.info("Strategy components initialized")
         
@@ -346,6 +346,11 @@ class TradingSystem:
         self.daily_stats['starting_balance'] = await self._get_total_balance()
 
         await self._load_open_positions_from_db()
+
+        enabled_symbols = [s for s, c in self.config.get('symbols', {}).items() if c.get('enabled')]
+        await self.market_hours.prefetch_all(enabled_symbols)
+        # this fires one get_symbol_sessions per symbol at startup, logs the full schedule
+
         
         # Start main trading loop
         try:
@@ -498,13 +503,8 @@ class TradingSystem:
                         break
                     # ── Market hours guard ────────────────────────────────────
                     if not self.market_hours.is_open(symbol):
-                        secs = self.market_hours.seconds_until_open(symbol)
-                        next_open = self.market_hours.next_open_str(symbol)
-                        logger.info(
-                            f"[MARKET_HOURS] {symbol} is closed. "
-                            f"Next open: {next_open}. Skipping."
-                        )
-                        continue   # skip this symbol this cycle, try next symbol
+                        logger.info(f"[MARKET_HOURS] {symbol} closed — next open: {self.market_hours.next_open_str(symbol)}")
+                        continue
                     # ✅ CHECK: Don't analyze if already have position in this symbol
                     symbol_has_position = any(
                         pos['symbol'] == symbol 
