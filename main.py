@@ -25,6 +25,7 @@ from risk_management.stop_manager import StopManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
 from execution.binance_api import BinanceAPI
 from learning.learner import StrategyLearner
+from utils.market_hours import MarketHoursChecker
 
 # Setup logging
 _file_handler   = logging.FileHandler('logs/trading_system.log', encoding='utf-8')
@@ -208,6 +209,7 @@ class TradingSystem:
         self.strategy_engine = StrategyEngine(self.config)
         self.money_manager = MoneyManager(self.config)
         self.stop_manager = StopManager(self.config)
+        self.market_hours = MarketHoursChecker(self.config)
         
         logger.info("Strategy components initialized")
         
@@ -494,7 +496,15 @@ class TradingSystem:
                             f"stopping new entries this cycle"
                         )
                         break
-                    
+                    # ── Market hours guard ────────────────────────────────────
+                    if not self.market_hours.is_open(symbol):
+                        secs = self.market_hours.seconds_until_open(symbol)
+                        next_open = self.market_hours.next_open_str(symbol)
+                        logger.info(
+                            f"[MARKET_HOURS] {symbol} is closed. "
+                            f"Next open: {next_open}. Skipping."
+                        )
+                        continue   # skip this symbol this cycle, try next symbol
                     # ✅ CHECK: Don't analyze if already have position in this symbol
                     symbol_has_position = any(
                         pos['symbol'] == symbol 
