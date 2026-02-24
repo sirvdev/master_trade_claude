@@ -209,7 +209,6 @@ class TradingSystem:
         self.strategy_engine = StrategyEngine(self.config)
         self.money_manager = MoneyManager(self.config)
         self.stop_manager = StopManager(self.config)
-        self.market_hours = MarketHoursChecker(self.mt5_client)
         
         logger.info("Strategy components initialized")
         
@@ -227,6 +226,8 @@ class TradingSystem:
             'magic_number': 123456
         }
         self.mt5_client = MT5Bridge(mt5_config, demo_mode=False)
+
+        self.market_hours = MarketHoursChecker(self.mt5_client)
         
         # Binance
         binance_config = {
