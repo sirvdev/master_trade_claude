@@ -464,13 +464,15 @@ class TradingSystem:
                     await asyncio.sleep(903)
                     continue
                 
-                # Get enabled symbols
+                # Get enabled symbols — shuffle each cycle so no single symbol
+                import random as _random
                 symbols_config = self.config.get('symbols', {})
                 enabled_symbols = [
                     (symbol, cfg)
                     for symbol, cfg in symbols_config.items()
                     if cfg.get('enabled', False)
                 ]
+                _random.shuffle(enabled_symbols)
                 
                 for symbol, symbol_config in enabled_symbols:
                     # ✅ DOUBLE CHECK before each symbol
@@ -482,8 +484,24 @@ class TradingSystem:
                         break
                     # ── Market hours guard ────────────────────────────────────
                     if not self.market_hours.is_open(symbol):
-                        logger.info(f"[MARKET_HOURS] {symbol} closed — next open: {self.market_hours.next_open_str(symbol)}")
-                        continue
+                        # Double-check with live price freshness — works even
+                        # without EA v2.2 (uses existing get_historical action).
+                        price_fresh = await self.market_hours.is_open_by_price(
+                            symbol, self.mt5_client, timeframe='1H'
+                        )
+                        if not price_fresh:
+                            logger.info(
+                                f"[MARKET_HOURS] {symbol} closed — "
+                                f"next open: {self.market_hours.next_open_str(symbol)}"
+                            )
+                            continue
+                        # Schedule says closed but live price data is fresh →
+                        # trust the price, proceed with analysis
+                        logger.debug(
+                            f"[MARKET_HOURS] {symbol}: schedule says closed "
+                            f"but recent price data found — proceeding"
+                        )
+
                     # ✅ CHECK: Don't analyze if already have position in this symbol
                     symbol_has_position = any(
                         pos['symbol'] == symbol 
@@ -596,16 +614,34 @@ class TradingSystem:
                 'stop_loss', {}
             ).get('atr_multiplier', 2.0)
             
+            # ── TP levels read from config, not hardcoded ──────────────────
+            _tp_targets = self.config.get('risk_management', {}).get(
+                'take_profit', {}
+            ).get('targets', [])
+            # Filter out the trailing-only entry (rr_ratio: 999)
+            _real_tps = [t for t in _tp_targets if float(t.get('rr_ratio', 999)) < 999]
+            # Fall back to 2R / 3R if config section missing
+            _tp1_rr       = float(_real_tps[0]['rr_ratio']) if len(_real_tps) >= 1 else 2.0
+            _tp2_rr       = float(_real_tps[1]['rr_ratio']) if len(_real_tps) >= 2 else 3.0
+            _tp1_fraction = float(_real_tps[0].get('close_percent', 50)) / 100.0 if _real_tps else 0.5
+                            
+
             if analysis['direction'] == 'long':
-                stop_loss = current_price - (atr * atr_multiplier)
-                risk = current_price - stop_loss
-                take_profit_1 = current_price + (risk * 1.5)
-                take_profit_2 = current_price + (risk * 3.0)
+                stop_loss    = current_price - (atr * atr_multiplier)
+                risk         = current_price - stop_loss
+                take_profit_1 = current_price + (risk * _tp1_rr)
+                take_profit_2 = current_price + (risk * _tp2_rr)
             else:
-                stop_loss = current_price + (atr * atr_multiplier)
-                risk = stop_loss - current_price
-                take_profit_1 = current_price - (risk * 1.5)
-                take_profit_2 = current_price - (risk * 3.0)
+                stop_loss    = current_price + (atr * atr_multiplier)
+                risk         = stop_loss - current_price
+                take_profit_1 = current_price - (risk * _tp1_rr)
+                take_profit_2 = current_price - (risk * _tp2_rr)
+
+            logger.info(
+                f"[TP] {symbol} {analysis['direction']}: "
+                f"SL={stop_loss:.5f}  TP1={take_profit_1:.5f} ({_tp1_rr}R, "
+                f"{_tp1_fraction*100:.0f}% close)  TP2={take_profit_2:.5f} ({_tp2_rr}R)"
+            )
             
             # Get balance
             balance = await self._get_total_balance()
@@ -636,7 +672,7 @@ class TradingSystem:
                     order_type='market',
                     price=None,
                     stop_loss=stop_loss,
-                    take_profit=take_profit_1,
+                    take_profit=take_profit_2,
                     comment=f"Analysis_{analysis_id[:8]}" if analysis_id != 'unknown' else "Python"
                 )
             
@@ -644,40 +680,39 @@ class TradingSystem:
             if result['success']:
                 executed_price = result.get('filled_price') or result.get('price') or current_price
                 ticket = result.get('ticket') or result.get('order_id')
-                
-                trade_data = {
-                    'analysis_id': analysis_id,
-                    'symbol': symbol,
-                    'platform': platform,
-                    'direction': analysis['direction'],
-                    'entry_price': executed_price,
-                    'stop_loss': stop_loss,
+
+                trade_id = self.audit_logger.log_trade_entry({
+                    'analysis_id'  : analysis_id,
+                    'symbol'       : symbol,
+                    'platform'     : platform,
+                    'direction'    : analysis['direction'],
+                    'entry_price'  : executed_price,
+                    'stop_loss'    : stop_loss,
                     'take_profit_1': take_profit_1,
                     'take_profit_2': take_profit_2,
-                    'position_size': sizing['position_size']
-                }
-                
-                # Log to database
-                trade_id = self.audit_logger.log_trade_entry(trade_data)
-                
-                # Update with ticket
-                self.db.update_trade(trade_id, {
-                    'ticket': ticket,
-                    'status': 'open'
+                    'position_size': sizing['position_size'],
                 })
-                
-                # Add to tracking
-                self.open_positions[trade_id] = {
-                    **trade_data,
-                    'trade_id': trade_id,
-                    'ticket': ticket,
-                    'entry_time': datetime.utcnow()
-                }
-                
+
+                self.db.update_trade(trade_id, {'ticket': ticket, 'status': 'open'})
+
+                self._register_new_position(
+                    trade_id    = trade_id,
+                    ticket      = ticket,
+                    symbol      = symbol,
+                    direction   = analysis['direction'],
+                    entry_price = executed_price,
+                    volume      = sizing['position_size'],
+                    sl          = stop_loss,
+                    tp1         = take_profit_1,
+                    tp2         = take_profit_2,
+                    tp1_fraction= _tp1_fraction,   
+                    platform    = platform,
+                    analysis_id = analysis_id,
+                )
+
                 self.daily_stats['trades_today'] += 1
-                
                 logger.info(
-                    f" Trade #{len(self.open_positions)}: {symbol} {analysis['direction']} "
+                    f"Trade #{len(self.open_positions)}: {symbol} {analysis['direction']} "
                     f"@ {executed_price:.4f}, Ticket: {ticket}"
                 )
             else:

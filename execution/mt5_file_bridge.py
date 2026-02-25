@@ -82,6 +82,8 @@ class MT5FileBridge:
         except Exception as e:
             logger.error(f"Could not write session file: {e}")
 
+        await asyncio.sleep(1.0)
+
         if self.status_file.exists():
             try:
                 status = self.status_file.read_text(encoding='utf-8', errors='ignore')

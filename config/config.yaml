@@ -160,9 +160,9 @@ risk_management:
   # Take Profit
   take_profit:
     targets:
-      - {name: TP1, rr_ratio: 2, close_percent: 50}  # Close 50% at 1.5R
+      - {name: TP1, rr_ratio: 2, close_percent: 50}  # Close 50% at 2R
       - {name: TP2, rr_ratio: 3, close_percent: 30}  # Close 30% at 3R
-      - {name: TP3, rr_ratio: 999, close_percent: 20}  # Trail remainder
+      - {name: TP3, rr_ratio: 10, close_percent: 20}  # Trail remainder
     
     dynamic_extension: true  # Extend TP on new structural highs
   

@@ -194,6 +194,92 @@ class MarketHoursChecker:
             parts.append(f"{d} {fh:02d}:{fm:02d}–{th:02d}:{tm:02d}")
         return f"{symbol}: " + ", ".join(parts)
 
+    async def is_open_by_price(
+        self,
+        symbol: str,
+        mt5_bridge,
+        timeframe: str = "1H",
+        stale_multiplier: float = 2.5,
+    ) -> bool:
+        """
+        Secondary market-open check using price data freshness.
+
+        Asks MT5 for the last 2 bars and checks whether the most recent bar's
+        timestamp is recent enough. If the last bar is older than
+        (timeframe_seconds × stale_multiplier), the market is very likely closed
+        (no new bars are being formed by the broker).
+
+        This works with ANY EA version — it only uses 'get_historical' which
+        every version of PythonFileBridge supports. It does NOT require the
+        new get_symbol_sessions action.
+
+        Args:
+            symbol:           Trading symbol, e.g. 'XAU/USD'
+            mt5_bridge:       Connected MT5FileBridge instance
+            timeframe:        Timeframe to inspect (default '1H')
+            stale_multiplier: How many full periods old = "closed"
+                              2.5 means: if the last 1H bar is >2.5 hours old,
+                              market is considered closed.
+
+        Returns:
+            True  — market appears open (price is fresh), or on any error.
+            False — last bar is stale, market is likely closed.
+        """
+        _TF_SECONDS = {
+            '1m': 60, '5m': 300, '15m': 900, '30m': 1800,
+            '1H': 3600, '4H': 14400, '1D': 86400,
+            # MT5 style aliases
+            'M1': 60, 'M5': 300, 'M15': 900, 'M30': 1800,
+            'H1': 3600, 'H4': 14400, 'D1': 86400,
+        }
+        tf_secs = _TF_SECONDS.get(timeframe, 3600)
+        mt5_sym = _mt5_symbol(symbol)
+
+        try:
+            response = await mt5_bridge._send_command(
+                {
+                    "action":    "get_historical",
+                    "symbol":    mt5_sym,
+                    "timeframe": timeframe,
+                    "count":     2,
+                },
+                timeout=10.0,
+            )
+
+            if response.get("status") != "success":
+                logger.debug(
+                    f"[MarketHours] is_open_by_price: get_historical failed for "
+                    f"{symbol}: {response.get('error')} — assuming open"
+                )
+                return True  # fail open
+
+            data = response.get("data", [])
+            if not data:
+                return True  # fail open — no data means bridge issue, not closed market
+
+            # data rows: [timestamp_unix, open, high, low, close, volume]
+            last_bar_ts = int(data[-1][0])
+            now_ts = int(datetime.utcnow().timestamp())
+            age_secs = now_ts - last_bar_ts
+
+            stale_threshold = tf_secs * stale_multiplier
+            is_fresh = age_secs < stale_threshold
+
+            if not is_fresh:
+                h, m = divmod(age_secs // 60, 60) if age_secs < 3600 else (age_secs // 3600, (age_secs % 3600) // 60)
+                logger.info(
+                    f"[MarketHours] {symbol}: last {timeframe} bar is "
+                    f"{age_secs // 3600}h {(age_secs % 3600) // 60}m old "
+                    f"(threshold {stale_threshold / 3600:.1f}h) — market likely closed"
+                )
+            return is_fresh
+
+        except Exception as e:
+            logger.debug(
+                f"[MarketHours] is_open_by_price error for {symbol}: {e} — assuming open"
+            )
+            return True  # fail open
+
     # ── Internal fetch / cache ─────────────────────────────────────────────────
 
     async def _ensure_fetched(self, symbol: str) -> None:

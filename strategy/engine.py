@@ -636,25 +636,34 @@ class StrategyEngine:
         
     def _calculate_take_profits(self, analysis: Dict, entry_price: float,
                                 stop_loss: float, atr: float) -> Dict:
-        """Calculate take profit levels based on R:R ratios."""
+        # Calculate take profit levels from config R:R ratios (not hardcoded).
         risk = abs(entry_price - stop_loss)
         direction = analysis['direction']
-        
-        # TP ratios from config (default: 1.5R, 3R, trail)
-        tp_targets = [
-            {'rr_ratio': 1.5, 'close_percent': 50},
-            {'rr_ratio': 3.0, 'close_percent': 30},
-        ]
-        
+
+        # Read targets from config — honours whatever is in config.yaml
+        raw_targets = self.config.get('risk_management', {}).get(
+            'take_profit', {}
+        ).get('targets', [])
+
+        # Exclude the trailing-only sentinel (rr_ratio: 999)
+        real_targets = [t for t in raw_targets if float(t.get('rr_ratio', 999)) < 999]
+
+        if not real_targets:
+            # Hard fallback if risk_management.take_profit.targets is absent
+            real_targets = [
+                {'rr_ratio': 2.0, 'close_percent': 50},
+                {'rr_ratio': 4.0, 'close_percent': 30},
+            ]
+
         tps = {}
-        for i, target in enumerate(tp_targets, 1):
-            rr = target['rr_ratio']
+        for i, target in enumerate(real_targets, 1):
+            rr = float(target['rr_ratio'])
             if direction == 'long':
                 tp = entry_price + risk * rr
             else:
                 tp = entry_price - risk * rr
             tps[f'tp{i}'] = tp
-            
+
         return tps
 
 
