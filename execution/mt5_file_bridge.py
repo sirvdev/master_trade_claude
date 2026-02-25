@@ -114,38 +114,73 @@ class MT5FileBridge:
     # ------------------------------------------------------------------
 
     async def _send_command(self, command: Dict, timeout: float = 30.0) -> Dict:
-        """Send command — serialised via module-level lock, one retry on timeout."""
+        """
+        Send command to EA and wait for response.
+
+        Lock design — critical section is NARROW (write + EA pickup only):
+          The EA's ProcessCommandFile() does:
+            1. read command file
+            2. FileDelete(commandFile)   ← happens immediately, before any processing
+            3. process command (slow: CopyRates, order placement, etc.)
+            4. AppendResponse()          ← appends tagged line to response file
+
+          Once the file is deleted (step 2), the EA holds the command in memory.
+          It is safe to write the next command — the EA will not re-read the file
+          until the current OnTimer() call completes and the next one begins.
+
+          The response file is already append-only and every line is tagged with
+          request_id, so responses from overlapping commands never collide.
+
+        Lock hold time: ~100-200ms (EA timer interval) instead of up to 30s.
+        """
         if self.demo_mode:
             return await self._simulate_command(command)
 
-        for attempt in range(2):   # try twice
-            async with _get_mt5_global_lock():
-                self.request_counter += 1
-                request_id = f"{self.session_id}_{self.request_counter}"
-                command['request_id'] = request_id
+        # ── Assign request_id and write to command file (under lock) ──────────
+        async with _get_mt5_global_lock():
+            self.request_counter += 1
+            request_id = f"{self.session_id}_{self.request_counter}"
+            command['request_id'] = request_id
 
-                try:
-                    command_json = json.dumps(command, ensure_ascii=True)
-                    self.command_file.write_text(command_json, encoding='utf-8')
-                    logger.debug(f"Sent command {request_id}: {command.get('action')} (attempt {attempt+1})")
+            try:
+                command_json = json.dumps(command, ensure_ascii=True)
+                self.command_file.write_text(command_json, encoding='utf-8')
+                logger.debug(f"[BRIDGE] → {request_id}: {command.get('action')}")
+            except Exception as e:
+                logger.error(f"[BRIDGE] Error writing command {request_id}: {e}")
+                return {'status': 'error', 'error': str(e)}
 
-                    start_time = time.time()
-                    while time.time() - start_time < timeout:
-                        response = await self._read_response_for_id(request_id)
-                        if response:
-                            return response
-                        await asyncio.sleep(0.05)
+            # Wait until the EA deletes the command file — this confirms it has
+            # picked up the command and we can safely queue the next one.
+            # EA timer fires every ~100ms; allow 3s for worst-case lag.
+            pickup_deadline = time.time() + 3.0
+            while self.command_file.exists():
+                if time.time() > pickup_deadline:
+                    logger.warning(
+                        f"[BRIDGE] EA did not pick up {request_id} "
+                        f"({command.get('action')}) within 3s — releasing lock"
+                    )
+                    break
+                await asyncio.sleep(0.02)   # 20ms — fine-grained enough to catch fast deletes
 
-                    logger.error(f"Command {request_id} timed out after {timeout}s (attempt {attempt+1})")
+        # ── Lock released — poll for response outside the lock ────────────────
+        # The response file accumulates tagged lines; we find ours by request_id.
+        # Other commands can now proceed in parallel through the lock.
+        poll_start = time.time()
+        while time.time() - poll_start < timeout:
+            response = await self._read_response_for_id(request_id)
+            if response:
+                logger.debug(
+                    f"[BRIDGE] ← {request_id}: {response.get('status')} "
+                    f"({time.time() - poll_start:.2f}s)"
+                )
+                return response
+            await asyncio.sleep(0.05)
 
-                except Exception as e:
-                    logger.error(f"Error sending command: {e}", exc_info=True)
-                    return {'status': 'error', 'error': str(e)}
-
-            if attempt == 0:
-                logger.warning(f"Retrying command {command.get('action')} after timeout...")
-                await asyncio.sleep(1.0)   # brief pause before retry
-
+        logger.error(
+            f"[BRIDGE] {request_id} ({command.get('action')}) "
+            f"timed out after {timeout}s"
+        )
         return {'status': 'error', 'error': 'timeout'}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
