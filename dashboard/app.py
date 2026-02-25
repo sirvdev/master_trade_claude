@@ -2,9 +2,9 @@
 Trading System Dashboard — v3
 Changes from v2:
   - Top horizontal navigation bar replaces sidebar radio
+  - Nav bar persists across F5 reloads via st.query_params
   - Equity curve backfills equity_after_close for old trades (one-time per session)
-  - All use_container_width removed — replaced with width='stretch' for dataframes,
-    use_container_width=True for plotly charts (plotly still requires the old param)
+  - ALL use_container_width replaced: width='stretch' for dataframes + plotly charts
   - Sidebar kept lean: mode, quick actions, time filter only
 """
 
@@ -252,9 +252,19 @@ def backfill_equity_once(db_path: str = "data/trading.db") -> None:
 NAV_PAGES = ["📊 Overview", "📈 Trades", "📉 Analytics", "⚙️ Config", "🧠 Learning"]
 
 def render_top_nav() -> str:
-    """Render the horizontal nav bar and return the currently active page name."""
+    """
+    Render the horizontal nav bar and return the active page name.
+
+    Active page is stored in BOTH session_state (fast within-session) and
+    st.query_params so it survives F5 / hard reload — the browser URL keeps
+    ?page=<name> and Streamlit reads it back on the next load.
+    """
+    # On first load of a session: restore from URL query param if present
     if "active_page" not in st.session_state:
-        st.session_state["active_page"] = NAV_PAGES[0]
+        from_url = st.query_params.get("page", NAV_PAGES[0])
+        st.session_state["active_page"] = (
+            from_url if from_url in NAV_PAGES else NAV_PAGES[0]
+        )
 
     active = st.session_state["active_page"]
     cols   = st.columns(len(NAV_PAGES))
@@ -263,6 +273,7 @@ def render_top_nav() -> str:
         btn_type = "primary" if page == active else "secondary"
         if cols[i].button(page, key=f"nav_{i}", type=btn_type, use_container_width=True):
             st.session_state["active_page"] = page
+            st.query_params["page"] = page   # persist in URL — survives F5
             st.rerun()
 
     st.markdown("<hr style='margin:0 0 16px 0; border-color:#1e3a5f'>",
@@ -346,7 +357,7 @@ def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt
             title={"text": f"Net P&L ({time_range})"},
         ))
         fig.update_layout(height=160, margin=dict(t=40, b=0, l=0, r=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.markdown(f"""
 | | |
@@ -562,7 +573,7 @@ def show_analytics_tab(closed_filt):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=0, r=0, t=30, b=0),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # ── Equity summary ────────────────────────────────────────────────────────
     max_dd     = df_sorted["drawdown"].min()
@@ -619,7 +630,7 @@ def show_analytics_tab(closed_filt):
             fig2.add_trace(go.Histogram(x=losses, name="Losses", marker_color="#ff4444", opacity=0.7))
         fig2.update_layout(barmode="overlay", height=280,
                            xaxis_title="P&L ($)", yaxis_title="Count")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     # ── Time-based ────────────────────────────────────────────────────────────
     st.subheader("Time-Based Analysis")
@@ -636,7 +647,7 @@ def show_analytics_tab(closed_filt):
                           title="P&L by Hour",
                           color=hour_pnl.values,
                           color_continuous_scale=["red", "yellow", "green"])
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
         with col2:
             day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
             day_pnl   = df_t.groupby("day_of_week")["pnl"].sum()
@@ -646,7 +657,7 @@ def show_analytics_tab(closed_filt):
                           title="P&L by Day of Week",
                           color=day_pnl.values,
                           color_continuous_scale=["red", "yellow", "green"])
-            st.plotly_chart(fig4, use_container_width=True)
+            st.plotly_chart(fig4, width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

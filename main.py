@@ -327,6 +327,7 @@ class TradingSystem:
         await self._load_open_positions_from_db()
 
         empty_trades = self.db.get_trades(filters={'pnl': 0, 'status': 'closed'})
+        empty_trades += self.db.get_trades(filters={'pnl': 0, 'status': 'pending_exit'})
         logger.warning(f"{len(empty_trades)} trades without P&L found in database.")
         if empty_trades:
             logger.warning("Starting deferred deal lookups for trades without P&L...")
@@ -1224,6 +1225,7 @@ class TradingSystem:
                     "profit"       : mt5_pos["profit"],
                     "volume"       : mt5_pos["volume"],
                     "type"         : mt5_pos["type"],
+                    "type"         : mt5_pos["platform"],
                 })
                 if "stop_loss" not in self.open_positions[ticket]:
                     self.open_positions[ticket]["stop_loss"] = mt5_pos["sl"]
@@ -1268,6 +1270,7 @@ class TradingSystem:
                     "max_favorable_excursion": 0.0,
                     "max_adverse_excursion"  : 0.0,
                     "source"                 : "sync_discovered",
+                    "platform"               : mt5_pos["platform"],
                 }
 
 

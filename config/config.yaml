@@ -15,7 +15,7 @@ symbols:
     primary_timeframe: 15m
     entry_timeframe: 5m
   XAG/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -25,7 +25,7 @@ symbols:
     primary_timeframe: 15m
     entry_timeframe: 1m
   BTC/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -34,11 +34,6 @@ symbols:
     - 15m
     primary_timeframe: 4H
     entry_timeframe: 15m
-timeframes:
-  structure_timeframe: 1H
-  trend_timeframe: 15m
-  entry_timeframe: 5m
-  min_timeframes: 3
 indicators:
   ema:
     periods:
