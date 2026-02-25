@@ -77,7 +77,7 @@ results = backtester.run(
     stop_manager,
     multi_tf_data,
     'XAU/USD',
-    initial_balance=10000
+    initial_balance=100000
 )
 
 print(f"Win Rate: {results['win_rate']:.2%}")
@@ -252,7 +252,7 @@ learner = StrategyLearner(db, config)
 # Calculate metrics from backtest trades
 metrics = learner.calculate_performance_metrics(
     results['trades'],
-    initial_balance=10000
+    initial_balance=100000
 )
 
 print(f"Expectancy: ${metrics['expectancy']:.2f}")

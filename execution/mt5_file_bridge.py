@@ -653,7 +653,7 @@ class MT5FileBridge:
             return {'status': 'success', 'message': 'pong'}
 
         if action == 'authenticate':
-            return {'status': 'success', 'account': 99999, 'balance': 10000.0, 'equity': 10000.0}
+            return {'status': 'success', 'account': 99999, 'balance': 100000.0, 'equity': 100000.0}
 
         if action in ('get_historical', 'get_historical_range'):
             # Generate synthetic bars for demo

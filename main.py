@@ -1180,7 +1180,7 @@ class TradingSystem:
         """
         Pull live positions from MT5 and reconcile with self.open_positions.
 
-        - Adds any MT5 positions not yet tracked (e.g. manual trades or restarts).
+        - Adds any MT5 positions not yet tracked (manual trades or restarts).
         - Removes ghost positions (tracked locally but no longer on MT5).
         - Updates current_price, sl, tp, profit for each surviving position.
         """
@@ -1211,7 +1211,7 @@ class TradingSystem:
                 symbol     = pos.get("symbol"),
             )
 
-        # ── Update surviving positions ───────────────────────────────────────
+        # ── Update surviving + register new positions ────────────────────────
         for mt5_pos in mt5_positions:
             ticket = int(mt5_pos["ticket"])
 
@@ -1225,32 +1225,49 @@ class TradingSystem:
                     "volume"       : mt5_pos["volume"],
                     "type"         : mt5_pos["type"],
                 })
-                # Keep our internal stop_loss in sync with MT5 unless we have a newer value
                 if "stop_loss" not in self.open_positions[ticket]:
                     self.open_positions[ticket]["stop_loss"] = mt5_pos["sl"]
             else:
-                # Unknown position — register it so we can manage it going forward
+                # Unknown position — register it so we can manage it going forward.
+                # open_time from MT5 is a unix timestamp; convert to datetime so
+                # _handle_external_close can compute duration correctly.
+                open_time_raw = mt5_pos.get("open_time") or mt5_pos.get("time")
+                if open_time_raw:
+                    try:
+                        entry_time = datetime.utcfromtimestamp(int(open_time_raw))
+                    except Exception:
+                        entry_time = None
+                else:
+                    entry_time = None
+
+                sl = float(mt5_pos.get("sl") or 0.0)
+
                 logger.info(
                     f"[SYNC] Discovered untracked position: ticket {ticket} "
                     f"({mt5_pos['symbol']}). Registering."
                 )
                 self.open_positions[ticket] = {
-                    "ticket"         : ticket,
-                    "symbol"         : mt5_pos["symbol"],
-                    "volume"         : mt5_pos["volume"],
-                    "price"          : mt5_pos["price"],        # entry price
-                    "entry_price"    : mt5_pos["price"],
-                    "current_price"  : mt5_pos["current_price"],
-                    "sl"             : mt5_pos["sl"],
-                    "stop_loss"      : mt5_pos["sl"],
-                    "tp"             : mt5_pos["tp"],
-                    "type"           : mt5_pos["type"],
-                    "profit"         : mt5_pos["profit"],
-                    "trailing_active": False,
-                    "tp1_hit"        : False,
-                    "tp2_hit"        : False,
-                    "last_sl_update" : 0.0,
-                    "source"         : "sync_discovered",
+                    "ticket"                 : ticket,
+                    "symbol"                 : mt5_pos["symbol"],
+                    "volume"                 : mt5_pos["volume"],
+                    "price"                  : mt5_pos["price"],
+                    "entry_price"            : mt5_pos["price"],
+                    "current_price"          : mt5_pos["current_price"],
+                    "sl"                     : sl,
+                    "stop_loss"              : sl,
+                    "original_stop_loss"     : sl,   # best guess — breakeven may have already moved it
+                    "tp"                     : mt5_pos["tp"],
+                    "type"                   : mt5_pos["type"],
+                    "profit"                 : mt5_pos["profit"],
+                    "entry_time"             : entry_time,   # datetime or None
+                    "direction"              : "long" if mt5_pos.get("type") in ("0", 0, "buy") else "short",
+                    "trailing_active"        : False,
+                    "tp1_hit"                : False,
+                    "tp2_hit"                : False,
+                    "last_sl_update"         : 0.0,
+                    "max_favorable_excursion": 0.0,
+                    "max_adverse_excursion"  : 0.0,
+                    "source"                 : "sync_discovered",
                 }
 
 
@@ -1369,78 +1386,29 @@ class TradingSystem:
 
     async def _handle_external_close(self, trade_id: str, position: dict):
         """
-        Handle a position that was closed outside our system (SL/TP hit by broker,
-        manual close on MT5 terminal, margin call, etc.).
+        Handle a position closed outside our system (broker SL/TP, manual close,
+        margin call, etc.).
 
-        Fetches the actual closing deal from MT5 history so the database record
-        contains real exit_price, P&L, duration, commission, slippage, MFE/MAE
-        and exit_reason instead of zeros.
+        Fetches the actual closing deal from MT5 history (with up to 3 retries
+        using growing lookback windows) so the database record contains real
+        exit_price, P&L, duration, commission, slippage, MFE/MAE and
+        exit_reason.  Also captures account equity immediately after the close
+        so the analytics tab can plot a real equity curve.
+
+        If all retries fail, marks the trade as 'pending_exit' and fires a
+        background _deferred_deal_lookup that retries at 30 s / 120 s / 300 s.
+        Never writes zeros to the database.
         """
         ticket      = position.get('ticket')
         symbol      = position.get('symbol', '')
-        entry_price = position.get('entry_price', 0.0)
-        direction   = position.get('direction', 'long')
-        sl          = position.get('stop_loss', 0.0)
-        tp1         = position.get('take_profit_1', 0.0)
-        entry_time  = position.get('entry_time')      # datetime stored at registration
 
         logger.info(f"Recording external close for {trade_id} (ticket={ticket})")
 
-        # ── Fetch real deal data from MT5 history ────────────────────────────
-        exit_price   = 0.0
-        net_pnl      = 0.0
-        gross_profit = 0.0
-        swap         = 0.0
-        commission   = 0.0
-        exit_reason  = 'external_close'
-        volume       = position.get('volume', position.get('position_size', 0.0))
-        close_time   = None     # will be set from deal if available
+        # ── Fetch real deal data from MT5 history (up to 3 attempts) ─────────
+        base_lookback = self.config.get('monitor', {}).get('history_lookback_hours', 48)
+        deal = {'status': 'failed'}
 
         if ticket:
-            try:
-                lookback_hours = self.config.get('monitor', {}).get(
-                    'history_lookback_hours', 48
-                )
-                deal = await self.mt5_client.get_deal_history(
-                    ticket        = int(ticket),
-                    lookback_hours= lookback_hours,
-                )
-
-                if deal.get('status') == 'success':
-                    exit_price   = deal.get('exit_price',  0.0)
-                    gross_profit = deal.get('profit',      0.0)
-                    swap         = deal.get('swap',        0.0)
-                    commission   = deal.get('commission',  0.0)
-                    net_pnl      = deal.get('net_profit',  gross_profit + swap + commission)
-                    exit_reason  = deal.get('exit_reason', 'external_close')
-                    volume       = deal.get('volume',      volume)
-                    close_time   = deal.get('close_time',  None)   # unix epoch int
-
-                    if entry_price == 0.0:
-                        entry_price = deal.get('entry_price', 0.0)
-
-                    logger.info(
-                        f"[CLOSE] ticket={ticket} exit={exit_price:.5f} "
-                        f"net_pnl={net_pnl:.2f} commission={commission:.2f} "
-                        f"reason={exit_reason}"
-                    )
-                else:
-                    logger.warning(
-                        f"[CLOSE] get_deal_history failed for ticket={ticket}: "
-                        f"{deal.get('error')} — writing with available data"
-                    )
-
-            except Exception as e:
-                logger.error(
-                    f"[CLOSE] Exception fetching deal history for ticket={ticket}: {e}"
-                )
-
-        if ticket:
-            base_lookback = self.config.get('monitor', {}).get(
-                'history_lookback_hours', 48
-            )
-            # Retry with increasing lookback windows: 48h → 96h → 192h
-            deal = {'status': 'failed'}
             for attempt, lookback in enumerate(
                 [base_lookback, base_lookback * 2, base_lookback * 4], start=1
             ):
@@ -1450,141 +1418,97 @@ class TradingSystem:
                         lookback_hours= lookback,
                     )
                     if deal.get('status') == 'success' and float(deal.get('exit_price', 0)) > 0:
-                        break   # Good data — stop retrying
-                    err = deal.get('error', 'no exit_price')
+                        break
                     logger.warning(
                         f"[CLOSE] get_deal_history attempt {attempt}/3 "
-                        f"ticket={ticket} lookback={lookback}h: {err}"
+                        f"ticket={ticket} lookback={lookback}h: "
+                        f"{deal.get('error', 'no exit_price')}"
                     )
                 except Exception as e:
                     logger.error(
                         f"[CLOSE] Exception on attempt {attempt}/3 for ticket={ticket}: {e}"
                     )
                 if attempt < 3:
-                    await asyncio.sleep(2.0 * attempt)   # 2s, 4s between retries
+                    await asyncio.sleep(2.0 * attempt)
 
-            if deal.get('status') == 'success' and float(deal.get('exit_price', 0)) > 0:
-                exit_price   = deal.get('exit_price',  0.0)
-                gross_profit = deal.get('profit',      0.0)
-                swap         = deal.get('swap',        0.0)
-                commission   = deal.get('commission',  0.0)
-                net_pnl      = deal.get('net_profit',  gross_profit + swap + commission)
-                exit_reason  = deal.get('exit_reason', 'external_close')
-                volume       = deal.get('volume',      volume)
-                close_time   = deal.get('close_time',  None)
-                if entry_price == 0.0:
-                    entry_price = deal.get('entry_price', 0.0)
-                logger.info(
-                    f"[CLOSE] ticket={ticket} exit={exit_price:.5f} "
-                    f"net_pnl={net_pnl:.2f} commission={commission:.2f} "
-                    f"reason={exit_reason}"
-                )
-            else:
-                # All retries failed — do NOT write zeros to the database.
-                # Mark as pending and schedule a deferred lookup.
-                logger.warning(
-                    f"[CLOSE] All deal history attempts failed for ticket={ticket}. "
-                    f"Marking as pending_exit — will retry in background."
-                )
-                self.db.update_trade(trade_id, {
-                    'status'     : 'pending_exit',
-                    'exit_reason': 'pending_deal_lookup',
-                    'exit_time'  : datetime.utcnow(),
-                })
-                if trade_id in self.open_positions:
-                    del self.open_positions[trade_id]
-                # Fire-and-forget deferred lookup
-                asyncio.ensure_future(
-                    self._deferred_deal_lookup(trade_id, ticket, position)
-                )
-                return   # ← exit early, do not write zeros below
-
-        # ── Duration ─────────────────────────────────────────────────────────
-        duration_minutes = None
-        if entry_time:
-            # entry_time is a datetime; close_time from deal is a unix epoch int
-            if close_time and close_time > 0:
-                exit_dt = datetime.utcfromtimestamp(close_time)
-            else:
-                exit_dt = datetime.utcnow()
-
-            if isinstance(entry_time, datetime):
-                delta = exit_dt - entry_time
-                duration_minutes = round(delta.total_seconds() / 60, 1)
-
-        # ── Slippage (exit): difference between the reference price and actual fill ──
-        # For SL hits: reference = stop_loss level
-        # For TP hits: reference = take_profit_1 level
-        # For everything else: 0
-        slippage = 0.0
-        if exit_price > 0:
-            if exit_reason == 'stop_loss' and sl:
-                slippage = round(abs(exit_price - sl), 5)
-            elif exit_reason == 'take_profit' and tp1:
-                slippage = round(abs(exit_price - tp1), 5)
-
-        # ── Realised R:R — use ORIGINAL SL, not the current (post-breakeven) SL ──
-        original_sl  = position.get('original_stop_loss') or sl
-        initial_risk = abs(entry_price - original_sl) if original_sl and entry_price else 0.0
-        realized_rr  = 0.0
-        if initial_risk > 0 and exit_price > 0 and entry_price > 0:
-            price_move  = (exit_price - entry_price) if direction == 'long' \
-                          else (entry_price - exit_price)
-            realized_rr = price_move / initial_risk
-
-        # ── P&L as % of current live equity (not hardcoded config value) ─────
-        equity      = self.current_equity if self.current_equity > 0 else 10_000.0
-        pnl_percent = round((net_pnl / equity * 100), 4) if equity else 0.0
-
-        # ── Update daily drawdown stats ──────────────────────────────────────
-        if net_pnl < 0 and self.daily_stats.get('starting_balance', 0) > 0:
-            self.daily_stats['daily_drawdown_percent'] = (
-                self.daily_stats.get('daily_drawdown_percent', 0.0)
-                + abs(pnl_percent)
+        # ── All retries failed — defer, never write zeros ─────────────────────
+        if deal.get('status') != 'success' or float(deal.get('exit_price', 0)) <= 0:
+            logger.warning(
+                f"[CLOSE] All deal history attempts failed for ticket={ticket}. "
+                f"Marking as pending_exit — retrying in background."
             )
-
-        # ── Consecutive loss tracking ────────────────────────────────────────
-        if net_pnl < 0:
-            self.consecutive_losses = getattr(self, 'consecutive_losses', 0) + 1
-            self.last_loss_time     = _time.time()
-            logger.info(
-                f"[CLOSE] Loss — consecutive_losses={self.consecutive_losses}"
+            self.db.update_trade(trade_id, {
+                'status'     : 'pending_exit',
+                'exit_reason': 'pending_deal_lookup',
+                'exit_time'  : datetime.utcnow(),
+            })
+            if trade_id in self.open_positions:
+                del self.open_positions[trade_id]
+            asyncio.ensure_future(
+                self._deferred_deal_lookup(trade_id, ticket, position)
             )
-        else:
-            self.consecutive_losses = 0
+            return
 
-        # ── Write everything to audit log + database ──────────────────────────
-        # audit_logger.log_trade_exit now passes all fields through to db.update_trade
+        # ── Got real data — compute all derived fields via shared helper ───────
+        fields = self._compute_close_fields(position, deal)
+
+        logger.info(
+            f"[CLOSE] ticket={ticket} exit={fields['exit_price']:.5f} "
+            f"net_pnl={fields['net_pnl']:.2f} commission={fields['commission']:.2f} "
+            f"reason={fields['exit_reason']} rr={fields['realized_rr']:.2f} "
+            f"duration={fields['duration_minutes']}m slippage={fields['slippage']}"
+        )
+
+        # ── Side-effects: consecutive losses, daily drawdown ──────────────────
+        self._apply_close_side_effects(fields['net_pnl'])
+
+        # ── Snapshot equity immediately after close ────────────────────────────
+        # This is stored per-trade so the dashboard can plot a real equity curve
+        # instead of extrapolating from a starting balance.
+        equity_after_close = None
+        try:
+            balance_result = await self.mt5_client.get_balance()
+            if balance_result.get('success'):
+                equity_after_close = balance_result.get('equity')
+                # Keep our cached equity fresh
+                self.current_equity = equity_after_close
+        except Exception as e:
+            logger.debug(f"[CLOSE] Could not fetch equity after close: {e}")
+
+        # ── Write to audit log + database ─────────────────────────────────────
         self.audit_logger.log_trade_exit(trade_id, {
-            'exit_price'             : exit_price,
-            'reason'                 : exit_reason,
-            'pnl'                    : round(net_pnl, 2),
-            'pnl_percent'            : pnl_percent,
-            'realized_rr'            : round(realized_rr, 4),
-            'duration_minutes'       : duration_minutes,
-            'commission'             : round(commission, 2),
-            'slippage'               : slippage,
-            'max_favorable_excursion': position.get('max_favorable_excursion'),
-            'max_adverse_excursion'  : position.get('max_adverse_excursion'),
+            'exit_price'             : fields['exit_price'],
+            'reason'                 : fields['exit_reason'],
+            'pnl'                    : fields['net_pnl'],
+            'pnl_percent'            : fields['pnl_percent'],
+            'realized_rr'            : fields['realized_rr'],
+            'duration_minutes'       : fields['duration_minutes'],
+            'commission'             : fields['commission'],
+            'slippage'               : fields['slippage'],
+            'max_favorable_excursion': fields['max_favorable_excursion'],
+            'max_adverse_excursion'  : fields['max_adverse_excursion'],
+            'equity_after_close'     : equity_after_close,
         })
 
-        # ── Notification ─────────────────────────────────────────────────────
+        # ── Notification ──────────────────────────────────────────────────────
         if hasattr(self, 'notifier'):
-            emoji = '✅' if net_pnl >= 0 else '❌'
-            dur_str = f"{duration_minutes:.0f}m" if duration_minutes else "?"
+            emoji   = '✅' if fields['net_pnl'] >= 0 else '❌'
+            dur_str = f"{fields['duration_minutes']:.0f}m" if fields['duration_minutes'] else "?"
+            eq_str  = f" | Equity: ${equity_after_close:,.2f}" if equity_after_close else ""
             self.notifier.send(
-                f"{emoji} {symbol} closed ({exit_reason})\n"
-                f"Exit: {exit_price:.5f} | Net P&L: {net_pnl:.2f} "
-                f"| RR: {realized_rr:.2f} | Duration: {dur_str}"
+                f"{emoji} {symbol} closed ({fields['exit_reason']})\n"
+                f"Exit: {fields['exit_price']:.5f} | Net P&L: {fields['net_pnl']:.2f} "
+                f"| RR: {fields['realized_rr']:.2f} | Duration: {dur_str}{eq_str}"
             )
 
-        # ── Remove from open positions ────────────────────────────────────────
+        # ── Remove from open positions ─────────────────────────────────────────
         if trade_id in self.open_positions:
             del self.open_positions[trade_id]
 
+
     async def _deferred_deal_lookup(
         self, trade_id: str, ticket, position: dict
-    ) -> None:
+        ) -> None:
         """
         Background retry for deal history when _handle_external_close couldn't
         fetch the data immediately (e.g. EA not yet updated, lock contention,
@@ -1695,6 +1619,7 @@ class TradingSystem:
             'status'     : 'closed',
             'exit_reason': 'deal_history_unavailable',
         })
+
 
     async def _update_position(self, trade_id: str, position: dict):
         """Update single position."""

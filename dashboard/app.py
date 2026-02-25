@@ -699,26 +699,131 @@ def show_analytics_tab(closed_filt):
         return
 
     df = pd.DataFrame(closed_filt)
-    df["entry_time"]  = pd.to_datetime(df.get("entry_time"),  errors="coerce")
-    df["pnl"]         = pd.to_numeric(df.get("pnl"),         errors="coerce").fillna(0.0)
-    df["realized_rr"] = pd.to_numeric(df.get("realized_rr"), errors="coerce").fillna(0.0)
+    df["entry_time"]         = pd.to_datetime(df.get("entry_time"), errors="coerce")
+    df["exit_time"]          = pd.to_datetime(df.get("exit_time"),  errors="coerce")
+    df["pnl"]                = pd.to_numeric(df.get("pnl"),                errors="coerce").fillna(0.0)
+    df["realized_rr"]        = pd.to_numeric(df.get("realized_rr"),        errors="coerce").fillna(0.0)
+    df["equity_after_close"] = pd.to_numeric(df.get("equity_after_close"), errors="coerce")
 
-    df_sorted = df.dropna(subset=["entry_time"]).sort_values("entry_time")
-    df_sorted["cumulative_pnl"] = df_sorted["pnl"].cumsum()
-    df_sorted["equity"]         = 10000 + df_sorted["cumulative_pnl"]
+    df_sorted = df.dropna(subset=["exit_time"]).sort_values("exit_time").copy()
 
-    # ── Equity curve ──────────────────────────────────────────────────────────
+    # ── Equity curve: use real equity snapshots where available ───────────────
+    # For rows that have equity_after_close, use it directly.
+    # For older rows that don't, fill forward then fall back to cumsum.
+    has_real_equity = df_sorted["equity_after_close"].notna().any()
+
+    if has_real_equity:
+        # Forward-fill small gaps (e.g., deferred-close rows that still lack it)
+        df_sorted["equity_plot"] = df_sorted["equity_after_close"].ffill()
+        # Back-fill the leading NaNs using first known equity minus cumulative pnl
+        first_valid_idx = df_sorted["equity_after_close"].first_valid_index()
+        if first_valid_idx is not None:
+            first_equity = df_sorted.loc[first_valid_idx, "equity_after_close"]
+            first_pos    = df_sorted.index.get_loc(first_valid_idx)
+            # For rows before the first real reading, reconstruct backwards
+            pnl_before = df_sorted["pnl"].iloc[:first_pos].iloc[::-1].cumsum().iloc[::-1]
+            df_sorted.loc[df_sorted.index[:first_pos], "equity_plot"] = (
+                first_equity - pnl_before.values
+            )
+        equity_source_label = "Real Account Equity"
+    else:
+        # No equity_after_close data yet — fall back to approximation
+        df_sorted["cumulative_pnl"] = df_sorted["pnl"].cumsum()
+        # Try to get starting balance from the database
+        try:
+            conn = sqlite3.connect("data/trading.db")
+            row = conn.execute(
+                "SELECT equity_after_close FROM trades "
+                "WHERE equity_after_close IS NOT NULL "
+                "ORDER BY exit_time ASC LIMIT 1"
+            ).fetchone()
+            conn.close()
+            start_equity = row[0] - df_sorted["pnl"].iloc[0] if row else 10_000.0
+        except Exception:
+            start_equity = 10_000.0
+        df_sorted["equity_plot"] = start_equity + df_sorted["cumulative_pnl"]
+        equity_source_label = "Estimated Equity (P&L cumsum)"
+
+    # ── Peak / drawdown ───────────────────────────────────────────────────────
+    df_sorted["peak"]     = df_sorted["equity_plot"].cummax()
+    df_sorted["drawdown"] = df_sorted["equity_plot"] - df_sorted["peak"]   # always ≤ 0
+
+    # ── Equity Curve chart ────────────────────────────────────────────────────
     st.subheader("Equity Curve")
+
+    if has_real_equity:
+        st.caption(f"📡 {equity_source_label} — sourced from live MT5 balance snapshots")
+    else:
+        st.caption(f"⚠️ {equity_source_label} — run the system with the updated code to get real values")
+
     fig = go.Figure()
+
+    # Main equity line
     fig.add_trace(go.Scatter(
-        x=df_sorted["entry_time"], y=df_sorted["equity"],
-        mode="lines", name="Equity",
-        line=dict(color="royalblue", width=2),
-        fill="tozeroy", fillcolor="rgba(65,105,225,0.08)"
+        x    = df_sorted["exit_time"],
+        y    = df_sorted["equity_plot"],
+        mode = "lines",
+        name = "Equity",
+        line = dict(color="royalblue", width=2),
+        fill = "tozeroy",
+        fillcolor = "rgba(65,105,225,0.08)",
+        hovertemplate = "<b>%{x|%Y-%m-%d %H:%M}</b><br>Equity: $%{y:,.2f}<extra></extra>",
     ))
-    fig.update_layout(xaxis_title="Date", yaxis_title="Equity ($)",
-                      hovermode="x unified", height=350)
-    st.plotly_chart(fig)
+
+    # Drawdown shading (secondary y-axis)
+    fig.add_trace(go.Scatter(
+        x    = df_sorted["exit_time"],
+        y    = df_sorted["drawdown"],
+        mode = "lines",
+        name = "Drawdown",
+        line = dict(color="rgba(220,50,50,0.6)", width=1, dash="dot"),
+        fill = "tozeroy",
+        fillcolor = "rgba(220,50,50,0.07)",
+        yaxis = "y2",
+        hovertemplate = "<b>%{x|%Y-%m-%d %H:%M}</b><br>Drawdown: $%{y:,.2f}<extra></extra>",
+    ))
+
+    # Peak line
+    fig.add_trace(go.Scatter(
+        x    = df_sorted["exit_time"],
+        y    = df_sorted["peak"],
+        mode = "lines",
+        name = "Peak",
+        line = dict(color="rgba(0,180,0,0.4)", width=1, dash="dash"),
+        hovertemplate = "<b>%{x|%Y-%m-%d %H:%M}</b><br>Peak: $%{y:,.2f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        xaxis_title  = "Date (UTC)",
+        yaxis_title  = "Equity ($)",
+        yaxis2       = dict(
+            title      = "Drawdown ($)",
+            overlaying = "y",
+            side       = "right",
+            showgrid   = False,
+        ),
+        hovermode    = "x unified",
+        height       = 380,
+        legend       = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin       = dict(l=0, r=0, t=30, b=0),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Drawdown stats ────────────────────────────────────────────────────────
+    max_dd     = df_sorted["drawdown"].min()
+    max_dd_pct = (max_dd / df_sorted["peak"].max() * 100) if df_sorted["peak"].max() > 0 else 0
+    current_eq = df_sorted["equity_plot"].iloc[-1] if not df_sorted.empty else 0
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.metric("Current Equity", f"${current_eq:,.2f}")
+    with d2:
+        st.metric("Max Drawdown",   f"${max_dd:,.2f}", delta=f"{max_dd_pct:.2f}%", delta_color="inverse")
+    with d3:
+        net_pnl = df_sorted["pnl"].sum()
+        st.metric("Net P&L (period)", f"${net_pnl:,.2f}", delta=f"+${net_pnl:,.2f}" if net_pnl >= 0 else f"${net_pnl:,.2f}")
+
+    st.markdown("---")
 
     # ── Summary stats ─────────────────────────────────────────────────────────
     st.subheader("Summary Statistics")
@@ -748,11 +853,11 @@ def show_analytics_tab(closed_filt):
         st.subheader("By Symbol")
         if "symbol" in df.columns:
             sym_stats = df.groupby("symbol").agg(
-                trades=("pnl", "count"),
-                total_pnl=("pnl", "sum"),
-                avg_rr=("realized_rr", "mean")
+                trades    = ("pnl", "count"),
+                total_pnl = ("pnl", "sum"),
+                avg_rr    = ("realized_rr", "mean"),
             ).round(2)
-            st.dataframe(sym_stats, width='stretch')
+            st.dataframe(sym_stats, use_container_width=True)
 
     with col2:
         st.subheader("Win / Loss Distribution")
@@ -763,7 +868,7 @@ def show_analytics_tab(closed_filt):
             fig2.add_trace(go.Histogram(x=losses, name="Losses", marker_color="red",   opacity=0.7))
         fig2.update_layout(barmode="overlay", height=280,
                            xaxis_title="P&L ($)", yaxis_title="Count")
-        st.plotly_chart(fig2)
+        st.plotly_chart(fig2, use_container_width=True)
 
     # ── Time-based ────────────────────────────────────────────────────────────
     st.subheader("Time-Based Analysis")
@@ -775,23 +880,27 @@ def show_analytics_tab(closed_filt):
     if not df_t.empty:
         with col1:
             hour_pnl = df_t.groupby("hour")["pnl"].sum()
-            fig3 = px.bar(x=hour_pnl.index, y=hour_pnl.values,
-                          labels={"x":"Hour (UTC)","y":"P&L ($)"},
-                          title="P&L by Hour",
-                          color=hour_pnl.values,
-                          color_continuous_scale=["red","yellow","green"])
-            st.plotly_chart(fig3)
+            fig3 = px.bar(
+                x=hour_pnl.index, y=hour_pnl.values,
+                labels={"x": "Hour (UTC)", "y": "P&L ($)"},
+                title="P&L by Hour",
+                color=hour_pnl.values,
+                color_continuous_scale=["red", "yellow", "green"],
+            )
+            st.plotly_chart(fig3, use_container_width=True)
 
         with col2:
-            day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            day_pnl = df_t.groupby("day_of_week")["pnl"].sum()
-            day_pnl = day_pnl.reindex([d for d in day_order if d in day_pnl.index])
-            fig4 = px.bar(x=day_pnl.index, y=day_pnl.values,
-                          labels={"x":"Day","y":"P&L ($)"},
-                          title="P&L by Day of Week",
-                          color=day_pnl.values,
-                          color_continuous_scale=["red","yellow","green"])
-            st.plotly_chart(fig4)
+            day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            day_pnl   = df_t.groupby("day_of_week")["pnl"].sum()
+            day_pnl   = day_pnl.reindex([d for d in day_order if d in day_pnl.index])
+            fig4 = px.bar(
+                x=day_pnl.index, y=day_pnl.values,
+                labels={"x": "Day", "y": "P&L ($)"},
+                title="P&L by Day of Week",
+                color=day_pnl.values,
+                color_continuous_scale=["red", "yellow", "green"],
+            )
+            st.plotly_chart(fig4, use_container_width=True)
 
 
 if __name__ == "__main__":

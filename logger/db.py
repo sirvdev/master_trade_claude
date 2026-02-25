@@ -204,24 +204,30 @@ class DatabaseManager:
         """
         cursor = self.conn.cursor()
 
-        # ── Migration 1: Add ticket column to trades ──────────────────────────
-        # Required for broker position tracking and restart recovery.
         existing = {
             row[1] for row in cursor.execute("PRAGMA table_info(trades)")
         }
+
+        # ── Migration 1: ticket column ────────────────────────────────────────
         if 'ticket' not in existing:
             cursor.execute("ALTER TABLE trades ADD COLUMN ticket INTEGER")
-            logger.info("Migration: added 'ticket' column to trades table")
+            logger.info("Migration: added 'ticket' column to trades")
 
-        # ── Migration 2: Add original_stop_loss column to trades ─────────────
-        # Used for correct RR calculation after breakeven/trailing moves.
+        # ── Migration 2: original_stop_loss column ────────────────────────────
         if 'original_stop_loss' not in existing:
             cursor.execute(
                 "ALTER TABLE trades ADD COLUMN original_stop_loss REAL"
             )
-            logger.info(
-                "Migration: added 'original_stop_loss' column to trades table"
+            logger.info("Migration: added 'original_stop_loss' column to trades")
+
+        # ── Migration 3: equity_after_close column ────────────────────────────
+        # Stores live account equity snapshot taken immediately after each close.
+        # Used by the analytics dashboard to plot a real equity curve.
+        if 'equity_after_close' not in existing:
+            cursor.execute(
+                "ALTER TABLE trades ADD COLUMN equity_after_close REAL"
             )
+            logger.info("Migration: added 'equity_after_close' column to trades")
 
         self.conn.commit()
         
@@ -307,23 +313,30 @@ class DatabaseManager:
     def log_trade(self, trade_data: Dict[str, Any]) -> str:
         """
         Log a trade execution.
-        
+
         Args:
-            trade_data: Dictionary containing trade details
-            
+            trade_data: Dictionary containing trade details.
+                        Now includes 'original_stop_loss' so RR is always
+                        computed against the entry-time SL, not the
+                        post-breakeven level.
+
         Returns:
             trade_id of the logged trade
         """
         cursor = self.conn.cursor()
-        
-        trade_id = trade_data.get('trade_id') or f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
-        
+
+        trade_id = (
+            trade_data.get('trade_id')
+            or f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
+        )
+
         cursor.execute("""
             INSERT INTO trades (
                 trade_id, analysis_id, symbol, platform, direction,
-                entry_time, entry_price, stop_loss, take_profit_1,
-                take_profit_2, take_profit_3, position_size, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entry_time, entry_price, stop_loss, original_stop_loss,
+                take_profit_1, take_profit_2, take_profit_3,
+                position_size, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade_id,
             trade_data.get('analysis_id'),
@@ -333,13 +346,14 @@ class DatabaseManager:
             datetime.utcnow(),
             trade_data.get('entry_price'),
             trade_data.get('stop_loss'),
+            trade_data.get('original_stop_loss') or trade_data.get('stop_loss'),
             trade_data.get('take_profit_1'),
             trade_data.get('take_profit_2'),
             trade_data.get('take_profit_3'),
             trade_data.get('position_size'),
-            'open'
+            'open',
         ))
-        
+
         self.conn.commit()
         return trade_id
         

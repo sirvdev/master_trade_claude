@@ -124,8 +124,8 @@ class AuditLogger:
             exit_price, reason, pnl, pnl_percent, realized_rr   (required)
             duration_minutes, commission, slippage               (optional)
             max_favorable_excursion, max_adverse_excursion       (optional)
+            equity_after_close                                   (optional)
         """
-        # Build the full update dict — every column the trades table has for a close
         db_update = {
             'exit_time'              : datetime.utcnow(),
             'exit_price'             : exit_data.get('exit_price'),
@@ -134,15 +134,15 @@ class AuditLogger:
             'pnl_percent'            : exit_data.get('pnl_percent'),
             'realized_rr'            : exit_data.get('realized_rr'),
             'status'                 : 'closed',
-            # Fields that were silently dropped before
             'duration_minutes'       : exit_data.get('duration_minutes'),
             'commission'             : exit_data.get('commission'),
             'slippage'               : exit_data.get('slippage'),
             'max_favorable_excursion': exit_data.get('max_favorable_excursion'),
             'max_adverse_excursion'  : exit_data.get('max_adverse_excursion'),
+            'equity_after_close'     : exit_data.get('equity_after_close'),
         }
 
-        # Strip None values so we don't overwrite existing data with NULL
+        # Strip None so we never overwrite existing data with NULL
         db_update = {k: v for k, v in db_update.items() if v is not None}
 
         self.db.update_trade(trade_id, db_update)
@@ -160,6 +160,7 @@ class AuditLogger:
             'slippage'               : exit_data.get('slippage'),
             'max_favorable_excursion': exit_data.get('max_favorable_excursion'),
             'max_adverse_excursion'  : exit_data.get('max_adverse_excursion'),
+            'equity_after_close'     : exit_data.get('equity_after_close'),
         })
         self._write_json_log(entry)
 

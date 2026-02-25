@@ -36,7 +36,7 @@ class StrategyLearner:
     def calculate_performance_metrics(
         self,
         trades: List[Dict],
-        initial_balance: float = 10000
+        initial_balance: float = 100000
     ) -> Dict:
         """
         Calculate comprehensive performance metrics.
@@ -156,7 +156,7 @@ class StrategyLearner:
             'max_consecutive_wins': 0,
             'max_consecutive_losses': 0,
             'avg_duration_hours': 0,
-            'final_balance': 10000,
+            'final_balance': 100000,
             'return_percent': 0
         }
         

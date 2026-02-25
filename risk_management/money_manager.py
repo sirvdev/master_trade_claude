@@ -484,7 +484,7 @@ if __name__ == "__main__":
     # Test MT5 position sizing (the problematic case from logs)
     print("=== MT5 Position Sizing Test ===")
     result = manager.calculate_position_size(
-        account_equity=10000,
+        account_equity=100000,
         entry_price=4084.002,
         stop_loss=4093.250857142857,
         symbol='XAUUSD',

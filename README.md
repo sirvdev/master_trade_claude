@@ -178,7 +178,7 @@ results = backtester.run(
     stop_manager,
     multi_tf_data,
     symbol='BTC/USDT',
-    initial_balance=10000
+    initial_balance=100000
 )
 
 print(results)
