@@ -1642,26 +1642,21 @@ class TradingSystem:
         })
 
     async def _deferred_deal_lookup(
-        self, trade_id: str, ticket, position: dict
-        ) -> None:
-        """
-        Background retry for deal history when _handle_external_close couldn't
-        fetch the data immediately (e.g. EA not yet updated, lock contention,
-        or transient bridge timeout).
-
-        Retries at 30 s, 120 s, and 300 s.  On success, uses _compute_close_fields
-        (the same helper as _handle_external_close) so every field is populated
-        identically — no drift, no missing columns.
-
-        If all attempts fail, writes a best-effort record so the row never stays
-        as 'pending_exit' indefinitely.
-        """
-        base_lookback = self.config.get('monitor', {}).get('history_lookback_hours', 48)
+        self,
+        trade_id: str,
+        ticket,
+        position: dict,
+        min_lookback_hours: int = 0,   # ← new param, 0 = use config default
+    ) -> None:
+        base_lookback = max(
+            min_lookback_hours,
+            self.config.get('monitor', {}).get('history_lookback_hours', 48)
+        )
 
         for delay, lookback in [
-            (3,  base_lookback),
-            (120, base_lookback * 4),
-            (300, base_lookback * 8),
+            (3,   base_lookback),
+            (120, max(base_lookback, base_lookback * 4)),
+            (300, max(base_lookback, base_lookback * 8)),
         ]:
             await asyncio.sleep(delay)
 
@@ -1676,7 +1671,7 @@ class TradingSystem:
                 f"[DEFERRED_CLOSE] Attempting deal history for "
                 f"trade_id={trade_id} ticket={ticket} lookback={lookback}h"
             )
-
+            
             try:
                 deal = await self.mt5_client.get_deal_history(
                     ticket        = int(ticket),
@@ -1784,15 +1779,6 @@ class TradingSystem:
 
 
     async def _startup_pnl_backfill(self):
-        """
-        Background task: find all closed/pending trades with missing P&L and
-        queue a deferred deal lookup for each one.
-
-        Runs AFTER startup completes with low priority — yields between each task
-        so the trading and monitor loops are never starved.
-        Fires independent tasks so trades don't chain-block each other.
-        """
-        # Give the system a moment to fully initialize before hammering the bridge
         await asyncio.sleep(10)
 
         try:
@@ -1805,7 +1791,6 @@ class TradingSystem:
             logger.info("[PNL_BACKFILL] No trades missing P&L — nothing to backfill.")
             return
 
-        # Deduplicate by trade_id (multiple filter passes could return same row)
         seen = set()
         unique = []
         for t in trades:
@@ -1814,10 +1799,9 @@ class TradingSystem:
                 seen.add(tid)
                 unique.append(t)
 
-        logger.info(
-            f"[PNL_BACKFILL] {len(unique)} trade(s) need P&L data — "
-            f"backfilling in background."
-        )
+        logger.info(f"[PNL_BACKFILL] {len(unique)} trade(s) need P&L data — backfilling in background.")
+
+        base_lookback = self.config.get('monitor', {}).get('history_lookback_hours', 48)
 
         for i, trade in enumerate(unique):
             if not self.running:
@@ -1830,6 +1814,28 @@ class TradingSystem:
             if not ticket:
                 logger.debug(f"[PNL_BACKFILL] {trade_id} has no ticket — skipping.")
                 continue
+
+            # ── Calculate lookback from actual trade age ──────────────────────
+            # Always add a 24h buffer beyond the trade age so the first
+            # attempt covers the full window without needing a retry cycle.
+            entry_time_raw = trade.get('entry_time') or trade.get('exit_time')
+            lookback = base_lookback  # fallback
+
+            if entry_time_raw:
+                try:
+                    entry_dt = datetime.fromisoformat(
+                        str(entry_time_raw).replace('Z', '+00:00')
+                    ).replace(tzinfo=None)
+                    age_hours = (datetime.utcnow() - entry_dt).total_seconds() / 3600
+                    # Cover full age + 24h buffer, minimum base_lookback
+                    lookback = max(base_lookback, int(age_hours) + 24)
+                except Exception:
+                    lookback = base_lookback * 4  # safe fallback if parsing fails
+
+            logger.info(
+                f"[PNL_BACKFILL] Queuing {trade_id} ticket={ticket} "
+                f"(lookback={lookback}h, {i+1}/{len(unique)})"
+            )
 
             position = {
                 'entry_price'            : trade.get('entry_price', 0.0),
@@ -1844,17 +1850,11 @@ class TradingSystem:
                 'max_adverse_excursion'  : trade.get('max_adverse_excursion'),
             }
 
-            # Each lookup is an independent task — they run in parallel
-            # and don't block each other or this loop
             asyncio.create_task(
-                self._deferred_deal_lookup(trade_id, ticket, position)
+                self._deferred_deal_lookup(trade_id, ticket, position,
+                                        min_lookback_hours=lookback)
             )
 
-            logger.debug(
-                f"[PNL_BACKFILL] Queued {trade_id} ({i+1}/{len(unique)})"
-            )
-
-            # Yield briefly between task creations so the event loop stays responsive
             await asyncio.sleep(1.0)
 
         logger.info(f"[PNL_BACKFILL] All {len(unique)} backfill tasks queued.")
