@@ -283,7 +283,7 @@ class TradingSystem:
                             self.running = False
                             
                             # Close all positions if configured
-                            if emergency_config.get('auto_close_all', True):
+                            if emergency_config.get('close_positions_on_shutdown', False):
                                 await self._emergency_close_all()
                     
             except Exception as e:
@@ -291,28 +291,40 @@ class TradingSystem:
                 await asyncio.sleep(30)
 
     async def _emergency_close_all(self):
-        """Emergency close all positions."""
-        logger.warning("EMERGENCY: Closing all positions!")
-        
+        """
+        Close all open positions.  Only runs when close_positions_on_shutdown=true.
+        """
+        close_cfg = (
+            self.config
+                .get('risk_management', {})
+                .get('global_limits', {})
+                .get('emergency_shutdown', {})
+        )
+        if not close_cfg.get('close_positions_on_shutdown', False):
+            logger.info(
+                "[EMERGENCY_CLOSE] Skipped — close_positions_on_shutdown=false. "
+                "Positions will be reconciled on next startup."
+            )
+            return
+
+        logger.warning(f"EMERGENCY: Closing all {len(self.open_positions)} positions!")
+
         for trade_id, position in list(self.open_positions.items()):
             try:
-                platform = position['platform']
-                symbol = position['symbol']
-                ticket = position.get('ticket')
-                
+                platform = position.get('platform')
+                ticket   = position.get('ticket')
+
                 if platform == 'mt5' and ticket:
                     result = await self.mt5_client.close_position(ticket)
                     logger.info(f"Emergency closed MT5 position {ticket}: {result}")
-                
-                # Log the closure
+
                 self.audit_logger.log_trade_exit(trade_id, {
-                    'exit_price': 0,  # Will be filled from actual result
-                    'reason': 'emergency_shutdown',
-                    'pnl': 0,
+                    'exit_price' : 0,
+                    'reason'     : 'emergency_shutdown',
+                    'pnl'        : 0,
                     'pnl_percent': 0,
-                    'realized_rr': 0
+                    'realized_rr': 0,
                 })
-                
             except Exception as e:
                 logger.error(f"Error closing position {trade_id}: {e}")
 
@@ -333,25 +345,7 @@ class TradingSystem:
         await self._load_open_positions_from_db()
 
         # cLEANING UP EMPTY OR NULL TRADES ON STARTUP
-        empty_trades = self.db.get_trades(filters={'pnl': 0, 'status': 'closed'})
-        empty_trades += self.db.get_trades(filters={'pnl': 0, 'status': 'pending_exit'})
-        empty_trades += self.db.get_trades(filters={'exit_reason': 'deal_history_unavailable'})
-        empty_trades += self.db.get_trades(filters={'pnl': None})
-        logger.warning(f"{len(empty_trades)} trades without P&L found in database.")
-        if empty_trades:
-            logger.warning("Starting deferred deal lookups for trades without P&L...")
-            for trade in empty_trades:
-                trade_id = trade['trade_id']
-                position = {
-                    'entry_price': trade.get('entry_price', 0.0),
-                    'direction': trade.get('direction', 'long'),
-                    'entry_time': trade.get('entry_time'),
-                    'volume': trade.get('volume', trade.get('position_size', 0.0)),
-                    'position_size': trade.get('position_size', 0.0)
-                }
-                ticket   = trade.get('ticket')
-                await self._deferred_deal_lookup(trade_id, ticket, position)
-            logger.info("Trade cleanup completed.")
+        asyncio.ensure_future(self._startup_pnl_backfill())
 
         enabled_symbols = [s for s, c in self.config.get('symbols', {}).items() if c.get('enabled')]
         await self.market_hours.prefetch_all(enabled_symbols)
@@ -426,19 +420,77 @@ class TradingSystem:
                     pos_info = await self.mt5_client.get_position_info(int(ticket))
 
                     if not pos_info:
+                        # ── Before assuming the position was closed, check if the market
+                        #    is currently closed. Some brokers don't serve position data
+                        #    during the weekend — the ticket will appear "missing" even
+                        #    though the trade is still open and will resume on Monday.
+                        symbol = trade.get('symbol', '')
+                        market_is_open = False
+
+                        try:
+                            # Primary check: broker session schedule (cached from last run if available)
+                            market_is_open = self.market_hours.is_open(symbol)
+
+                            # Secondary check: if schedule says closed, verify via price staleness.
+                            # is_open_by_price returns True if a recent bar exists → market is live.
+                            if not market_is_open:
+                                market_is_open = await self.market_hours.is_open_by_price(
+                                    symbol, self.mt5_client, timeframe='1H'
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"[STARTUP] Market-open check failed for {symbol}: {e} — "
+                                f"assuming market closed to protect position."
+                            )
+                            market_is_open = False  # fail-safe: don't destroy the trade on uncertainty
+
+                        if not market_is_open:
+                            logger.info(
+                                f"[STARTUP] ticket={ticket} ({symbol}) not found on MT5 "
+                                f"but market is currently closed — restoring as active. "
+                                f"Position monitor will reconcile when market reopens."
+                            )
+                            # Restore into tracking exactly like a confirmed live position
+                            self.open_positions[trade_id] = {
+                                'trade_id'               : trade_id,
+                                'ticket'                 : ticket,
+                                'symbol'                 : trade.get('symbol'),
+                                'platform'               : platform,
+                                'direction'              : trade.get('direction'),
+                                'entry_price'            : trade.get('entry_price', 0.0),
+                                'current_price'          : trade.get('entry_price', 0.0),
+                                'stop_loss'              : trade.get('stop_loss', 0.0),
+                                'original_stop_loss'     : trade.get('original_stop_loss') or trade.get('stop_loss', 0.0),
+                                'take_profit_1'          : trade.get('take_profit_1'),
+                                'take_profit_2'          : trade.get('take_profit_2'),
+                                'position_size'          : trade.get('position_size', 0.0),
+                                'volume'                 : trade.get('position_size', 0.0),
+                                'entry_time'             : trade.get('entry_time'),
+                                'analysis_id'            : trade.get('analysis_id'),
+                                'trailing_active'        : False,
+                                'tp1_hit'                : False,
+                                'tp2_hit'                : False,
+                                'last_sl_update'         : 0.0,
+                                'high_since_entry'       : trade.get('entry_price', 0.0),
+                                'low_since_entry'        : trade.get('entry_price', 0.0),
+                                'max_favorable_excursion': 0.0,
+                                'max_adverse_excursion'  : 0.0,
+                                'source'                 : 'market_closed_restore',
+                            }
+                            continue
+
+                        # Market is open and position not found → truly closed externally
                         logger.warning(
                             f"[STARTUP] trade_id={trade_id} ticket={ticket} "
-                            f"not found on MT5 — was closed while system was down."
+                            f"not found on MT5 (market is open) — was closed while system was down."
                         )
-                        # Build a minimal position dict so _handle_external_close
-                        # has the data it needs for the deal history lookup
                         ghost_position = {
                             'ticket'             : ticket,
                             'symbol'             : trade.get('symbol'),
                             'direction'          : trade.get('direction'),
                             'entry_price'        : trade.get('entry_price', 0.0),
                             'stop_loss'          : trade.get('stop_loss', 0.0),
-                            'original_stop_loss' : trade.get('stop_loss', 0.0),
+                            'original_stop_loss' : trade.get('original_stop_loss') or trade.get('stop_loss', 0.0),
                             'take_profit_1'      : trade.get('take_profit_1', 0.0),
                             'volume'             : trade.get('position_size', 0.0),
                             'position_size'      : trade.get('position_size', 0.0),
@@ -449,7 +501,6 @@ class TradingSystem:
                         }
                         await self._handle_external_close(trade_id, ghost_position)
                         continue
-
                 # ── Position confirmed alive — restore into tracking ───────────
                 self.open_positions[trade_id] = {
                     'trade_id'           : trade_id,
@@ -1590,7 +1641,6 @@ class TradingSystem:
             'realized_rr': fields['realized_rr'],
         })
 
-
     async def _deferred_deal_lookup(
         self, trade_id: str, ticket, position: dict
         ) -> None:
@@ -1733,6 +1783,83 @@ class TradingSystem:
         })
 
 
+    async def _startup_pnl_backfill(self):
+        """
+        Background task: find all closed/pending trades with missing P&L and
+        queue a deferred deal lookup for each one.
+
+        Runs AFTER startup completes with low priority — yields between each task
+        so the trading and monitor loops are never starved.
+        Fires independent tasks so trades don't chain-block each other.
+        """
+        # Give the system a moment to fully initialize before hammering the bridge
+        await asyncio.sleep(10)
+
+        try:
+            trades = self.db.get_trades_missing_pnl()
+        except Exception as e:
+            logger.error(f"[PNL_BACKFILL] DB query failed: {e}")
+            return
+
+        if not trades:
+            logger.info("[PNL_BACKFILL] No trades missing P&L — nothing to backfill.")
+            return
+
+        # Deduplicate by trade_id (multiple filter passes could return same row)
+        seen = set()
+        unique = []
+        for t in trades:
+            tid = t.get('trade_id')
+            if tid and tid not in seen:
+                seen.add(tid)
+                unique.append(t)
+
+        logger.info(
+            f"[PNL_BACKFILL] {len(unique)} trade(s) need P&L data — "
+            f"backfilling in background."
+        )
+
+        for i, trade in enumerate(unique):
+            if not self.running:
+                logger.info("[PNL_BACKFILL] System stopping — aborting backfill.")
+                break
+
+            trade_id = trade.get('trade_id')
+            ticket   = trade.get('ticket')
+
+            if not ticket:
+                logger.debug(f"[PNL_BACKFILL] {trade_id} has no ticket — skipping.")
+                continue
+
+            position = {
+                'entry_price'            : trade.get('entry_price', 0.0),
+                'direction'              : trade.get('direction', 'long'),
+                'entry_time'             : trade.get('entry_time'),
+                'stop_loss'              : trade.get('stop_loss', 0.0),
+                'original_stop_loss'     : trade.get('original_stop_loss') or trade.get('stop_loss', 0.0),
+                'take_profit_1'          : trade.get('take_profit_1', 0.0),
+                'volume'                 : trade.get('position_size', 0.0),
+                'position_size'          : trade.get('position_size', 0.0),
+                'max_favorable_excursion': trade.get('max_favorable_excursion'),
+                'max_adverse_excursion'  : trade.get('max_adverse_excursion'),
+            }
+
+            # Each lookup is an independent task — they run in parallel
+            # and don't block each other or this loop
+            asyncio.create_task(
+                self._deferred_deal_lookup(trade_id, ticket, position)
+            )
+
+            logger.debug(
+                f"[PNL_BACKFILL] Queued {trade_id} ({i+1}/{len(unique)})"
+            )
+
+            # Yield briefly between task creations so the event loop stays responsive
+            await asyncio.sleep(1.0)
+
+        logger.info(f"[PNL_BACKFILL] All {len(unique)} backfill tasks queued.")
+
+
     async def _update_position(self, trade_id: str, position: dict):
         """Update single position."""
         try:
@@ -1827,40 +1954,41 @@ class TradingSystem:
 
     def _emergency_shutdown(self, reason: str = "manual") -> None:
         """
-        Immediately halt all new activity, close every open position, and
-        set the kill-switch flag so the main loop exits cleanly.
+        Halt all new activity and set kill-switch.
+        Whether positions are closed is controlled by config:
+        close_positions_on_shutdown: false  → leave open, reconcile on restart
+        close_positions_on_shutdown: true   → close all immediately
         """
         logger.critical(f"[SHUTDOWN] Emergency shutdown triggered: {reason}")
-        self.kill_switch = True   # checked by run() loop
+        self.kill_switch = True
 
-        self.audit_logger.log_event(
-            event_type = "emergency_shutdown",
-            reason     = reason,
+        self.audit_logger.log_event(event_type="emergency_shutdown", reason=reason)
+
+        close_cfg = (
+            self.config
+                .get('risk_management', {})
+                .get('global_limits', {})
+                .get('emergency_shutdown', {})
         )
+        close_on_shutdown = close_cfg.get('close_positions_on_shutdown', False)
 
         if hasattr(self, "notifier"):
-            self.notifier.send(f"🚨 Emergency shutdown: {reason}. Closing all positions.")
+            action = "Closing all positions." if close_on_shutdown else "Positions left open — will reconcile on restart."
+            self.notifier.send(f"🚨 Emergency shutdown: {reason}. {action}")
 
-        # Close all MT5 positions
-        for ticket, position in list(self.open_positions.items()):
-            try:
-                result = self.mt5_client.close_position(ticket=ticket)
-                if result.get("status") == "success":
-                    logger.info(f"[SHUTDOWN] Closed MT5 position {ticket}.")
-                    self.audit_logger.log_event(
-                        event_type = "position_closed",
-                        ticket     = ticket,
-                        symbol     = position.get("symbol"),
-                        reason     = "emergency_shutdown",
-                    )
-                else:
-                    logger.error(
-                        f"[SHUTDOWN] Failed to close {ticket}: {result.get('error')}"
-                    )
-            except Exception as exc:
-                logger.error(f"[SHUTDOWN] Exception closing {ticket}: {exc}")
+        if close_on_shutdown:
+            # Fire async close from the sync context via the running event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self._emergency_close_all())
+            logger.critical("[SHUTDOWN] Position close scheduled.")
+        else:
+            logger.critical(
+                f"[SHUTDOWN] close_positions_on_shutdown=false — "
+                f"{len(self.open_positions)} position(s) left open. "
+                f"They will be reconciled on next startup."
+            )
 
-        self.open_positions.clear()
         logger.critical("[SHUTDOWN] Emergency shutdown complete.")
 
     def _register_new_position(
@@ -2101,46 +2229,53 @@ class TradingSystem:
         return self.db.get_trades(filters={'status': 'closed'}, limit=n)
         
     async def shutdown(self):
-        """Shutdown trading system gracefully."""
         if not self.running:
-            return  # Already shut down
-            
+            return
+
         logger.info("=" * 60)
         logger.info("Shutting down Trading System")
         logger.info("=" * 60)
-        
+
         self.running = False
-        
-        # Give loops time to finish current iteration
         await asyncio.sleep(1)
-        
-        # Close open positions if emergency shutdown enabled
-        if self.config.get('risk_management', {}).get('global_limits', {}).get('emergency_shutdown', {}).get('auto_close_all', False):
-            logger.warning("Emergency shutdown - closing all positions")
-            for position in self.open_positions.values():
+
+        close_cfg = (
+            self.config
+                .get('risk_management', {})
+                .get('global_limits', {})
+                .get('emergency_shutdown', {})
+        )
+        close_on_shutdown = close_cfg.get('close_positions_on_shutdown', False)
+
+        if close_on_shutdown and self.open_positions:
+            logger.warning(f"Shutdown — closing {len(self.open_positions)} position(s) as configured.")
+            for trade_id, position in list(self.open_positions.items()):
                 try:
-                    if position['platform'] == 'mt5':
+                    if position.get('platform') == 'mt5':
                         await self.mt5_client.close_position(position['ticket'])
                 except Exception as e:
-                    logger.error(f"Error closing position: {e}")
-                    
-        # Close connections
+                    logger.error(f"Error closing position on shutdown: {e}")
+        elif self.open_positions:
+            logger.info(
+                f"[SHUTDOWN] Leaving {len(self.open_positions)} position(s) open "
+                f"(close_positions_on_shutdown=false). "
+                f"They will be reconciled on next startup."
+            )
+
+        # disconnect clients / DB as before
         try:
             await self.mt5_client.disconnect()
-        except:
+        except Exception:
             pass
-            
         try:
             await self.market_client.close_all()
-        except:
+        except Exception:
             pass
-        
-        # Close database
         try:
             self.db.disconnect()
-        except:
+        except Exception:
             pass
-        
+
         logger.info("Trading System shutdown complete")
 
 

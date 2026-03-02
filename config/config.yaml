@@ -171,8 +171,8 @@ risk_management:
       cooldown_seconds: 3600
     emergency_shutdown:
       enabled: true
-      trigger_drawdown_percent: 4.0
-      auto_close_all: true
+      trigger_drawdown_percent: 4.7
+      close_positions_on_shutdown: false # true = close all positions on any shutdown event, false = only shutdown trading activity, keep existing positions open and reconcile on restart
 execution:
   slippage_tolerance_percent: 0.1
   max_order_retry: 3

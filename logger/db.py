@@ -508,34 +508,58 @@ class DatabaseManager:
             return cursor.lastrowid
         
     def get_trades(self, filters: Optional[Dict] = None, limit: int = 100) -> List[Dict]:
-        """
-        Retrieve trades with optional filters.
-        
-        Args:
-            filters: Optional dict with keys like symbol, status, platform
-            limit: Maximum number of trades to return
-            
-        Returns:
-            List of trade dictionaries
-        """
         with self._db_lock:
             cursor = self.conn.cursor()
-        
-            query = "SELECT * FROM trades"
+
+            query  = "SELECT * FROM trades"
             params = []
-            
+
             if filters:
                 where_clauses = []
                 for key, value in filters.items():
-                    where_clauses.append(f"{key} = ?")
-                    params.append(value)
-                query += " WHERE " + " AND ".join(where_clauses)
-                
+                    if value is None:
+                        # SQL requires IS NULL — '= NULL' always returns no rows
+                        where_clauses.append(f"{key} IS NULL")
+                        # No param appended — IS NULL takes no bind parameter
+                    else:
+                        where_clauses.append(f"{key} = ?")
+                        params.append(value)
+                if where_clauses:
+                    query += " WHERE " + " AND ".join(where_clauses)
+
             query += f" ORDER BY entry_time DESC LIMIT {limit}"
-            
+
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
-        
+    
+    def get_trades_missing_pnl(self) -> List[Dict]:
+        """
+        Return all closed/pending trades that have no real P&L data.
+
+        Matches:
+        - pnl IS NULL                          (never written)
+        - pnl = 0 AND status != 'open'         (written as zero placeholder)
+        - exit_reason = 'deal_history_unavailable'
+        - status = 'pending_exit'
+
+        Only returns rows that have a ticket (required for deal history lookup).
+        Excludes status='open' so live positions are never queued for backfill.
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                SELECT * FROM trades
+                WHERE  status IN ('closed', 'pending_exit')
+                AND  ticket IS NOT NULL
+                AND  (
+                        pnl IS NULL
+                    OR pnl = 0
+                    OR exit_reason IN ('deal_history_unavailable', 'pending_deal_lookup')
+                )
+                ORDER  BY entry_time DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+
     def get_open_trades(self) -> List[Dict]:
         """Get all currently open trades."""
         return self.get_trades(filters={'status': 'open'})

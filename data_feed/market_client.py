@@ -105,6 +105,11 @@ class MT5DataClient(MarketDataClient):
             df.set_index('timestamp', inplace=True)
             df.drop('time', axis=1, inplace=True)
             
+            # Drop the last (current-forming) candle since we requested count+1
+            # This ensures only *closed* candles are used in technical indicator calculations
+            if len(df) > 1:
+                df = df.iloc[:-1]
+            
             logger.info(f"Fetched {len(df)} candles for {symbol} from MT5")
             return df
             

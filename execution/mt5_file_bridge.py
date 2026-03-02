@@ -115,26 +115,31 @@ class MT5FileBridge:
         """
         Send command to EA and wait for response.
 
-        Lock design — critical section is NARROW (write + EA pickup only):
+        Lock design — critical section is very narrow (just the write):
           The EA's ProcessCommandFile() does:
             1. read command file
             2. FileDelete(commandFile)   ← happens immediately, before any processing
             3. process command (slow: CopyRates, order placement, etc.)
             4. AppendResponse()          ← appends tagged line to response file
 
-          Once the file is deleted (step 2), the EA holds the command in memory.
-          It is safe to write the next command — the EA will not re-read the file
-          until the current OnTimer() call completes and the next one begins.
+          Once the file is deleted (step 2) the EA holds the command in memory.
+          It's therefore safe for Python to issue another command immediately;
+          we only need a lock to prevent two coroutines from writing at the same
+          instant.  We no longer wait for EA pickup because per-request-ID
+          responses avoid collisions.
 
-          The response file is already append-only and every line is tagged with
-          request_id, so responses from overlapping commands never collide.
+          The response file is append‑only and every line is tagged with
+          request_id, so overlapping commands never collide.
 
-        Lock hold time: ~100-200ms (EA timer interval) instead of up to 30s.
+        Lock hold time: <5ms (just the file write) instead of up to 30s.
         """
         if self.demo_mode:
             return await self._simulate_command(command)
 
-        # ── Assign request_id and write to command file (under lock) ──────────
+        # ── Assign request_id and write to command file (under lock).  We no
+        # longer wait for the EA to delete the command file; per-request-ID
+        # responses make overlapping commands safe.  Lock only protects the
+        # write itself so two coroutines don't stomp each other.
         async with _get_mt5_global_lock():
             self.request_counter += 1
             request_id = f"{self.session_id}_{self.request_counter}"
@@ -148,18 +153,8 @@ class MT5FileBridge:
                 logger.error(f"[BRIDGE] Error writing command {request_id}: {e}")
                 return {'status': 'error', 'error': str(e)}
 
-            # Wait until the EA deletes the command file — this confirms it has
-            # picked up the command and we can safely queue the next one.
-            # EA timer fires every ~100ms; allow 3s for worst-case lag.
-            pickup_deadline = time.time() + 3.0
-            while self.command_file.exists():
-                if time.time() > pickup_deadline:
-                    logger.warning(
-                        f"[BRIDGE] EA did not pick up {request_id} "
-                        f"({command.get('action')}) within 3s — releasing lock"
-                    )
-                    break
-                await asyncio.sleep(0.02)   # 20ms — fine-grained enough to catch fast deletes
+        # ── Lock released immediately after write.  EA pickup no longer blocks
+        # further commands.
 
         # ── Lock released — poll for response outside the lock ────────────────
         # The response file accumulates tagged lines; we find ours by request_id.
