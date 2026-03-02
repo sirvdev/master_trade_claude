@@ -295,7 +295,8 @@ class MarketHoursChecker:
     async def _fetch_from_broker(self, symbol: str, mt5_sym: str) -> None:
         """
         Call get_symbol_sessions on the MT5 EA and parse the response.
-        Falls back to _FALLBACK_SESSIONS if the call fails.
+        EA returns session times in broker-local time; converts to UTC using
+        server_tz_offset_sec. Falls back to _FALLBACK_SESSIONS if the call fails.
         """
         try:
             response = await self._bridge._send_command(
@@ -310,20 +311,55 @@ class MarketHoursChecker:
             if not raw_sessions:
                 raise ValueError("empty sessions list in response")
 
+            # Extract server timezone offset (in seconds)
+            # EA returns broker-local session times; we convert to UTC
+            server_tz_offset_sec = response.get("server_tz_offset_sec", 0)
+
             # Convert MT5 day (Sun=0) → Python weekday (Mon=0)
             parsed = []
             for s in raw_sessions:
                 py_day = _MT5_TO_PYTHON[int(s["day"])]
-                parsed.append({
-                    "day"     : py_day,
-                    "from_sec": int(s["from"]),
-                    "to_sec"  : int(s["to"]),
-                })
+                
+                # Session times are in broker-local time (from EA)
+                # Convert to UTC: utc_time = (local_time - offset_sec) % 86400
+                from_local_sec = int(s["from"])
+                to_local_sec = int(s["to"])
+                
+                from_utc_sec = (from_local_sec - server_tz_offset_sec) % 86400
+                to_utc_sec = (to_local_sec - server_tz_offset_sec) % 86400
+                
+                # Handle midnight-wrap: if to_utc < from_utc after offset conversion,
+                # the session spans midnight in UTC
+                if to_utc_sec < from_utc_sec:
+                    # Session wraps across midnight — split into two windows
+                    # Part 1: from_utc to 23:59:59
+                    parsed.append({
+                        "day"     : py_day,
+                        "from_sec": from_utc_sec,
+                        "to_sec"  : 86399,
+                    })
+                    # Part 2: 00:00:00 to to_utc (next day)
+                    # For simplicity, we mark it as the same day in our logic
+                    # (caller handles day wraparound in seconds_until_open)
+                    next_day = (py_day + 1) % 7
+                    parsed.append({
+                        "day"     : next_day,
+                        "from_sec": 0,
+                        "to_sec"  : to_utc_sec,
+                    })
+                else:
+                    # Normal case: session does not wrap
+                    parsed.append({
+                        "day"     : py_day,
+                        "from_sec": from_utc_sec,
+                        "to_sec"  : to_utc_sec,
+                    })
 
             self._sessions[mt5_sym] = parsed
             logger.info(
-                f"[MarketHours] {symbol}: fetched {len(parsed)} session windows "
-                f"from broker. {self.session_summary(symbol)}"
+                f"[MarketHours] {symbol}: fetched {len(raw_sessions)} session(s) "
+                f"from broker (tz_offset={server_tz_offset_sec//3600:+d}h). "
+                f"{self.session_summary(symbol)}"
             )
 
         except Exception as e:

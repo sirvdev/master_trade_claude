@@ -788,7 +788,7 @@ def show_learning_tab(db):
         st.subheader("Optimization Controls")
         st.info("The learning engine analyses closed trades and suggests better parameters.")
         try:
-            from learning.learner import Learner
+            from learning.learner import StrategyLearner as Learner
             cfg     = load_config()
             learner = Learner(db, cfg)
             ca, cb  = st.columns(2)

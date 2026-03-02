@@ -30,19 +30,21 @@ class AuditLogger:
         self.logger = logging.getLogger("audit")
         self.logger.setLevel(logging.INFO)
         
-        # JSON file handler
-        log_file = self.log_dir / f"audit_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
-        handler = logging.FileHandler(log_file)
-        handler.setFormatter(logging.Formatter('%(message)s'))
-        self.logger.addHandler(handler)
-        
-        # Console handler for important events
-        console = logging.StreamHandler()
-        console.setLevel(logging.WARNING)
-        console.setFormatter(logging.Formatter(
-            '%(asctime)s - %(levelname)s - %(message)s'
-        ))
-        self.logger.addHandler(console)
+        # ── Only add handlers if not already present (prevent accumulation) ────
+        if not self.logger.handlers:
+            # JSON file handler
+            log_file = self.log_dir / f"audit_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
+            handler = logging.FileHandler(log_file)
+            handler.setFormatter(logging.Formatter('%(message)s'))
+            self.logger.addHandler(handler)
+            
+            # Console handler for important events
+            console = logging.StreamHandler()
+            console.setLevel(logging.WARNING)
+            console.setFormatter(logging.Formatter(
+                '%(asctime)s - %(levelname)s - %(message)s'
+            ))
+            self.logger.addHandler(console)
         
     def _create_log_entry(self, event_type: str, data: Dict[str, Any]) -> Dict:
         """Create standardized log entry."""

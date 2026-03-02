@@ -27,6 +27,7 @@ from learning.learner import StrategyLearner
 from utils.market_hours import MarketHoursChecker
 
 # Setup logging
+Path('logs').mkdir(exist_ok=True)
 _file_handler   = logging.FileHandler('logs/trading_system.log', encoding='utf-8')
 _stream_handler = logging.StreamHandler(sys.stdout)
 _stream_handler.stream.reconfigure(encoding='utf-8', errors='replace')
@@ -139,6 +140,7 @@ class TradingSystem:
         
         # State
         self.running = False
+        self.kill_switch = False  # Emergency shutdown flag
         self.open_positions = {}
         self.current_equity = 0.0
         self.daily_stats = {
@@ -195,7 +197,9 @@ class TradingSystem:
         
     def _init_strategy_components(self):
         """Initialize strategy and risk management."""
-        self.indicators = TechnicalIndicators(self.config.get('indicators', {}))
+        # ── Note: StrategyEngine creates its own TechnicalIndicators instance ──
+        # Don't create a separate one here to avoid duplication and sync issues.
+        # Access indicators via: self.strategy_engine.indicators if needed.
         self.strategy_engine = StrategyEngine(self.config)
         self.money_manager = MoneyManager(self.config)
         self.stop_manager = StopManager(self.config)
@@ -204,7 +208,7 @@ class TradingSystem:
         
     def _init_execution_clients(self):
         """Initialize execution clients."""
-        demo_mode = self.config['general']['mode'] == 'live'
+        demo_mode = self.config['general']['mode'] != 'live'
         
         # MT5
         mt5_config = {
@@ -215,8 +219,10 @@ class TradingSystem:
             'server': os.getenv('MT5_SERVER'),
             'magic_number': 123456
         }
-        self.mt5_client = MT5Bridge(mt5_config, demo_mode=False)
+        self.mt5_client = MT5Bridge(mt5_config, demo_mode=demo_mode)
 
+        # ── MarketHoursChecker needs MT5 client, but it's not yet connected ──
+        # The actual connection happens in start() before prefetch_all() is called.
         self.market_hours = MarketHoursChecker(self.mt5_client)
         
         logger.info(f"Execution clients initialized ({'DEMO' if demo_mode else 'LIVE'} mode)")
@@ -326,8 +332,11 @@ class TradingSystem:
 
         await self._load_open_positions_from_db()
 
+        # cLEANING UP EMPTY OR NULL TRADES ON STARTUP
         empty_trades = self.db.get_trades(filters={'pnl': 0, 'status': 'closed'})
         empty_trades += self.db.get_trades(filters={'pnl': 0, 'status': 'pending_exit'})
+        empty_trades += self.db.get_trades(filters={'exit_reason': 'deal_history_unavailable'})
+        empty_trades += self.db.get_trades(filters={'pnl': None})
         logger.warning(f"{len(empty_trades)} trades without P&L found in database.")
         if empty_trades:
             logger.warning("Starting deferred deal lookups for trades without P&L...")
@@ -350,14 +359,26 @@ class TradingSystem:
 
         
         # Start main trading loop
+        # ── Use return_exceptions=True to prevent cascading failures ──────────
+        # If one loop crashes, others continue running so trading/monitoring isn't
+        # completely interrupted by a transient error in learning or summary loops.
         try:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 self._trading_loop(),
                 self._position_monitor_loop(),
                 self._balance_monitor_loop(),
                 self._learning_loop(),
-                self._daily_summary_loop()
+                self._daily_summary_loop(),
+                return_exceptions=True
             )
+            # Log any exceptions that occurred in individual loops
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    loop_names = [
+                        'trading', 'position_monitor', 'balance_monitor', 
+                        'learning', 'daily_summary'
+                    ]
+                    logger.error(f"Loop '{loop_names[i]}' failed: {result}", exc_info=result)
         except asyncio.CancelledError:
             logger.info("Trading loops cancelled - shutting down")
         except KeyboardInterrupt:
@@ -464,9 +485,11 @@ class TradingSystem:
             
     async def _trading_loop(self):
         """Main trading loop - WITH POSITION COUNT CHECK."""
+        import time as _time
         logger.info("Trading loop started")
         
         while self.running:
+            loop_start_time = _time.monotonic()
             try:
                 # ✅ CHECK: Verify we haven't exceeded limits BEFORE analyzing
                 current_positions = len(self.open_positions)
@@ -521,8 +544,10 @@ class TradingSystem:
                         )
 
                     # ✅ CHECK: Don't analyze if already have position in this symbol
+                    # Normalize symbols by removing slashes to handle XAU/USD vs XAUUSD format
+                    normalized_symbol = symbol.replace('/', '')
                     symbol_has_position = any(
-                        pos['symbol'] == symbol 
+                        pos['symbol'].replace('/', '') == normalized_symbol 
                         for pos in self.open_positions.values()
                     )
                     
@@ -577,8 +602,12 @@ class TradingSystem:
                         logger.error(f"Error in strategy analysis: {e}", exc_info=True)
                         continue
                 
-                # Wait before next iteration
-                await asyncio.sleep(303)
+                # ── Sleep with elapsed-time compensation ────────────────────────
+                target_interval = 303  # seconds between analysis cycles
+                elapsed = _time.monotonic() - loop_start_time
+                sleep_time = max(0, target_interval - elapsed)
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
                 
             except Exception as e:
                 logger.error(f"Error in trading loop: {e}", exc_info=True)
@@ -744,6 +773,12 @@ class TradingSystem:
         """Monitor open positions - BATCHED VERSION."""
         logger.info("Position monitor loop started (batched)")
         
+        # ── Enforce minimum monitor interval to prevent bridge saturation ──────
+        monitor_interval = max(
+            5,  # Minimum 5 seconds
+            self.config.get('monitor', {}).get('interval_seconds', 10)
+        )
+        
         while self.running:
             try:
                 if len(self.open_positions) == 0:
@@ -762,12 +797,12 @@ class TradingSystem:
                 if mt5_positions:
                     await self._batch_update_mt5_positions(mt5_positions)
                 
-                # Wait before next check
-                await asyncio.sleep(10)
+                # Wait before next check (respecting minimum interval)
+                await asyncio.sleep(monitor_interval)
                 
             except Exception as e:
                 logger.error(f"Error in position monitor: {e}", exc_info=True)
-                await asyncio.sleep(10)
+                await asyncio.sleep(monitor_interval)
 
 
     async def _batch_update_mt5_positions(self, positions: dict):
@@ -903,15 +938,29 @@ class TradingSystem:
             if direction == 'long':
                 breakeven_sl = entry_price + buffer_pts
                 if current_sl < breakeven_sl:
-                    await self._send_sl_modify(
-                        trade_id, position, breakeven_sl, current_tp, label='breakeven'
-                    )
+                    try:
+                        await self._send_sl_modify(
+                            trade_id, position, breakeven_sl, current_tp, label='breakeven'
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[TRAIL] Breakeven SL modify failed for trade_id={trade_id} "
+                            f"ticket={ticket}: {e}"
+                        )
+                        # Don't propagate — let position monitoring continue
             else:
                 breakeven_sl = entry_price - buffer_pts
                 if current_sl > breakeven_sl:
-                    await self._send_sl_modify(
-                        trade_id, position, breakeven_sl, current_tp, label='breakeven'
-                    )
+                    try:
+                        await self._send_sl_modify(
+                            trade_id, position, breakeven_sl, current_tp, label='breakeven'
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[TRAIL] Breakeven SL modify failed for trade_id={trade_id} "
+                            f"ticket={ticket}: {e}"
+                        )
+                        # Don't propagate — let position monitoring continue
 
             position['trailing_active'] = True
             logger.info(
@@ -964,7 +1013,15 @@ class TradingSystem:
         if new_sl is None:
             return
 
-        await self._send_sl_modify(trade_id, position, new_sl, current_tp, label='trail')
+        try:
+            await self._send_sl_modify(trade_id, position, new_sl, current_tp, label='trail')
+        except Exception as e:
+            logger.error(
+                f"[TRAIL] Trailing SL modify failed for trade_id={trade_id} "
+                f"ticket={ticket}: {e}"
+            )
+            # Don't propagate — let position monitoring continue
+
 
 
     async def _send_sl_modify(
@@ -1434,7 +1491,10 @@ class TradingSystem:
                 if attempt < 3:
                     await asyncio.sleep(2.0 * attempt)
 
-        # ── All retries failed — defer, never write zeros ─────────────────────
+        # ── CRITICAL: Always remove from open_positions first BEFORE any DB updates ──
+        self.open_positions.pop(trade_id, None)
+
+        # ── All retries failed — mark as pending and retry in background ─────
         if deal.get('status') != 'success' or float(deal.get('exit_price', 0)) <= 0:
             logger.warning(
                 f"[CLOSE] All deal history attempts failed for ticket={ticket}. "
@@ -1445,14 +1505,24 @@ class TradingSystem:
                 'exit_reason': 'pending_deal_lookup',
                 'exit_time'  : datetime.utcnow(),
             })
-            if trade_id in self.open_positions:
-                del self.open_positions[trade_id]
             asyncio.ensure_future(
                 self._deferred_deal_lookup(trade_id, ticket, position)
             )
             return
 
+        # ── Log each partial close deal separately to the audit trail ─────────
+        for deal_item in deal.get('deals', []):
+            self.audit_logger.log_order_event({
+                'trade_id'    : trade_id,
+                'event_type'  : 'partial_close' if len(deal.get('deals', [])) > 1 else 'close',
+                'price'       : deal_item.get('exit_price'),
+                'quantity'    : deal_item.get('volume'),
+                'api_response': deal_item,
+                'notes'       : f"deal_ticket={deal_item.get('deal_ticket')}"
+            })
+
         # ── Got real data — compute all derived fields via shared helper ───────
+        # _compute_close_fields expects the aggregated deal info at the top level
         fields = self._compute_close_fields(position, deal)
 
         logger.info(
@@ -1504,9 +1574,21 @@ class TradingSystem:
                 f"| RR: {fields['realized_rr']:.2f} | Duration: {dur_str}{eq_str}"
             )
 
-        # ── Remove from open positions ─────────────────────────────────────────
-        if trade_id in self.open_positions:
-            del self.open_positions[trade_id]
+        # ── Update database with final close information ──────────────────────
+        self.db.update_trade(trade_id, {
+            'status'     : 'closed',
+            'exit_price' : fields['exit_price'],
+            'exit_time'  : fields['exit_time'],
+            'exit_reason': fields['exit_reason'],
+            'pnl'        : fields['net_pnl'],
+            'pnl_percent': fields['pnl_percent'],
+            'duration_minutes': fields['duration_minutes'],
+            'commission' : fields['commission'],
+            'slippage'   : fields['slippage'],
+            'max_favorable_excursion': fields['max_favorable_excursion'],
+            'max_adverse_excursion'  : fields['max_adverse_excursion'],
+            'realized_rr': fields['realized_rr'],
+        })
 
 
     async def _deferred_deal_lookup(
@@ -1527,7 +1609,7 @@ class TradingSystem:
         base_lookback = self.config.get('monitor', {}).get('history_lookback_hours', 48)
 
         for delay, lookback in [
-            (30,  base_lookback),
+            (3,  base_lookback),
             (120, base_lookback * 4),
             (300, base_lookback * 8),
         ]:
@@ -1573,6 +1655,17 @@ class TradingSystem:
                 )
                 continue
 
+            # ── Log each partial close deal separately to the audit trail ────────
+            for deal_item in deal.get('deals', []):
+                self.audit_logger.log_order_event({
+                    'trade_id'    : trade_id,
+                    'event_type'  : 'partial_close' if len(deal.get('deals', [])) > 1 else 'close',
+                    'price'       : deal_item.get('exit_price'),
+                    'quantity'    : deal_item.get('volume'),
+                    'api_response': deal_item,
+                    'notes'       : f"deal_ticket={deal_item.get('deal_ticket')} [deferred]"
+                })
+
             logger.info(
                 f"[DEFERRED_CLOSE] ✓ trade_id={trade_id} ticket={ticket} "
                 f"exit={fields['exit_price']:.5f} net_pnl={fields['net_pnl']:.2f} "
@@ -1583,7 +1676,7 @@ class TradingSystem:
             # Apply in-memory side-effects (consecutive losses, daily drawdown)
             self._apply_close_side_effects(fields['net_pnl'])
 
-            # Write to audit log + DB (log_trade_exit also calls db.update_trade)
+            # Write to audit log + DB
             self.audit_logger.log_trade_exit(trade_id, {
                 'exit_price'             : fields['exit_price'],
                 'reason'                 : fields['exit_reason'],
@@ -1595,6 +1688,22 @@ class TradingSystem:
                 'slippage'               : fields['slippage'],
                 'max_favorable_excursion': fields['max_favorable_excursion'],
                 'max_adverse_excursion'  : fields['max_adverse_excursion'],
+            })
+
+            # Update database with final close information
+            self.db.update_trade(trade_id, {
+                'status'     : 'closed',
+                'exit_price' : fields['exit_price'],
+                'exit_time'  : fields['exit_time'],
+                'exit_reason': fields['exit_reason'],
+                'pnl'        : fields['net_pnl'],
+                'pnl_percent': fields['pnl_percent'],
+                'duration_minutes': fields['duration_minutes'],
+                'commission' : fields['commission'],
+                'slippage'   : fields['slippage'],
+                'max_favorable_excursion': fields['max_favorable_excursion'],
+                'max_adverse_excursion'  : fields['max_adverse_excursion'],
+                'realized_rr': fields['realized_rr'],
             })
 
             if hasattr(self, 'notifier'):
@@ -1657,9 +1766,9 @@ class TradingSystem:
         max_dd_pct = self.config.get("risk", {}).get("daily_max_drawdown_percent", 5.0)
 
         try:
-            account_info = self.mt5_client.get_account_info()
-            balance      = account_info.get("balance", 0)
-            equity       = account_info.get("equity", balance)
+            # account_info = self.mt5_client.get_account_info()
+            balance      = getattr(self, 'current_equity', 0)
+            # equity       = getattr(self, 'current_equity', 0)
         except Exception as exc:
             logger.error(f"[DRAWDOWN] Cannot fetch account info: {exc}")
             return True   # fail-open: don't block trading on connection error

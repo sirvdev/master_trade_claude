@@ -509,7 +509,11 @@ class StrategyLearner:
             filters={'status': 'closed'},
             limit=1000
         )
-        trades = [t for t in trades if t['entry_time'] >= cutoff_date]
+        # ── Parse entry_time strings from DB comparison with datetime object ──
+        trades = [
+            t for t in trades 
+            if datetime.fromisoformat(str(t['entry_time']).replace('Z', '+00:00')) >= cutoff_date
+        ]
         
         logger.info(f"Analyzing {len(trades)} trades from last {days_lookback} days")
         

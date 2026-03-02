@@ -444,6 +444,8 @@ class StrategyEngine:
             'confluence_signals': []
         }
         
+        direction = None  # ── Initialize to prevent UnboundLocalError ────────
+        
         ltf_ind = ltf['indicators']
         
         # Check for Bollinger squeeze breakout
@@ -458,7 +460,7 @@ class StrategyEngine:
         if ltf_ind['macd']['bullish_cross']:
             decision['confluence_signals'].append('macd_bullish_cross')
             direction = 'long'
-        elif not ltf_ind['macd']['bullish_cross'] and ltf_ind['macd']['histogram'] < 0:
+        elif ltf_ind['macd']['histogram'] < 0:
             decision['confluence_signals'].append('macd_bearish_cross')
             direction = 'short'
         else:
@@ -468,7 +470,7 @@ class StrategyEngine:
         if ltf_ind['adx']['trend_strength'] == 'strong':
             decision['confluence_signals'].append('strong_trend')
             
-        if len(decision['confluence_signals']) >= 2:
+        if len(decision['confluence_signals']) >= 2 and direction:
             decision['signal'] = True
             decision['entry_signal'] = True
             decision['direction'] = direction

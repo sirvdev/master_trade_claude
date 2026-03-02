@@ -99,12 +99,16 @@ class MoneyManager:
         if platform == 'mt5':
             position_size = self._apply_mt5_constraints(position_size)
         
+        # ── Initialize variables to prevent UnboundLocalError on non-MT5 platforms ──
+        actual_risk = 0.0
+        position_value = 0.0
+        
         # Calculate actual risk with final position size
         if platform == 'mt5':
             contract_size = self._get_mt5_contract_size(symbol)
             actual_risk = position_size * contract_size * risk_distance
         
-        actual_risk_percent = (actual_risk / account_equity) * 100
+        actual_risk_percent = (actual_risk / account_equity) * 100 if account_equity > 0 else 0
         
         # Calculate position value
         if platform == 'mt5':

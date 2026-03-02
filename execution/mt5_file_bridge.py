@@ -44,13 +44,11 @@ class MT5FileBridge:
         self.common_path = self._find_mt5_common_path()
 
         self.command_file  = self.common_path / "python_command.txt"
-        self.response_file = self.common_path / "python_responses.txt"
         self.status_file   = self.common_path / "mt5_status.txt"
         self.session_file  = self.common_path / "python_session.txt"
 
         self._connected = False
         self.request_counter = 0
-        self.last_read_position = 0
 
 
         self.demo_orders    = {}
@@ -184,28 +182,18 @@ class MT5FileBridge:
         return {'status': 'error', 'error': 'timeout'}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
+        response_file = self.common_path / f"python_response_{request_id}.txt"
         try:
-            if not self.response_file.exists():
+            if not response_file.exists():
                 return None
-
-            content = self.response_file.read_text(encoding='utf-8', errors='ignore')
-            content = content.lstrip('\ufeff')
-
-            for line in reversed(content.strip().split('\n')):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    resp = json.loads(line)
-                    if resp.get('request_id') == request_id:
-                        return resp
-                except json.JSONDecodeError:
-                    continue
-
+            content = response_file.read_text(encoding='utf-8', errors='ignore').strip()
+            response_file.unlink(missing_ok=True)   # self-cleaning
+            return json.loads(content)
+        except (json.JSONDecodeError, PermissionError, FileNotFoundError):
+            return None
         except Exception as e:
-            logger.debug(f"Error reading response: {e}")
-
-        return None
+            logger.debug(f"Error reading response for {request_id}: {e}")
+            return None
 
     # ------------------------------------------------------------------
     # Historical data methods
@@ -450,10 +438,12 @@ class MT5FileBridge:
         
         command = {
             'action': 'modify_position',
-            'ticket': ticket,
-            'sl':     stop_loss or 0,
-            'tp':     take_profit or 0
+            'ticket': ticket
         }
+        if stop_loss is not None:
+            command['sl'] = stop_loss
+        if take_profit is not None:
+            command['tp'] = take_profit
         
         response = await self._send_command(command)
         
@@ -568,38 +558,70 @@ class MT5FileBridge:
 
     async def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
         """
-        Fetch the closed deal record for a given position ticket from MT5 history.
-
-        Calls the EA's get_deal_history action which scans HistorySelect for an
-        OUT deal whose DEAL_POSITION_ID matches the given position ticket.
-
-        Returns a dict with keys:
-            status, ticket, symbol, entry_price, exit_price, volume,
-            profit, swap, commission, net_profit, close_time, exit_reason
+        Fetch all closing deal records for a given position ticket from MT5.
+        Fixed EA returns a 'deals' array covering all partial closes.
         """
         if self.demo_mode:
-            # In demo mode there is no real history — return a neutral stub so
-            # _handle_external_close can still write a closed record without crashing.
             return {
-                'status'     : 'success',
-                'ticket'     : ticket,
-                'entry_price': 0.0,
-                'exit_price' : 0.0,
-                'volume'     : 0.0,
-                'profit'     : 0.0,
-                'swap'       : 0.0,
-                'commission' : 0.0,
-                'net_profit' : 0.0,
-                'close_time' : 0,
-                'exit_reason': 'demo_close',
+                'status'              : 'success',
+                'ticket'              : ticket,
+                'deal_count'          : 1,
+                'total_profit'        : 0.0,
+                'total_volume_closed' : 0.0,
+                'exit_price'          : 0.0,   # convenience field
+                'profit'              : 0.0,
+                'exit_reason'         : 'demo_close',
+                'deals'               : []
             }
 
-        return await self._send_command({
-            'action'        : 'get_deal_history',
-            'ticket'        : ticket,
-            'lookback_hours': lookback_hours,
+        now      = int(time.time())
+        from_ts  = now - (lookback_hours * 3600)
+
+        response = await self._send_command({
+            'action'    : 'get_deal_history',
+            'ticket'    : ticket,
+            'from_time' : from_ts,
+            'to_time'   : now + 3600,
         })
 
+        if response.get('status') != 'success':
+            logger.warning(f"get_deal_history failed for ticket {ticket}: {response.get('error')}")
+            return {
+                'status'  : 'error',
+                'ticket'  : ticket,
+                'profit'  : 0.0,
+                'deals'   : [],
+                'error'   : response.get('error', 'unknown')
+            }
+
+        deals = response.get('deals', [])
+
+        # Convenience scalars derived from the deals array
+        # Use the LAST closing deal's price as the representative exit price
+        last_deal      = deals[-1] if deals else {}
+        total_profit   = response.get('total_profit', 0.0)
+        exit_price     = last_deal.get('exit_price', 0.0)
+        exit_time      = last_deal.get('exit_time', 0)
+
+        logger.info(
+            f"get_deal_history ticket={ticket}: "
+            f"{response.get('deal_count', 0)} deal(s), "
+            f"total_profit={total_profit:.2f}, "
+            f"exit_price={exit_price}"
+        )
+
+        return {
+            'status'              : 'success',
+            'ticket'              : ticket,
+            'deal_count'          : response.get('deal_count', len(deals)),
+            'total_profit'        : total_profit,
+            'total_volume_closed' : response.get('total_volume_closed', 0.0),
+            'exit_price'          : exit_price,       # last partial close price
+            'profit'              : total_profit,     # alias for callers expecting 'profit'
+            'exit_time'           : exit_time,
+            'exit_reason'         : 'closed',
+            'deals'               : deals,            # full array for audit logging
+        }
     # ------------------------------------------------------------------
     # Helper: convert raw bar list to DataFrame
     # ------------------------------------------------------------------
