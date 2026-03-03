@@ -1685,6 +1685,46 @@ class TradingSystem:
                 )
                 return
 
+            # ── RE-ADOPTION CHECK ──────────────────────────────────────────────
+            # Before searching deal history, verify the position is actually
+            # closed on MT5. If it is still open, the false-close that triggered
+            # this deferred lookup was caused by a transient bridge error (e.g.
+            # Bug 2: get_all_positions timeout returning []). Re-adopt the
+            # position back into open_positions and cancel this deferred lookup.
+            try:
+                pos_info = await self.mt5_client.get_position_info(int(ticket))
+                if pos_info and pos_info.get('status') == 'success':
+                    logger.warning(
+                        f"[DEFERRED_CLOSE] ticket={ticket} is STILL OPEN on MT5 — "
+                        f"false close detected. Re-adopting trade_id={trade_id} "
+                        f"back into open_positions and cancelling deferred lookup."
+                    )
+                    # Restore DB status to open
+                    self.db.update_trade(trade_id, {
+                        'status'     : 'open',
+                        'exit_reason': None,
+                        'exit_time'  : None,
+                    })
+                    # Re-adopt into live tracking so the monitor resumes managing it
+                    if trade_id not in self.open_positions:
+                        self.open_positions[trade_id] = {
+                            **position,
+                            'trade_id'       : trade_id,
+                            'ticket'         : ticket,
+                            'current_price'  : float(pos_info.get('current_price', position.get('entry_price', 0.0))),
+                            'stop_loss'      : float(pos_info.get('sl', position.get('stop_loss', 0.0))),
+                            'trailing_active': position.get('trailing_active', False),
+                            'tp1_hit'        : position.get('tp1_hit', False),
+                            'tp2_hit'        : position.get('tp2_hit', False),
+                        }
+                    return  # ← cancel the deferred close entirely
+
+            except Exception as e:
+                logger.debug(
+                    f"[DEFERRED_CLOSE] Re-adoption check failed for ticket={ticket}: {e} "
+                    f"— proceeding with deal history lookup"
+                )
+
             logger.info(
                 f"[DEFERRED_CLOSE] Attempting deal history for "
                 f"trade_id={trade_id} ticket={ticket} lookback={lookback}h"
@@ -1866,6 +1906,13 @@ class TradingSystem:
                 'position_size'          : trade.get('position_size', 0.0),
                 'max_favorable_excursion': trade.get('max_favorable_excursion'),
                 'max_adverse_excursion'  : trade.get('max_adverse_excursion'),
+                # Required by re-adoption path in _deferred_deal_lookup:
+                # if the position is found to still be alive on MT5, these fields
+                # are spread into open_positions via **position. Without them,
+                # the monitor loop crashes on position['platform'] / position['symbol'].
+                'platform'               : trade.get('platform', 'mt5'),
+                'symbol'                 : trade.get('symbol', ''),
+                'ticket'                 : ticket,
             }
 
             asyncio.create_task(
