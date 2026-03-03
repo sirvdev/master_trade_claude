@@ -428,15 +428,14 @@ class TradingSystem:
                         market_is_open = False
 
                         try:
-                            # Primary check: broker session schedule (cached from last run if available)
+                            # Primary check: broker session schedule (fetched at startup).
+                            # During startup position verification we trust the schedule
+                            # and skip the is_open_by_price secondary check — that check
+                            # sends a get_historical command which times out when the EA
+                            # is in a reduced weekend state. The trading loop handles the
+                            # price-freshness check at analysis time.
                             market_is_open = self.market_hours.is_open(symbol)
-
-                            # Secondary check: if schedule says closed, verify via price staleness.
-                            # is_open_by_price returns True if a recent bar exists → market is live.
-                            if not market_is_open:
-                                market_is_open = await self.market_hours.is_open_by_price(
-                                    symbol, self.mt5_client, timeframe='1H'
-                                )
+                            
                         except Exception as e:
                             logger.warning(
                                 f"[STARTUP] Market-open check failed for {symbol}: {e} — "
