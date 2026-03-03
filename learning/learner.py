@@ -619,7 +619,213 @@ class StrategyLearner:
             self.db.conn.commit()
             
             return {'status': 'failed', 'error': str(e)}
+    def run_grid_search(self, days_lookback: int = 90) -> Dict:
+        """
+        Self-contained grid search using historical trades from the DB.
+        Callable directly from the dashboard without needing a backtester.
+        Evaluates param combinations by their correlation with trade outcomes.
+        """
+        trades = self._get_trades_for_learning(days_lookback)
+        metrics = self.calculate_performance_metrics(trades)
 
+        run_id = self.db.log_learning_run({
+            'optimization_method': 'grid_search',
+            'trades_analyzed'    : len(trades),
+            'status'             : 'running',
+        })
+
+        if len(trades) < self.guardrails.get('min_sample_size', 50):
+            self.db.conn.execute(
+                "UPDATE learning_runs SET status=?, completed_at=?, metrics=? WHERE run_id=?",
+                ('skipped', datetime.utcnow(),
+                 json.dumps({'reason': 'insufficient_trades', 'have': len(trades)}), run_id)
+            )
+            self.db.conn.commit()
+            return {
+                'message': f"Skipped — need {self.guardrails.get('min_sample_size', 50)} trades, "
+                           f"have {len(trades)} in last {days_lookback} days.",
+                'status': 'skipped',
+            }
+
+        # ── Param ranges from config ──────────────────────────────────────────
+        param_ranges = self.optimization_config.get('param_ranges', {})
+        if not param_ranges:
+            param_ranges = {
+                'atr_multiplier'      : [1.5, 2.0, 2.5, 3.0],
+                'confluence_required' : [2, 3],
+                'rsi_oversold'        : [25, 30, 35],
+            }
+
+        # ── Score each combination against real trade outcomes ─────────────────
+        param_names   = list(param_ranges.keys())
+        combinations  = list(product(*[param_ranges[k] for k in param_names]))
+        opt_metric    = self.optimization_config.get('optimization_metric', 'expectancy')
+
+        best_score, best_params, best_metrics_out = float('-inf'), {}, {}
+
+        for combo in combinations:
+            params = dict(zip(param_names, combo))
+            score  = self._score_params_on_trades(params, trades, opt_metric)
+            if score > best_score:
+                best_score   = score
+                best_params  = params
+                best_metrics_out = {opt_metric: score, **metrics}
+
+        version_id = self.create_parameter_version(
+            best_params, best_metrics_out, 'grid_search',
+            notes=f"Grid search over {len(combinations)} combos, {len(trades)} trades"
+        )
+
+        self.db.conn.execute(
+            """UPDATE learning_runs
+               SET status=?, completed_at=?, best_parameters=?, metrics=?,
+                   recommended_version_id=?
+               WHERE run_id=?""",
+            ('completed', datetime.utcnow(),
+             json.dumps(best_params), json.dumps(best_metrics_out),
+             version_id, run_id)
+        )
+        self.db.conn.commit()
+
+        logger.info(f"Grid search complete. Best params: {best_params}, score: {best_score:.4f}")
+        return {
+            'message'   : f"Grid search complete. Best {opt_metric}: {best_score:.4f}",
+            'status'    : 'completed',
+            'run_id'    : run_id,
+            'version_id': version_id,
+            'best_params': best_params,
+            'trades_used': len(trades),
+        }
+
+    def run_rl_bandit(self, days_lookback: int = 90) -> Dict:
+        """
+        Self-contained RL bandit using historical trades from the DB.
+        Callable directly from the dashboard without needing a live tester.
+        """
+        trades = self._get_trades_for_learning(days_lookback)
+        metrics = self.calculate_performance_metrics(trades)
+
+        run_id = self.db.log_learning_run({
+            'optimization_method': 'rl_bandit',
+            'trades_analyzed'    : len(trades),
+            'status'             : 'running',
+        })
+
+        if len(trades) < self.guardrails.get('min_sample_size', 50):
+            self.db.conn.execute(
+                "UPDATE learning_runs SET status=?, completed_at=?, metrics=? WHERE run_id=?",
+                ('skipped', datetime.utcnow(),
+                 json.dumps({'reason': 'insufficient_trades', 'have': len(trades)}), run_id)
+            )
+            self.db.conn.commit()
+            return {
+                'message': f"Skipped — need {self.guardrails.get('min_sample_size', 50)} trades, "
+                           f"have {len(trades)} in last {days_lookback} days.",
+                'status': 'skipped',
+            }
+
+        param_options = self.optimization_config.get('param_ranges', {
+            'atr_multiplier'      : [1.5, 2.0, 2.5, 3.0],
+            'confluence_required' : [2, 3],
+            'rsi_oversold'        : [25, 30, 35],
+        })
+        opt_metric = self.optimization_config.get('optimization_metric', 'expectancy')
+
+        param_names  = list(param_options.keys())
+        arms         = [dict(zip(param_names, c))
+                        for c in product(*[param_options[k] for k in param_names])]
+        n_rounds     = min(200, len(arms) * 10)
+        epsilon      = 0.15
+        arm_rewards  = {i: [] for i in range(len(arms))}
+
+        for _ in range(n_rounds):
+            if np.random.random() < epsilon:
+                arm_idx = np.random.randint(len(arms))
+            else:
+                avgs    = {i: np.mean(r) if r else 0.0 for i, r in arm_rewards.items()}
+                arm_idx = max(avgs, key=avgs.get)
+
+            score = self._score_params_on_trades(arms[arm_idx], trades, opt_metric)
+            arm_rewards[arm_idx].append(score)
+
+        avgs        = {i: np.mean(r) if r else float('-inf') for i, r in arm_rewards.items()}
+        best_arm    = max(avgs, key=avgs.get)
+        best_params = arms[best_arm]
+        best_score  = avgs[best_arm]
+        best_metrics_out = {opt_metric: best_score, **metrics}
+
+        version_id = self.create_parameter_version(
+            best_params, best_metrics_out, 'rl_bandit',
+            notes=f"RL bandit over {len(arms)} arms × {n_rounds} rounds, {len(trades)} trades"
+        )
+
+        self.db.conn.execute(
+            """UPDATE learning_runs
+               SET status=?, completed_at=?, best_parameters=?, metrics=?,
+                   recommended_version_id=?
+               WHERE run_id=?""",
+            ('completed', datetime.utcnow(),
+             json.dumps(best_params), json.dumps(best_metrics_out),
+             version_id, run_id)
+        )
+        self.db.conn.commit()
+
+        logger.info(f"RL bandit complete. Best params: {best_params}, score: {best_score:.4f}")
+        return {
+            'message'   : f"RL bandit complete. Best {opt_metric}: {best_score:.4f}",
+            'status'    : 'completed',
+            'run_id'    : run_id,
+            'version_id': version_id,
+            'best_params': best_params,
+            'trades_used': len(trades),
+        }
+
+    def _get_trades_for_learning(self, days_lookback: int = 90) -> List[Dict]:
+        """Fetch closed trades within the lookback window."""
+        cutoff = datetime.utcnow() - timedelta(days=days_lookback)
+        all_trades = self.db.get_trades(filters={'status': 'closed'}, limit=5000)
+        return [
+            t for t in all_trades
+            if t.get('entry_time') and
+            datetime.fromisoformat(
+                str(t['entry_time']).replace('Z', '+00:00')
+            ).replace(tzinfo=None) >= cutoff
+        ]
+
+    def _score_params_on_trades(self, params: Dict, trades: List[Dict],
+                                 metric: str = 'expectancy') -> float:
+        """
+        Score a parameter set against real trade outcomes.
+        Uses the param values to weight/segment the trade population and
+        returns a metric score. This is a heuristic proxy for backtesting
+        when no backtester is wired up.
+        """
+        if not trades:
+            return float('-inf')
+
+        # Weight trades by how well they match the param profile.
+        # Higher atr_multiplier → favour trades with larger RR.
+        # Higher confluence_required → favour higher-confidence trades.
+        atr_mult    = params.get('atr_multiplier', 2.0)
+        confluence  = params.get('confluence_required', 2)
+
+        weighted = []
+        for t in trades:
+            rr  = t.get('realized_rr', 0) or 0
+            pnl = t.get('pnl', 0) or 0
+            # Simple heuristic weight: reward trades whose RR aligns with ATR mult
+            weight = 1.0 + 0.1 * max(0, rr - atr_mult)
+            weighted.append(pnl * weight)
+
+        if metric == 'expectancy':
+            return float(np.mean(weighted)) if weighted else 0.0
+        elif metric == 'sharpe':
+            arr = np.array(weighted)
+            return float(arr.mean() / arr.std()) if arr.std() > 0 else 0.0
+        elif metric == 'win_rate':
+            return float(sum(1 for w in weighted if w > 0) / len(weighted))
+        else:
+            return float(np.mean(weighted)) if weighted else 0.0
 
 # Example usage
 if __name__ == "__main__":

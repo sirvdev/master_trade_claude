@@ -2250,7 +2250,14 @@ class TradingSystem:
                 logger.info("Running learning cycle...")
                 
                 # Would run actual learning here
-                # result = self.learner.run_learning_cycle(...)
+                result = self.learner.run_grid_search(days_lookback=90)
+                logger.info(f"Learning cycle result: {result.get('message', result.get('status'))}")
+                self.audit_logger.log_learning_event({
+                    'event_type': 'learning_cycle_complete',
+                    'message'   : result.get('message', ''),
+                    'status'    : result.get('status'),
+                    'run_id'    : result.get('run_id'),
+                })
                 
             except Exception as e:
                 logger.error(f"Error in learning loop: {e}", exc_info=True)
