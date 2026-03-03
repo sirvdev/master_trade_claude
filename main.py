@@ -1462,6 +1462,7 @@ class TradingSystem:
 
         return {
             'exit_price'             : exit_price,
+            'exit_time'              : exit_dt if exit_dt else datetime.utcnow(),
             'exit_reason'            : exit_reason,
             'net_pnl'                : round(net_pnl, 2),
             'pnl_percent'            : pnl_percent,
@@ -1671,7 +1672,7 @@ class TradingSystem:
                 f"[DEFERRED_CLOSE] Attempting deal history for "
                 f"trade_id={trade_id} ticket={ticket} lookback={lookback}h"
             )
-            
+
             try:
                 deal = await self.mt5_client.get_deal_history(
                     ticket        = int(ticket),
