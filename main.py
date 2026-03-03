@@ -866,6 +866,17 @@ class TradingSystem:
         try:
             all_mt5_positions = await self.mt5_client.get_all_positions()
 
+            # GUARD: None means the bridge call failed (timeout, EA unresponsive).
+            # An empty list returned from an error is indistinguishable from
+            # "genuinely no open positions", which would trigger false external-close
+            # events on every live trade. Abort this monitoring cycle entirely.
+            if all_mt5_positions is None:
+                logger.warning(
+                    "[MONITOR] get_all_positions returned None (bridge error) "
+                    "— skipping close detection this cycle to prevent false closes."
+                )
+                return
+
             # Build lookup by ticket
             mt5_by_ticket = {
                 int(pos['ticket']): pos
@@ -1654,10 +1665,16 @@ class TradingSystem:
             self.config.get('monitor', {}).get('history_lookback_hours', 48)
         )
 
+        # Deferred retries use a genuinely progressive lookback window.
+        # The sync path in _handle_external_close already tried base, base*2, base*4
+        # (48h / 96h / 192h). Start the deferred path beyond that:
+        #   30s  delay → 192h  (same as last sync attempt — covers EA being briefly busy)
+        #   120s delay → 288h  (12 days — weekend/broker holiday gap)
+        #   300s delay → 384h  (16 days — max reasonable history window)
         for delay, lookback in [
-            (3,   base_lookback),
-            (120, max(base_lookback, base_lookback * 4)),
-            (300, max(base_lookback, base_lookback * 8)),
+            (30,  base_lookback * 4),
+            (120, base_lookback * 6),
+            (300, base_lookback * 8),
         ]:
             await asyncio.sleep(delay)
 

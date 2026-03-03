@@ -511,24 +511,33 @@ class MT5FileBridge:
         else:
             return None
 
-    async def get_all_positions(self) -> list:
+    async def get_all_positions(self) -> list | None:
         """
         Get all open positions.
-        
+
         Returns:
-            List of position dicts
+            List of position dicts if the bridge call succeeded (may be empty
+            if there are genuinely no open positions).
+            None if the bridge call failed (timeout, EA unresponsive, etc.).
+            Callers MUST check for None before processing closes — an empty
+            list from a failed call is indistinguishable from "no positions"
+            otherwise, causing false external-close events.
         """
         command = {
             'action': 'get_all_positions',
             'magic':  self.magic_number
         }
-        
+
         response = await self._send_command(command)
-        
+
         if response.get('status') == 'success':
             return response.get('positions', [])
         else:
-            return []
+            logger.warning(
+                f"get_all_positions failed: {response.get('error', 'unknown')} "
+                f"— returning None to prevent false close detection"
+            )
+            return None
 
     async def get_balance(self) -> Dict:
             """

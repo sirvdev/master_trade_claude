@@ -322,8 +322,8 @@ class MarketHoursChecker:
                 
                 # Session times are in broker-local time (from EA)
                 # Convert to UTC: utc_time = (local_time - offset_sec) % 86400
-                from_local_sec = int(s["from"])
-                to_local_sec = int(s["to"])
+                from_local_sec = int(s["from_sec"])
+                to_local_sec = int(s["to_sec"])
                 
                 from_utc_sec = (from_local_sec - server_tz_offset_sec) % 86400
                 to_utc_sec = (to_local_sec - server_tz_offset_sec) % 86400
