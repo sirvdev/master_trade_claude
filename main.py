@@ -791,6 +791,36 @@ class TradingSystem:
                     'position_size': sizing['position_size'],
                 })
 
+                # Backfill analysis_logs with the price levels that were only
+                # known at execution time (SL/TP/size are computed after analysis
+                # is initially logged — this fills the empty columns).
+                if analysis_id and analysis_id != 'unknown':
+                    try:
+                        risk = abs(executed_price - stop_loss)
+                        rr_1 = abs(take_profit_1 - executed_price) / risk if risk > 0 else None
+                        with self.db._db_lock:
+                            self.db.conn.execute("""
+                                UPDATE analysis_logs SET
+                                    entry_price   = ?,
+                                    stop_loss     = ?,
+                                    take_profit_1 = ?,
+                                    take_profit_2 = ?,
+                                    position_size = ?,
+                                    expected_rr   = ?
+                                WHERE analysis_id = ?
+                            """, (
+                                executed_price,
+                                stop_loss,
+                                take_profit_1,
+                                take_profit_2,
+                                sizing['position_size'],
+                                rr_1,
+                                analysis_id,
+                            ))
+                            self.db.conn.commit()
+                    except Exception as e:
+                        logger.warning(f"Could not backfill analysis_logs for {analysis_id}: {e}")
+
                 self.db.update_trade(trade_id, {'ticket': ticket, 'status': 'open'})
 
                 self._register_new_position(
@@ -930,6 +960,15 @@ class TradingSystem:
                         position.get('max_adverse_excursion', 0.0),
                         adverse
                     )
+                    # Persist MFE/MAE to DB on every update cycle so deferred
+                    # closes and crash-restarts have real values to work with.
+                    try:
+                        self.db.update_trade(trade_id, {
+                            'max_favorable_excursion': position['max_favorable_excursion'],
+                            'max_adverse_excursion'  : position['max_adverse_excursion'],
+                        })
+                    except Exception as _mfe_err:
+                        logger.debug(f"[MONITOR] MFE/MAE persist failed for {trade_id}: {_mfe_err}")
 
                 # ── TP level checks ───────────────────────────────────────────────
                 position['current_price'] = current_price
@@ -1133,6 +1172,24 @@ class TradingSystem:
             f"[{label.upper()}] trade_id={trade_id} ticket={ticket} ({symbol}) "
             f"SL moved {old_sl:.5f} → {new_sl:.5f}"
         )
+        # Record every SL move to sl_tp_adjustments for learning/analytics
+        try:
+            entry_price  = position.get('entry_price', 0.0)
+            original_sl  = position.get('original_stop_loss') or old_sl
+            initial_risk = abs(entry_price - original_sl)
+            price_move   = abs(position.get('current_price', entry_price) - entry_price)
+            current_rr   = (price_move / initial_risk) if initial_risk > 0 else 0.0
+
+            self.audit_logger.log_sl_tp_adjustment(trade_id, {
+                'adjustment_type': label,          # 'breakeven' or 'trail'
+                'old_value'      : old_sl,
+                'new_value'      : new_sl,
+                'trigger_reason' : f"{label} at RR={current_rr:.2f}",
+                'current_price'  : position.get('current_price', 0.0),
+                'current_rr'     : current_rr,
+            })
+        except Exception as _log_err:
+            logger.debug(f"[TRAIL] sl_tp_adjustments log failed: {_log_err}")
         try:
             self.audit_logger.log_trade_event(
                 trade_id   = trade_id,

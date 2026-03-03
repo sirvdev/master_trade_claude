@@ -205,6 +205,8 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_timestamp ON analysis_logs(timestamp)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_analysis_symbol ON analysis_logs(symbol)")
+            # Stamp current schema version (idempotent — INSERT OR IGNORE)
+            cursor.execute("INSERT OR IGNORE INTO schema_version (version) VALUES (?)",(self.current_version,))
             
             self.conn.commit()
             logger.info("Database schema initialized")

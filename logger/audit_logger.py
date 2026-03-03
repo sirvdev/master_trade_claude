@@ -242,12 +242,17 @@ class AuditLogger:
         )
         
     def log_order_event(self, event: Dict[str, Any]):
-        """
-        Log order lifecycle event.
-        
-        Args:
-            event: Order event data
-        """
+        # Infer order_type if not explicitly provided.
+        # All live trades are market orders; the field was never populated because
+        # callers set event_type (placed/filled/close) but forgot order_type.
+        if 'order_type' not in event or not event.get('order_type'):
+            et = event.get('event_type', '')
+            if et in ('trade_entry', 'placed', 'filled'):
+                event = {**event, 'order_type': 'market'}
+            elif et in ('close', 'partial_close', 'partial'):
+                event = {**event, 'order_type': 'market_close'}
+            elif et in ('modified',):
+                event = {**event, 'order_type': 'modify'}
         # Store in database
         self.db.log_order_event(event)
         
