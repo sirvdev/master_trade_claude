@@ -575,23 +575,11 @@ class TradingSystem:
                         break
                     # ── Market hours guard ────────────────────────────────────
                     if not self.market_hours.is_open(symbol):
-                        # Double-check with live price freshness — works even
-                        # without EA v2.2 (uses existing get_historical action).
-                        price_fresh = await self.market_hours.is_open_by_price(
-                            symbol, self.mt5_client, timeframe='1H'
-                        )
-                        if not price_fresh:
-                            logger.info(
-                                f"[MARKET_HOURS] {symbol} closed — "
-                                f"next open: {self.market_hours.next_open_str(symbol)}"
-                            )
-                            continue
-                        # Schedule says closed but live price data is fresh →
-                        # trust the price, proceed with analysis
                         logger.debug(
-                            f"[MARKET_HOURS] {symbol}: schedule says closed "
-                            f"but recent price data found — proceeding"
+                            f"[MARKET_HOURS] {symbol} closed — "
+                            f"next open: {self.market_hours.next_open_str(symbol)}"
                         )
+                        continue
 
                     # ✅ CHECK: Don't analyze if already have position in this symbol
                     # Normalize symbols by removing slashes to handle XAU/USD vs XAUUSD format
@@ -866,11 +854,37 @@ class TradingSystem:
                     await asyncio.sleep(30)
                     continue
                 
+                # ── Market hours guard: don't poll the EA when market is closed ──
+                # When closed, SL/TP cannot be hit, price cannot move, and the EA
+                # often doesn't respond to commands reliably in a weekend state.
+                # Sleep until the next open rather than hammering the bridge.
+                tracked_symbols = {
+                    pos.get('symbol') for pos in self.open_positions.values()
+                    if pos.get('symbol')
+                        }
+                any_symbol_open = any(
+                    self.market_hours.is_open(sym) for sym in tracked_symbols
+                        ) if tracked_symbols else True  # no positions = don't gate
+
+                if not any_symbol_open:
+                    # Find soonest market open across all tracked symbols
+                    secs_until_open = min(
+                        (self.market_hours.seconds_until_open(sym) for sym in tracked_symbols),
+                        default=300
+                    )
+                    sleep_secs = max(60, min(secs_until_open, 300))  # check every 5min max
+                    logger.info(
+                        f"[MONITOR] All markets closed — sleeping {sleep_secs//60}m "
+                        f"(next open in {self.market_hours.next_open_str(next(iter(tracked_symbols)))})"
+                    )
+                    await asyncio.sleep(sleep_secs)
+                    continue
+
                 # Group positions by platform for batch checking
                 mt5_positions = {}
                 
                 for trade_id, position in list(self.open_positions.items()):
-                    if position['platform'] == 'mt5':
+                    if position.get('platform', 'mt5') == 'mt5':
                         mt5_positions[trade_id] = position
                 
                 # Batch check MT5 positions (single API call)
