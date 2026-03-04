@@ -131,7 +131,7 @@ risk_management:
   use_dynamic_sizing: true
   stop_loss:
     method: conservative
-    atr_multiplier: 1.0
+    atr_multiplier: 1.5
     structure_buffer_pips: 2
   take_profit:
     targets:
@@ -147,7 +147,7 @@ risk_management:
     dynamic_extension: true
   trailing_stop:
     enabled: true
-    activation_rr: 0.19999999999999998
+    activation_rr: 0.2
     method: atr
     atr_multiplier: 0.3
     percentage: 0.5
@@ -161,7 +161,7 @@ risk_management:
     trail_on_new_highs: true
     max_trail_distance_atr: 3.0
   global_limits:
-    daily_max_drawdown_percent: 5.0
+    daily_max_drawdown_percent: 4.0
     max_concurrent_trades: 10
     max_trades_per_day: 333
     max_risk_per_symbol_percent: 3.0

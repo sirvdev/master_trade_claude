@@ -150,6 +150,7 @@ class TradingSystem:
         }
         self.consecutive_losses = 0
         self.last_loss_time     = 0.0
+        self.halt_new_trades = False
         
         logger.info("Trading System initialized successfully")
         
@@ -261,28 +262,29 @@ class TradingSystem:
                     ).get('daily_max_drawdown_percent', 5.0)
                     
                     if drawdown >= max_dd:
-                        logger.error(
-                            f"DRAWDOWN LIMIT HIT: {drawdown:.2f}% >= {max_dd}%"
-                        )
-                        
-                        # Check if emergency shutdown enabled
+                        if not self.halt_new_trades:
+                            logger.critical(
+                                f"[DRAWDOWN] Daily drawdown {drawdown:.2f}% >= limit {max_dd}% "
+                                f"— halting all new trade entries immediately."
+                            )
+                            self.halt_new_trades = True
+                            self.audit_logger.log_risk_event({
+                                'event_type'      : 'daily_drawdown_limit_hit',
+                                'drawdown_percent': drawdown,
+                                'max_allowed'     : max_dd,
+                                'message'         : f'New entries halted at {drawdown:.2f}% drawdown',
+                            })
+                            if hasattr(self, 'notifier'):
+                                self.notifier.send(
+                                    f"🛑 Daily drawdown limit hit: {drawdown:.2f}% — "
+                                    f"trading HALTED for today."
+                                )
+
+                        # Emergency shutdown (close positions) is separate from halting entries
                         emergency_config = self.config.get('risk_management', {}).get(
                             'global_limits', {}
                         ).get('emergency_shutdown', {})
-                        
                         if emergency_config.get('enabled', True):
-                            logger.error("EMERGENCY SHUTDOWN TRIGGERED!")
-                            self.audit_logger.log_risk_event({
-                                'event_type': 'emergency_shutdown',
-                                'drawdown_percent': drawdown,
-                                'max_allowed': max_dd,
-                                'message': 'Emergency shutdown triggered by drawdown limit'
-                            })
-                            
-                            # Stop trading
-                            self.running = False
-                            
-                            # Close all positions if configured
                             if emergency_config.get('close_positions_on_shutdown', False):
                                 await self._emergency_close_all()
                     
@@ -566,6 +568,14 @@ class TradingSystem:
                 _random.shuffle(enabled_symbols)
                 
                 for symbol, symbol_config in enabled_symbols:
+                    # ── Drawdown hard stop ────────────────────────────────────
+                    if self.halt_new_trades:
+                        logger.info(
+                            "[TRADING] Daily drawdown limit active — "
+                            "skipping all new entries."
+                        )
+                        break
+
                     # ✅ DOUBLE CHECK before each symbol
                     if len(self.open_positions) >= max_concurrent:
                         logger.info(
@@ -746,6 +756,22 @@ class TradingSystem:
             
             if not sizing['approved']:
                 logger.info(f"Trade rejected: {sizing.get('reason')}")
+                return
+            
+            # ── Per-symbol drawdown guard ─────────────────────────────────────
+            # Check symbol-specific daily loss against config limit before entry.
+            symbol_dd_limit = self.config.get('risk_management', {}).get(
+                'global_limits', {}
+            ).get('max_drawdown_per_symbol_percent', 3.0)
+
+            symbol_pnl_today = self.daily_stats.get('symbol_pnl', {}).get(symbol, 0.0)
+            symbol_dd_pct = (-symbol_pnl_today / balance * 100) if symbol_pnl_today < 0 else 0.0
+
+            if symbol_dd_pct >= symbol_dd_limit:
+                logger.warning(
+                    f"[RISK] {symbol} per-symbol drawdown {symbol_dd_pct:.2f}% "
+                    f">= limit {symbol_dd_limit}% — rejecting entry."
+                )
                 return
             
             # Place order
@@ -1555,7 +1581,7 @@ class TradingSystem:
             'max_adverse_excursion'  : position.get('max_adverse_excursion'),
         }
 
-    def _apply_close_side_effects(self, net_pnl: float) -> None:
+    def _apply_close_side_effects(self, net_pnl: float, symbol: str = '') -> None:
         """
         Update in-memory stats that are side-effects of closing a trade.
         Called by both _handle_external_close and _deferred_deal_lookup.
@@ -1567,15 +1593,13 @@ class TradingSystem:
             self.consecutive_losses = getattr(self, 'consecutive_losses', 0) + 1
             self.last_loss_time     = _time.time()
             logger.info(f"[CLOSE] Loss — consecutive_losses={self.consecutive_losses}")
-            # Update daily drawdown
-            if self.daily_stats.get('starting_balance', 0) > 0:
-                equity = self.current_equity if self.current_equity > 0 else 10_000.0
-                loss_pct = abs(net_pnl / equity * 100)
-                self.daily_stats['daily_drawdown_percent'] = (
-                    self.daily_stats.get('daily_drawdown_percent', 0.0) + loss_pct
-                )
         else:
             self.consecutive_losses = 0
+
+        # Track per-symbol daily P&L for per-symbol drawdown enforcement
+        if symbol:
+            sym_pnl = self.daily_stats.setdefault('symbol_pnl', {})
+            sym_pnl[symbol] = sym_pnl.get(symbol, 0.0) + net_pnl
 
     async def _handle_external_close(self, trade_id: str, position: dict):
         """
@@ -1666,7 +1690,7 @@ class TradingSystem:
         )
 
         # ── Side-effects: consecutive losses, daily drawdown ──────────────────
-        self._apply_close_side_effects(fields['net_pnl'])
+        self._apply_close_side_effects(fields['net_pnl'], position.get('symbol', ''))
 
         # ── Snapshot equity immediately after close ────────────────────────────
         # This is stored per-trade so the dashboard can plot a real equity curve
@@ -1847,7 +1871,7 @@ class TradingSystem:
             )
 
             # Apply in-memory side-effects (consecutive losses, daily drawdown)
-            self._apply_close_side_effects(fields['net_pnl'])
+            self._apply_close_side_effects(fields['net_pnl'], position.get('symbol', ''))
 
             # Write to audit log + DB
             self.audit_logger.log_trade_exit(trade_id, {
@@ -2019,47 +2043,6 @@ class TradingSystem:
             
         except Exception as e:
             logger.error(f"Error updating position {trade_id}: {e}")
-
-    def _check_daily_drawdown(self) -> bool:
-        """
-        Return True if trading is allowed, False if daily drawdown limit is hit.
-        Reads today's realised P&L from SQLite via the audit logger.
-        """
-        max_dd_pct = self.config.get("risk", {}).get("daily_max_drawdown_percent", 5.0)
-
-        try:
-            # account_info = self.mt5_client.get_account_info()
-            balance      = getattr(self, 'current_equity', 0)
-            # equity       = getattr(self, 'current_equity', 0)
-        except Exception as exc:
-            logger.error(f"[DRAWDOWN] Cannot fetch account info: {exc}")
-            return True   # fail-open: don't block trading on connection error
-
-        if balance <= 0:
-            return True
-
-        daily_pnl  = self.audit_logger.get_daily_realised_pnl()     # returns float
-        dd_pct     = (-daily_pnl / balance) * 100 if daily_pnl < 0 else 0.0
-
-        if dd_pct >= max_dd_pct:
-            logger.critical(
-                f"[DRAWDOWN] Daily drawdown {dd_pct:.2f}% ≥ limit {max_dd_pct}%. "
-                f"Halting new entries."
-            )
-            self.audit_logger.log_event(
-                event_type   = "daily_drawdown_limit_hit",
-                drawdown_pct = dd_pct,
-                limit_pct    = max_dd_pct,
-                balance      = balance,
-            )
-            # Optionally fire a notification
-            if hasattr(self, "notifier"):
-                self.notifier.send(
-                    f"⚠️ Daily drawdown limit hit: {dd_pct:.2f}% — trading paused."
-                )
-            return False
-
-        return True
 
     def _check_cooldown_after_losses(self) -> bool:
         """
@@ -2290,7 +2273,10 @@ class TradingSystem:
                 
                 # Reset daily stats
                 self.daily_stats['trades_today'] = 0
+                self.daily_stats['symbol_pnl'] = {}   # ← add this line
                 self.daily_stats['starting_balance'] = await self._get_total_balance()
+                self.halt_new_trades = False   # ← add this line
+                logger.info("[DAILY] Daily drawdown halt cleared for new trading day.")
                 
             except Exception as e:
                 logger.error(f"Error in daily summary: {e}", exc_info=True)
