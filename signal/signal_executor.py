@@ -111,6 +111,10 @@ class SignalExecutor:
         self.limit_alert_h   = _env_float("SIGNAL_LIMIT_ALERT_HOURS", 6)
         self.default_symbol  = os.getenv("SIGNAL_DEFAULT_SYMBOL", "XAUUSD")
 
+        # When budget only covers 1 position, use this TP index instead of TP1
+        # Default=3: bigger reward target since risk is fixed at min_lot anyway
+        self.single_pos_tp_index = _env_int("SIGNAL_SINGLE_POS_TP_INDEX", 3)
+
         logger.info(
             f"[EXECUTOR] Init — risk={self.risk_pct}% magic={self.magic_number} "
             f"max_market={self.max_market} contract={self.contract_size} "
@@ -197,6 +201,8 @@ class SignalExecutor:
                 await self._handle_close_all(signal)
             elif signal.signal_type == "cancel":
                 await self._handle_cancel(signal)
+            elif signal.signal_type == "pre_announcement":
+                await self._handle_pre_announcement(signal)
             elif signal.signal_type == "unknown":
                 logger.debug(f"[EXECUTOR] Unknown — skipping: {signal.raw_text[:60]!r}")
 
@@ -265,6 +271,30 @@ class SignalExecutor:
         # Keep only as many TPs as we can afford (TP1 first)
         dropped_budget = len(valid_tps) - affordable
         valid_tps      = valid_tps[:affordable]
+
+        # Small account: single position — aim for a deeper TP instead of TP1
+        # (risk is identical regardless of which TP we target with 1 position)
+        if affordable == 1 and len(valid_tps) == 1:
+            target_idx = self.single_pos_tp_index - 1   # 0-based
+            all_valid_tps = [vt for vt in enumerate(signal.take_profits, start=1)
+                             if vt[1] > 0 and not self._tp_already_passed(direction, current_price, vt[1])]
+            # Rebuild as (tp_index, tp_price, order_type)
+            all_classified = []
+            for i, tp in all_valid_tps:
+                ot = "market" if i <= self.max_market else ("limit" if original_entry else "market")
+                all_classified.append((i, tp, ot))
+            if target_idx < len(all_classified):
+                valid_tps = [all_classified[target_idx]]
+                logger.info(
+                    f"[EXECUTOR] Single-position budget — using TP{self.single_pos_tp_index} "
+                    f"({valid_tps[0][1]}) instead of TP1 for better reward"
+                )
+            else:
+                logger.info(
+                    f"[EXECUTOR] Single-position: TP{self.single_pos_tp_index} not available, "
+                    f"using deepest available TP"
+                )
+                valid_tps = [all_classified[-1]] if all_classified else valid_tps
 
         signal_id = f"CH-{message_id}-{uuid.uuid4().hex[:6].upper()}"
         record = SignalRecord(
@@ -566,7 +596,23 @@ class SignalExecutor:
             f"<i>No action taken — SL was already at entry</i>"
         )
 
-    # ── Incomplete entry (ghost template) — skip ──────────────────────────────
+    # ── Pre-announcement ("buy gold", "sell now", etc.) ──────────────────────────
+
+    async def _handle_pre_announcement(self, signal):
+        """
+        Provider announced direction before posting the full signal.
+        No trade is opened — we just log and notify so you know one is coming.
+        The full RiskY traDE signal will arrive shortly and execute normally.
+        """
+        emoji = "📢🟢" if signal.direction == "buy" else "📢🔴"
+        logger.info(f"[EXECUTOR] Pre-announcement: {signal.direction} — full signal expected shortly")
+        await self._notify(
+            f"{emoji} <b>Incoming signal</b> — provider announced <b>{signal.direction.upper()}</b>\n"
+            f"Waiting for full RiskY traDE signal with SL & TPs...\n"
+            f"<i>No trade placed yet.</i>"
+        )
+
+        # ── Incomplete entry (ghost template) — skip ──────────────────────────────
 
     async def _handle_entry_incomplete(self, signal):
         logger.info("[EXECUTOR] Skipping incomplete/ghost entry signal")

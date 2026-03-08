@@ -26,6 +26,10 @@ from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
 from learning.learner import StrategyLearner
 from utils.market_hours import MarketHoursChecker
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'signal'))
+
+from signal.channel_signal_bot import ChannelSignalBot, _limit_order_alert_watcher
+
 # Setup logging
 Path('logs').mkdir(exist_ok=True)
 _file_handler   = logging.FileHandler('logs/trading_system.log', encoding='utf-8')

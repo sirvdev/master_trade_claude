@@ -143,6 +143,12 @@ class ChannelSignalBot:
         async def on_message(event: events.NewMessage.Event):
             await self._handle_message(event)
 
+        @self._client.on(events.MessageEdited(chats=CHANNEL))
+        async def on_edit(event: events.MessageEdited.Event):
+            # Provider often sends blank template then edits prices in
+            # Only act on edits that turn an incomplete signal into a valid one
+            await self._handle_edit(event)
+
         async with self._client:
             me = await self._client.get_me()
             logger.info(f"[BOT] ✅ Connected as @{me.username} — watching {CHANNEL}")
@@ -340,5 +346,6 @@ if __name__ == "__main__":
             s = parse_signal(m)
             print(f"\n{m!r}\n  → {s.signal_type} | {s.symbol} | {s.direction} | TPs={s.take_profits}")
     else:
-        print(f"Starting channel listener in {'DRY RUN' if not os.getenv('MT5_BRIDGE_HOST') else 'LIVE'} mode")
+        print("Starting channel listener in DRY RUN mode (no MT5 bridge)")
+        print("To go live: integrate into main.py (see comment at top of this file)")
         asyncio.run(_standalone())
