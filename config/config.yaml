@@ -5,7 +5,7 @@ general:
   log_analysis: true
 symbols:
   XAU/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -161,7 +161,7 @@ risk_management:
     trail_on_new_highs: true
     max_trail_distance_atr: 3.0
   global_limits:
-    daily_max_drawdown_percent: 4.0
+    daily_max_drawdown_percent: 60.0
     max_concurrent_trades: 10
     max_trades_per_day: 333
     max_risk_per_symbol_percent: 3.0

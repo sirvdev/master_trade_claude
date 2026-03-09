@@ -25,10 +25,7 @@ from risk_management.stop_manager import StopManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
 from learning.learner import StrategyLearner
 from utils.market_hours import MarketHoursChecker
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'signal'))
-
-from signal.channel_signal_bot import ChannelSignalBot, _limit_order_alert_watcher
+from telegram_signal.channel_signal_bot import ChannelSignalBot, _limit_order_alert_watcher
 
 # Setup logging
 Path('logs').mkdir(exist_ok=True)
@@ -141,6 +138,7 @@ class TradingSystem:
         self._init_strategy_components()
         self._init_execution_clients()
         self._init_learning_engine()
+        self._init_notifier_and_signal_bot()
         
         # State
         self.running = False
@@ -240,6 +238,28 @@ class TradingSystem:
         else:
             self.learner = None
             logger.info("Learning engine disabled")
+    
+    def _init_notifier_and_signal_bot(self):
+        """Initialize Telegram notifier and channel signal bot."""
+        from notification.telegram_notifier import TelegramNotifier
+        try:
+            self.notifier = TelegramNotifier()
+            logger.info("Telegram notifier initialized")
+        except Exception as e:
+            logger.warning(f"Telegram notifier not available (check .env): {e}")
+            self.notifier = None
+
+        db_path = self.config.get('database', {}).get('path', 'data/trading.db')
+        try:
+            self.signal_bot = ChannelSignalBot(
+                mt5_bridge = self.mt5_client,   # MT5Bridge IS the bridge directly
+                notifier   = self.notifier,
+                db_path    = db_path,
+            )
+            logger.info("Channel signal bot initialized")
+        except Exception as e:
+            logger.warning(f"Signal bot init failed: {e}")
+            self.signal_bot = None
 
     async def _balance_monitor_loop(self):
         """Monitor account balance and update equity."""
@@ -279,10 +299,9 @@ class TradingSystem:
                                 'message'         : f'New entries halted at {drawdown:.2f}% drawdown',
                             })
                             if hasattr(self, 'notifier'):
-                                self.notifier.send(
-                                    f"🛑 Daily drawdown limit hit: {drawdown:.2f}% — "
-                                    f"trading HALTED for today."
-                                )
+                                asyncio.ensure_future(self.notifier.send(
+                                    f"⚠️ Daily drawdown limit hit: {dd_pct:.2f}% — trading paused."
+                                ))
 
                         # Emergency shutdown (close positions) is separate from halting entries
                         emergency_config = self.config.get('risk_management', {}).get(
@@ -363,20 +382,24 @@ class TradingSystem:
         # If one loop crashes, others continue running so trading/monitoring isn't
         # completely interrupted by a transient error in learning or summary loops.
         try:
-            results = await asyncio.gather(
+            _coros = [
                 self._trading_loop(),
                 self._position_monitor_loop(),
                 self._balance_monitor_loop(),
                 self._learning_loop(),
                 self._daily_summary_loop(),
-                return_exceptions=True
-            )
+            ]
+            if getattr(self, 'signal_bot', None):
+                _coros.append(self.signal_bot.start())
+                _coros.append(_limit_order_alert_watcher(self.signal_bot.executor))
+
+            results = await asyncio.gather(*_coros, return_exceptions=True)
             # Log any exceptions that occurred in individual loops
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
                     loop_names = [
-                        'trading', 'position_monitor', 'balance_monitor', 
-                        'learning', 'daily_summary'
+                        'trading', 'position_monitor', 'balance_monitor',
+                        'learning', 'daily_summary', 'signal_bot', 'limit_alert_watcher'
                     ]
                     logger.error(f"Loop '{loop_names[i]}' failed: {result}", exc_info=result)
         except asyncio.CancelledError:

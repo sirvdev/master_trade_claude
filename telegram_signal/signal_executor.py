@@ -628,13 +628,29 @@ class SignalExecutor:
             logger.error(f"[EXECUTOR] get_equity failed: {e}")
         return None
 
+    # Since get current price is not in EA we used get_historical with 1 bar to fetch the last price.
     async def _get_current_price(self, symbol: str, direction: str) -> Optional[float]:
+        """
+        Get current price via get_historical (1 bar).
+        The EA does NOT support a 'get_price' action — it only supports
+        get_historical, so we fetch the last 1m bar and use its close price.
+        """
         try:
-            resp = await self.bridge._send_command({"action": "get_price", "symbol": symbol})
-            if resp.get("status") == "success":
-                return float(resp.get("ask") if direction == "buy" else resp.get("bid"))
+            resp = await self.bridge._send_command({
+                "action":    "get_historical",
+                "symbol":    symbol,
+                "timeframe": "M1",
+                "count":     1,
+            })
+            if resp.get("status") == "success" and resp.get("data"):
+                close = float(resp["data"][-1][4])  # index 4 = close
+                spread = 0.30  # typical XAUUSD spread
+                if direction == "buy":
+                    return round(close + spread / 2, 2)
+                else:
+                    return round(close - spread / 2, 2)
         except Exception as e:
-            logger.error(f"[EXECUTOR] get_price failed: {e}")
+            logger.error(f"[EXECUTOR] get_current_price failed: {e}")
         return None
 
     async def _place_market_order(
