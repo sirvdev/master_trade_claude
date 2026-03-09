@@ -300,8 +300,8 @@ class TradingSystem:
                             })
                             if hasattr(self, 'notifier'):
                                 asyncio.ensure_future(self.notifier.send(
-                                    f"⚠️ Daily drawdown limit hit: {dd_pct:.2f}% — trading paused."
-                                ))
+                                    f"⚠️ Daily drawdown limit hit: {drawdown:.2f}% — trading paused."
+                                )) # assumed dd_pct mean drawdown percent
 
                         # Emergency shutdown (close positions) is separate from halting entries
                         emergency_config = self.config.get('risk_management', {}).get(
