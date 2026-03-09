@@ -238,7 +238,11 @@ class SignalExecutor:
             for pos in pre.positions:
                 if pos.status == "open" and pos.ticket:
                     # Apply SL/TP to the already-open position
-                    ok = await self._modify_sl(pos.ticket, sl, tps[0] if tps else 0.0)
+                    # Use same TP index as single-position sizing (default TP3)
+                    target_real_tps = [t for t in tps if t > 0.0]
+                    target_tp_idx   = self.single_pos_tp_index - 1  # 0-based
+                    upgrade_tp      = target_real_tps[target_tp_idx] if target_tp_idx < len(target_real_tps) else target_real_tps[-1] if target_real_tps else 0.0
+                    ok = await self._modify_sl(pos.ticket, sl, upgrade_tp)
                     if ok:
                         self.state.update_position_sl(pre.signal_id, sl)
                         self.state.update_signal_status(pre.signal_id, "open")
@@ -259,7 +263,7 @@ class SignalExecutor:
         # ── Classify each TP ──────────────────────────────────────────────────
         # Order: skip passed → market (up to max_market) → limit → rest market
         valid_tps: list[tuple[int, float, str]] = []
-        market_used = 0
+        market_used = already_open  # pre-announcement position already used a market slot
 
         for i, tp in enumerate(tps, start=1):
             if self._tp_already_passed(direction, current_price, tp):
