@@ -1752,7 +1752,7 @@ class TradingSystem:
             emoji   = '✅' if fields['net_pnl'] >= 0 else '❌'
             dur_str = f"{fields['duration_minutes']:.0f}m" if fields['duration_minutes'] else "?"
             eq_str  = f" | Equity: ${equity_after_close:,.2f}" if equity_after_close else ""
-            self.notifier.send(
+            await self.notifier.send(
                 f"{emoji} {symbol} closed ({fields['exit_reason']})\n"
                 f"Exit: {fields['exit_price']:.5f} | Net P&L: {fields['net_pnl']:.2f} "
                 f"| RR: {fields['realized_rr']:.2f} | Duration: {dur_str}{eq_str}"
@@ -1930,18 +1930,18 @@ class TradingSystem:
                 'realized_rr': fields['realized_rr'],
             })
 
-            if hasattr(self, 'notifier'):
-                emoji = '✅' if fields['net_pnl'] >= 0 else '❌'
-                dur_str = (
-                    f"{fields['duration_minutes']:.0f}m"
-                    if fields['duration_minutes'] else "?"
-                )
-                self.notifier.send(
-                    f"{emoji} {position.get('symbol')} closed "
-                    f"({fields['exit_reason']}) [deferred]\n"
-                    f"Exit: {fields['exit_price']:.5f} | "
-                    f"Net P&L: {fields['net_pnl']:.2f} | "
-                    f"RR: {fields['realized_rr']:.2f} | Duration: {dur_str}"
+            if hasattr(self, 'notifier') and self.notifier:
+                await self.notifier.notify_trade_close(
+                    symbol           = position.get('symbol', ''),
+                    direction        = position.get('direction', ''),
+                    entry_price      = position.get('entry_price', 0.0),
+                    exit_price       = fields['exit_price'],
+                    pnl              = fields['net_pnl'],
+                    realized_rr      = fields['realized_rr'],
+                    exit_reason      = fields['exit_reason'],
+                    duration_minutes = fields['duration_minutes'],
+                    trade_id         = trade_id,
+                    ticket           = ticket,
                 )
 
             return   # ── Done — record fully and correctly populated ──────────
@@ -2119,7 +2119,7 @@ class TradingSystem:
 
         if hasattr(self, "notifier"):
             action = "Closing all positions." if close_on_shutdown else "Positions left open — will reconcile on restart."
-            self.notifier.send(f"🚨 Emergency shutdown: {reason}. {action}")
+            asyncio.ensure_future(self.notifier.send(f"🚨 Emergency shutdown: {reason}. {action}"))
 
         if close_on_shutdown:
             # Fire async close from the sync context via the running event loop
@@ -2207,6 +2207,21 @@ class TradingSystem:
         except Exception:
             pass
 
+        if hasattr(self, 'notifier') and self.notifier:
+            asyncio.ensure_future(self.notifier.notify_trade_entry(
+                symbol             = symbol,
+                direction          = direction,
+                entry_price        = entry_price,
+                stop_loss          = sl,
+                take_profit_1      = tp1,
+                take_profit_2      = tp2,
+                position_size      = volume,
+                expected_rr        = 0.0,
+                confluence_reasons = [],
+                trade_id           = trade_id,
+                ticket             = ticket,
+            ))
+
         return position
 
     def _close_and_unregister(self, position: dict, reason: str = "strategy") -> bool:
@@ -2251,10 +2266,10 @@ class TradingSystem:
 
         if hasattr(self, "notifier"):
             emoji = "✅" if profit >= 0 else "❌"
-            self.notifier.send(
+            asyncio.ensure_future(self.notifier.send(
                 f"{emoji} Position closed: {position.get('symbol')} "
                 f"| P&L: {profit:.2f} | Reason: {reason}"
-            )
+            ))
         return True
 
     async def _learning_loop(self):
