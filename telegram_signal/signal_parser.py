@@ -75,6 +75,8 @@ class ParsedSignal:
     # TPs in order; 0.0 = open runner (no TP price)
     take_profits:  list  = field(default_factory=list)
     tp_number:     Optional[int]   = None   # for tp_hit
+    entry_price:   Optional[float] = None   # explicit limit entry price (None = market)
+    entry_type:    Optional[str]   = None   # 'market' | 'limit'
     new_sl:        Optional[float] = None   # for sl_correction
     confidence:    float = 1.0
     warnings:      list  = field(default_factory=list)

@@ -230,8 +230,8 @@ class SignalExecutor:
             await self._notify(f"⚠️ Cannot get price for {symbol} — entry skipped.")
             return
 
-        original_entry  = signal.entry_price       # None for pure "buy now"
-        effective_entry = original_entry or current_price
+        original_entry  = signal.entry_price  # None = "buy/sell now" = pure market
+        effective_entry = current_price        # always use live price for sizing/TP check
 
         # ── Classify each TP ──────────────────────────────────────────────────
         # Order: skip passed → market (up to max_market) → limit → rest market
@@ -243,13 +243,17 @@ class SignalExecutor:
                 logger.info(f"[EXECUTOR] TP{i} ({tp}) already passed — skipping")
                 continue
 
+            # All TPs → market order (open immediately at current price)
+            # This provider always says "now" — no limit entries
             if market_used < self.max_market:
                 valid_tps.append((i, tp, "market"))
                 market_used += 1
-            elif original_entry:
-                valid_tps.append((i, tp, "limit"))
             else:
-                valid_tps.append((i, tp, "market"))
+                # Beyond max_market slots: use TP1 price minus $5 as a limit entry
+                # so remaining positions still get filled near the signal price
+                implied_entry = (tps[0] + 5.0) if signal.direction == "sell" else (tps[0] - 5.0)
+                entry_for_limit = original_entry or implied_entry
+                valid_tps.append((i, tp, "limit"))
 
         if not valid_tps:
             await self._notify(f"⚠️ {symbol} — all TPs already passed, signal skipped.")
@@ -329,8 +333,10 @@ class SignalExecutor:
                     symbol, direction, lot_per_pos, sl, tp_price
                 )
             else:
+                implied_entry = (tps[0] + 5.0) if direction == "sell" else (tps[0] - 5.0)
+                limit_price = original_entry or implied_entry
                 result = await self._place_limit_order(
-                    symbol, direction, lot_per_pos, original_entry, sl, tp_price
+                    symbol, direction, lot_per_pos, limit_price, sl, tp_price
                 )
 
             if result and result.get("ticket"):
@@ -658,14 +664,13 @@ class SignalExecutor:
     ) -> Optional[dict]:
         try:
             return await self.bridge._send_command({
-                "action":       "place_order",
-                "symbol":       symbol,
-                "order_type":   "buy" if direction == "buy" else "sell",
-                "lot_size":     lot,
-                "stop_loss":    sl,
-                "take_profit":  tp,
-                "magic_number": self.magic_number,
-                "comment":      "ch_signal",
+                "action":     "place_order",
+                "symbol":     symbol,
+                "order_type": "ORDER_TYPE_BUY" if direction == "buy" else "ORDER_TYPE_SELL",
+                "volume":     lot,
+                "sl":         sl,
+                "tp":         tp if tp else 0.0,
+                "comment":    "ch_signal",
             })
         except Exception as e:
             logger.error(f"[EXECUTOR] market order failed: {e}")
@@ -677,15 +682,14 @@ class SignalExecutor:
     ) -> Optional[dict]:
         try:
             return await self.bridge._send_command({
-                "action":       "place_order",
-                "symbol":       symbol,
-                "order_type":   "buy_limit" if direction == "buy" else "sell_limit",
-                "price":        entry,
-                "lot_size":     lot,
-                "stop_loss":    sl,
-                "take_profit":  tp,
-                "magic_number": self.magic_number,
-                "comment":      "ch_signal_limit",
+                "action":     "place_order",
+                "symbol":     symbol,
+                "order_type": "ORDER_TYPE_BUY_LIMIT" if direction == "buy" else "ORDER_TYPE_SELL_LIMIT",
+                "price":      entry,
+                "volume":     lot,
+                "sl":         sl,
+                "tp":         tp if tp else 0.0,
+                "comment":    "ch_signal_limit",
             })
         except Exception as e:
             logger.error(f"[EXECUTOR] limit order failed: {e}")
