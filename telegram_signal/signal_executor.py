@@ -202,7 +202,7 @@ class SignalExecutor:
             elif signal.signal_type == "cancel":
                 await self._handle_cancel(signal)
             elif signal.signal_type == "pre_announcement":
-                await self._handle_pre_announcement(signal)
+                await self._handle_pre_announcement(signal, message_id)
             elif signal.signal_type == "unknown":
                 logger.debug(f"[EXECUTOR] Unknown — skipping: {signal.raw_text[:60]!r}")
 
@@ -229,6 +229,29 @@ class SignalExecutor:
         if not current_price:
             await self._notify(f"⚠️ Cannot get price for {symbol} — entry skipped.")
             return
+        
+        # ── Check for a pending pre-announcement position to upgrade ───────────
+        pending = [r for r in self.state.get_open_signals(symbol)
+                   if r.status == "pending" and r.direction == direction]
+        pre_positions = []
+        for pre in pending:
+            for pos in pre.positions:
+                if pos.status == "open" and pos.ticket:
+                    # Apply SL/TP to the already-open position
+                    ok = await self._modify_sl(pos.ticket, sl, tps[0] if tps else 0.0)
+                    if ok:
+                        self.state.update_position_sl(pre.signal_id, sl)
+                        self.state.update_signal_status(pre.signal_id, "open")
+                        pre_positions.append(pos)
+                        logger.info(
+                            f"[EXECUTOR] ✅ Pre-signal ticket={pos.ticket} upgraded "
+                            f"with SL={sl} TP={tps[0] if tps else 0.0}"
+                        )
+                    else:
+                        logger.error(f"[EXECUTOR] ❌ Failed to upgrade pre-signal ticket={pos.ticket}")
+
+        # Subtract pre-announcement positions from remaining budget slots
+        already_open = len(pre_positions)
 
         original_entry  = signal.entry_price  # None = "buy/sell now" = pure market
         effective_entry = current_price        # always use live price for sizing/TP check
@@ -604,18 +627,67 @@ class SignalExecutor:
 
     # ── Pre-announcement ("buy gold", "sell now", etc.) ──────────────────────────
 
-    async def _handle_pre_announcement(self, signal):
+    async def _handle_pre_announcement(self, signal: ParsedSignal, message_id: int = 0):
         """
-        Provider announced direction before posting the full signal.
-        No trade is opened — we just log and notify so you know one is coming.
-        The full RiskY traDE signal will arrive shortly and execute normally.
+        Provider said "buy" / "sell gold" before posting full signal.
+        → Open 1 market position immediately at min_lot with NO SL/TP.
+        → Save as status='pending' so _handle_entry can find and upgrade it.
         """
-        emoji = "📢🟢" if signal.direction == "buy" else "📢🔴"
-        logger.info(f"[EXECUTOR] Pre-announcement: {signal.direction} — full signal expected shortly")
+        symbol    = signal.symbol or self.default_symbol
+        direction = signal.direction
+
+        emoji = "📢🟢" if direction == "buy" else "📢🔴"
+        logger.info(f"[EXECUTOR] Pre-announcement {direction} — opening 1 position now, awaiting full signal")
+
+        result = await self._place_market_order(
+            symbol    = symbol,
+            direction = direction,
+            lot       = self.min_lot,
+            sl        = 0.0,    # no SL yet — will be set when full signal arrives
+            tp        = 0.0,    # no TP yet
+        )
+
+        if not (result and result.get("ticket")):
+            logger.error(f"[EXECUTOR] Pre-announcement order failed: {result}")
+            await self._notify(f"⚠️ Pre-announcement {direction} order failed: {result}")
+            return
+
+        ticket      = result["ticket"]
+        entry_price = result.get("price", 0.0)
+
+        signal_id = f"PRE-{message_id}-{uuid.uuid4().hex[:6].upper()}"
+        pos = SignalPosition(
+            signal_id   = signal_id,
+            tp_index    = 1,
+            tp_price    = 0.0,
+            lot_size    = self.min_lot,
+            stop_loss   = 0.0,
+            order_type  = "market",
+            ticket      = ticket,
+            entry_price = entry_price,
+            status      = "open",
+            opened_at   = datetime.utcnow().isoformat(),
+        )
+        record = SignalRecord(
+            signal_id   = signal_id,
+            message_id  = message_id,
+            channel     = self.channel,
+            raw_text    = signal.raw_text,
+            symbol      = symbol,
+            direction   = direction,
+            entry_type  = "market",
+            entry_price = entry_price,
+            stop_loss   = 0.0,
+            take_profits= [],
+            positions   = [pos],
+            status      = "pending",   # ← key: marks it as awaiting full signal
+        )
+        self.state.save_signal(record)
+
         await self._notify(
-            f"{emoji} <b>Incoming signal</b> — provider announced <b>{signal.direction.upper()}</b>\n"
-            f"Waiting for full RiskY traDE signal with SL & TPs...\n"
-            f"<i>No trade placed yet.</i>"
+            f"{emoji} <b>Pre-signal position opened</b> — {direction.upper()} {symbol}\n"
+            f"Ticket: <code>{ticket}</code>  |  Lot: <code>{self.min_lot}</code>\n"
+            f"⏳ Awaiting full RiskY traDE signal for SL/TP..."
         )
 
         # ── Incomplete entry (ghost template) — skip ──────────────────────────────
