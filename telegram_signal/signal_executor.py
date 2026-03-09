@@ -698,10 +698,10 @@ class SignalExecutor:
     async def _modify_sl(self, ticket: int, new_sl: float, tp: float) -> bool:
         try:
             resp = await self.bridge._send_command({
-                "action":      "modify_order",
-                "ticket":      ticket,
-                "stop_loss":   new_sl,
-                "take_profit": tp,
+                "action": "modify_position",
+                "ticket": ticket,
+                "sl":     new_sl,
+                "tp":     tp,
             })
             return resp.get("status") == "success"
         except Exception as e:
