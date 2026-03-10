@@ -251,12 +251,15 @@ class TradingSystem:
 
         db_path = self.config.get('database', {}).get('path', 'data/trading.db')
         try:
-            self.signal_bot = ChannelSignalBot(
-                mt5_bridge = self.mt5_client,   # MT5Bridge IS the bridge directly
-                notifier   = self.notifier,
-                db_path    = db_path,
-            )
-            logger.info("Channel signal bot initialized")
+            if self.config.get('telegram_signals', {}).get('enabled', True):
+                self.signal_bot = ChannelSignalBot(
+                    mt5_bridge = self.mt5_client,   # MT5Bridge IS the bridge directly
+                    notifier   = self.notifier,
+                    db_path    = db_path,
+                )
+                logger.info("Channel signal bot initialized")
+            else:
+                logger.info("Channel signal bot disabled in config")
         except Exception as e:
             logger.warning(f"Signal bot init failed: {e}")
             self.signal_bot = None
