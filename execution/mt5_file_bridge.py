@@ -43,9 +43,9 @@ class MT5FileBridge:
         self.session_id = str(uuid.uuid4())[:8]
         self.common_path = self._find_mt5_common_path()
 
-        self.command_file  = self.common_path / "python_command.txt"
-        self.status_file   = self.common_path / "mt5_status.txt"
-        self.session_file  = self.common_path / "python_session.txt"
+        self.command_file  = self.common_path / "python_command_main.txt"
+        self.status_file   = self.common_path / "mt5_status_main.txt"
+        self.session_file  = self.common_path / "python_session_main.txt"
 
         self._connected = False
         self.request_counter = 0

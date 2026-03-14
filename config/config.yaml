@@ -4,7 +4,7 @@ general:
   log_trades: true
   log_analysis: true
 symbols:
-  XAU/USD:
+  BTC/USD:
     enabled: true
     platform: mt5
     mode: live
@@ -14,7 +14,7 @@ symbols:
     - 5m
     primary_timeframe: 15m
     entry_timeframe: 5m
-  XAG/USD:
+  XAU/USD:
     enabled: true
     platform: mt5
     mode: live
@@ -24,8 +24,8 @@ symbols:
     - 1m
     primary_timeframe: 15m
     entry_timeframe: 1m
-  BTC/USD:
-    enabled: false
+  XAG/USD:
+    enabled: true
     platform: mt5
     mode: live
     timeframes:
@@ -88,6 +88,8 @@ strategy:
   - breakout_retest
   - pullback_to_sr
   - momentum_breakout
+  - fibonacci_retracement
+  - fair_value_gap
   confluence_required: 2
   filters:
     respect_higher_tf_bias: true
