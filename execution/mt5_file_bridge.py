@@ -38,7 +38,7 @@ class MT5FileBridge:
     def __init__(self, config: Dict, demo_mode: bool = True):
         self.config = config
         self.demo_mode = (config.get('mode') == 'demo')
-        self.magic_number = config.get('magic_number', 123456)
+        self.magic_number = config.get('magic_number', 654321)
 
         self.session_id = str(uuid.uuid4())[:8]
         self.common_path = self._find_mt5_common_path()
