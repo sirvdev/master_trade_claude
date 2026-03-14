@@ -278,9 +278,12 @@ notifications:
   dashboard:
     refresh_interval_seconds: 5
 dashboard:
-  port: 8501
+  port: 8500
   enable_manual_override: true
   enable_config_edit: true
   enable_learning_trigger: true
   show_charts: true
   chart_bars: 500
+telegram_signals:
+  enabled: true
+  
