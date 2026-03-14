@@ -5,7 +5,7 @@ general:
   log_analysis: true
 symbols:
   XAU/USD:
-    enabled: false
+    enabled: true
     platform: mt5
     mode: live
     timeframes:
@@ -15,7 +15,7 @@ symbols:
     primary_timeframe: 15m
     entry_timeframe: 5m
   XAG/USD:
-    enabled: false
+    enabled: true
     platform: mt5
     mode: live
     timeframes:
@@ -139,7 +139,7 @@ risk_management:
       rr_ratio: 2
       close_percent: 50
     - name: TP2
-      rr_ratio: 3
+      rr_ratio: 4
       close_percent: 30
     - name: TP3
       rr_ratio: 10
@@ -147,13 +147,13 @@ risk_management:
     dynamic_extension: true
   trailing_stop:
     enabled: true
-    activation_rr: 0.2
+    activation_rr: 0.3
     method: atr
     atr_multiplier: 0.3
     percentage: 0.5
     breakeven:
       enabled: true
-      trigger_rr: 0.5
+      trigger_rr: 0.2
       buffer_pips: 1
   long_runner:
     enabled: true
@@ -161,7 +161,7 @@ risk_management:
     trail_on_new_highs: true
     max_trail_distance_atr: 3.0
   global_limits:
-    daily_max_drawdown_percent: 60.0
+    daily_max_drawdown_percent: 5.0
     max_concurrent_trades: 10
     max_trades_per_day: 333
     max_risk_per_symbol_percent: 3.0
@@ -265,7 +265,7 @@ logging:
     export_frequency_hours: 168
 notifications:
   telegram:
-    enabled: false
+    enabled: true
     events:
     - trade_entry
     - trade_exit
@@ -276,7 +276,7 @@ notifications:
   email:
     enabled: false
   dashboard:
-    refresh_interval_seconds: 5
+    refresh_interval_seconds: 30
 dashboard:
   port: 8500
   enable_manual_override: true
@@ -285,5 +285,5 @@ dashboard:
   show_charts: true
   chart_bars: 500
 telegram_signals:
-  enabled: true
+  enabled: false
   
