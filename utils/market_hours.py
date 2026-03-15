@@ -323,10 +323,18 @@ class MarketHoursChecker:
                 # Session times are in broker-local time (from EA)
                 # Convert to UTC: utc_time = (local_time - offset_sec) % 86400
                 from_local_sec = int(s["from_sec"])
-                to_local_sec = int(s["to_sec"])
-                
+                to_local_sec   = int(s["to_sec"])
+
+                # MT5 encodes a 24-hour always-open session as from=0, to=0
+                # (midnight-to-midnight). Normalise BEFORE UTC conversion.
+                # Without this: (0 - offset) % 86400 gives the same non-zero
+                # value for both from and to, so is_open() only passes for
+                # exactly 1 second per day at the broker's UTC offset second.
+                if from_local_sec == 0 and to_local_sec == 0:
+                    to_local_sec = 86399
+
                 from_utc_sec = (from_local_sec - server_tz_offset_sec) % 86400
-                to_utc_sec = (to_local_sec - server_tz_offset_sec) % 86400
+                to_utc_sec   = (to_local_sec   - server_tz_offset_sec) % 86400
                 
                 # Handle midnight-wrap: if to_utc < from_utc after offset conversion,
                 # the session spans midnight in UTC
