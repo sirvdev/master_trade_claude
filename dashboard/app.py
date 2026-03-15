@@ -45,13 +45,16 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 
-/* ── Global ── */
-html, body, [class*="css"] {
+/* ── Hide Streamlit's default header/toolbar so nav sits at top ── */
+#MainMenu, header[data-testid="stHeader"], footer { display: none !important; }
+.main .block-container {
+    padding-top: 0.5rem;
+    padding-bottom: 2rem;
+}
     font-family: 'IBM Plex Sans', sans-serif;
     background-color: #0a0c10;
     color: #c9d1d9;
 }
-.main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
 
 /* ── Mono data text ── */
 code, .mono {
@@ -576,6 +579,7 @@ def show_overview_tab(db, open_trades, pending_orders, closed_filt, time_range):
         # ── Quick stats table ─────────────────────────────────────────────────
         avg_dur = (sum(safe_float(t.get("duration_minutes")) for t in closed_filt) / n_trades
                    if n_trades else 0)
+        pf_str = f"{profit_factor:.2f}" if profit_factor != float("inf") else "∞"
         st.markdown(f"""
 <div style='background:#111827;border:1px solid #1f2937;border-radius:6px;
      padding:14px;font-family:"IBM Plex Mono",monospace;font-size:13px;
@@ -585,7 +589,7 @@ def show_overview_tab(db, open_trades, pending_orders, closed_filt, time_range):
 <span style='color:#6b7280'>GROSS LOSS   </span>
 <span class='loss'>${gross_loss:,.2f}</span><br>
 <span style='color:#6b7280'>PROFIT FACTOR </span>
-<span style='color:#e2e8f0'>{profit_factor:.2f if profit_factor != float("inf") else "∞"}</span><br>
+<span style='color:#e2e8f0'>{pf_str}</span><br>
 <span style='color:#6b7280'>AVG DURATION  </span>
 <span style='color:#e2e8f0'>{avg_dur:.0f} min</span>
 </div>
