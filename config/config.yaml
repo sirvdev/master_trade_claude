@@ -97,6 +97,19 @@ indicators:
   fibonacci:
     auto_detect_swing: true
     lookback_bars: 50
+  candle_patterns:
+    enabled: true
+    patterns:
+    - engulfing
+    - pin_bar
+    - doji
+    - hammer
+    - shooting_star
+  price_action:
+    detect_structure: true
+    hhhl_for_uptrend: true
+    lhlh_for_downtrend: true
+    structure_break_confirmation: true
 strategy:
   # Entry types — evaluated in order, first passing type wins.
   # Each type has its own order placement logic (market vs limit).
