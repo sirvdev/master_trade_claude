@@ -1022,12 +1022,12 @@ class TradingSystem:
                     # MFE: best the trade has looked (highest favorable move)
                     position['max_favorable_excursion'] = max(
                         position.get('max_favorable_excursion', 0.0),
-                        favorable
+                        favorable or 0.0
                     )
                     # MAE: worst the trade has looked (highest adverse move, stored positive)
                     position['max_adverse_excursion'] = max(
                         position.get('max_adverse_excursion', 0.0),
-                        adverse
+                        adverse or 0.0
                     )
                     # Persist MFE/MAE to DB on every update cycle so deferred
                     # closes and crash-restarts have real values to work with.
