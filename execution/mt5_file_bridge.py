@@ -177,7 +177,7 @@ class MT5FileBridge:
         return {'status': 'error', 'error': 'timeout'}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
-        response_file = self.common_path / f"python_response_{request_id}.txt"
+        response_file = self.common_path / f"python_response_main_{request_id}.txt"
         try:
             if not response_file.exists():
                 return None
