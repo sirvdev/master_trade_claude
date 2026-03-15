@@ -1,11 +1,20 @@
 """
-Trading System Dashboard — v3
-Changes from v2:
-  - Top horizontal navigation bar replaces sidebar radio
-  - Nav bar persists across F5 reloads via st.query_params
-  - Equity curve backfills equity_after_close for old trades (one-time per session)
-  - ALL use_container_width replaced: width='stretch' for dataframes + plotly charts
-  - Sidebar kept lean: mode, quick actions, time filter only
+dashboard/app.py — Trading Terminal v4
+=======================================
+A professional dark trading terminal dashboard.
+
+Design direction: Bloomberg Terminal meets modern SaaS.
+Dark zinc background, amber/gold accent for profits,
+red for losses, cyan for pending/neutral states.
+Monospaced data fields, clean table rows, no decorative noise.
+
+Tabs:
+  📊 Overview   — live positions, pending limits, KPIs, recent activity
+  📈 Trades     — full trade history with filters and detail drill-down
+  ⏳ Orders     — pending limit orders with countdown, status, cancel
+  📉 Analytics  — equity curve, entry-type breakdown, session heatmap, RR dist
+  ⚙️ Config     — risk and strategy parameters
+  🧠 Learning   — optimizer controls and parameter versions
 """
 
 import streamlit as st
@@ -17,45 +26,163 @@ import json
 import sys
 import sqlite3
 from pathlib import Path
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 
 sys.path.append(str(Path(__file__).parent.parent))
 from logger.db import DatabaseManager
 
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Trading System",
-    page_icon="📈",
+    page_title="Trading Terminal",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# ── CSS — dark terminal aesthetic ────────────────────────────────────────────
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+
+/* ── Global ── */
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+    background-color: #0a0c10;
+    color: #c9d1d9;
+}
+.main .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+
+/* ── Mono data text ── */
+code, .mono {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 0.85em;
+}
+
 /* ── Colour helpers ── */
-.positive { color: #00cc44; font-weight: bold; }
-.negative { color: #ff4444; font-weight: bold; }
-.neutral  { color: #888888; }
+.profit   { color: #f0b429; font-weight: 600; }
+.loss     { color: #f87171; font-weight: 600; }
+.neutral  { color: #6b7280; }
+.pending  { color: #38bdf8; font-weight: 600; }
+.long-dir { color: #34d399; font-weight: 600; }
+.short-dir{ color: #f87171; font-weight: 600; }
 
 /* ── Mode badges ── */
-.mode-live { background: #d32f2f; color: white; padding: 3px 10px;
-             border-radius: 4px; font-weight: bold; font-size: 13px; }
-.mode-demo { background: #1565c0; color: white; padding: 3px 10px;
-             border-radius: 4px; font-weight: bold; font-size: 13px; }
+.badge-live { background: #7f1d1d; color: #fca5a5; padding: 3px 10px;
+              border-radius: 3px; font-weight: 600; font-size: 12px;
+              letter-spacing: 1px; font-family: 'IBM Plex Mono', monospace; }
+.badge-demo { background: #1e3a5f; color: #93c5fd; padding: 3px 10px;
+              border-radius: 3px; font-weight: 600; font-size: 12px;
+              letter-spacing: 1px; font-family: 'IBM Plex Mono', monospace; }
 
-/* ── Metric card styling ── */
+/* ── Metric cards ── */
 div[data-testid="metric-container"] {
-    background: #0e1a2b;
-    border: 1px solid #1e3a5f;
-    border-radius: 8px;
-    padding: 10px 14px;
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 6px;
+    padding: 12px 16px !important;
 }
+div[data-testid="metric-container"] label {
+    color: #6b7280 !important;
+    font-size: 11px !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+div[data-testid="metric-container"] [data-testid="metric-value"] {
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 22px !important;
+    color: #f0f6fc !important;
+}
+
+/* ── Section headers ── */
+h1, h2, h3 { font-family: 'IBM Plex Sans', sans-serif !important; }
+h2 { color: #e2e8f0; border-bottom: 1px solid #1f2937; padding-bottom: 6px; }
+h3 { color: #94a3b8; font-size: 14px !important; text-transform: uppercase;
+     letter-spacing: 1px; }
+
+/* ── Trade row cards ── */
+.trade-row {
+    background: #111827;
+    border: 1px solid #1f2937;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 6px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+}
+.trade-row:hover { border-color: #374151; }
+
+/* ── Pending order cards ── */
+.order-card {
+    background: #0f1f2e;
+    border: 1px solid #1e3a5f;
+    border-left: 3px solid #38bdf8;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 8px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+}
+.order-card.expiring { border-left-color: #f59e0b; }
+.order-card.critical { border-left-color: #f87171; }
+
+/* ── Session indicator ── */
+.session-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-weight: 600;
+    letter-spacing: 1px;
+}
+.session-asian  { background: #1e293b; color: #94a3b8; border: 1px solid #334155; }
+.session-london { background: #1e3a5f; color: #93c5fd; border: 1px solid #1d4ed8; }
+.session-ny     { background: #2d1b69; color: #a78bfa; border: 1px solid #7c3aed; }
+.session-overlap{ background: #1c1917; color: #d6d3d1; border: 1px solid #44403c; }
+
+/* ── Nav bar ── */
+.stButton > button {
+    border-radius: 4px !important;
+    font-family: 'IBM Plex Mono', monospace !important;
+    font-size: 12px !important;
+    letter-spacing: 0.5px !important;
+}
+
+/* ── Sidebar ── */
+[data-testid="stSidebar"] {
+    background: #0d1117 !important;
+    border-right: 1px solid #1f2937;
+}
+[data-testid="stSidebar"] h1 {
+    font-family: 'IBM Plex Mono', monospace !important;
+    color: #f0b429 !important;
+    font-size: 16px !important;
+    letter-spacing: 2px;
+}
+
+/* ── Dataframe ── */
+.dataframe { font-family: 'IBM Plex Mono', monospace !important; font-size: 12px; }
+
+/* ── Dividers ── */
+hr { border-color: #1f2937 !important; margin: 12px 0 !important; }
+
+/* ── Info/success boxes ── */
+.stAlert { border-radius: 4px !important; }
 </style>
 """, unsafe_allow_html=True)
 
-CONFIG_PATH    = Path("config/config.yaml")
-CONTROL_DIR    = Path("data")
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+CONFIG_PATH  = Path("config/config.yaml")
+CONTROL_DIR  = Path("data")
 CLOSE_CMD_FILE = CONTROL_DIR / "close_commands.json"
+
+NAV_PAGES = [
+    "📊 Overview", "📈 Trades", "⏳ Orders",
+    "📉 Analytics", "⚙️ Config", "🧠 Learning",
+]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -102,7 +229,17 @@ def issue_close_command(ticket, symbol, trade_id):
     })
     CLOSE_CMD_FILE.write_text(json.dumps(cmds, indent=2))
 
-# ── Time helpers ──────────────────────────────────────────────────────────────
+def get_current_session() -> tuple[str, str]:
+    """Return (session_name, css_class) based on UTC hour."""
+    h = datetime.utcnow().hour
+    if 0 <= h < 7:
+        return "ASIAN", "session-asian"
+    elif 7 <= h < 12:
+        return "LONDON", "session-london"
+    elif 12 <= h < 20:
+        return "NEW YORK", "session-ny"
+    else:
+        return "OVERLAP", "session-overlap"
 
 def get_time_bounds(time_range: str, custom_start=None, custom_end=None):
     now = datetime.utcnow()
@@ -134,6 +271,25 @@ def filter_trades_by_time(trades, start_dt, end_dt):
             result.append(t)
     return result
 
+def format_countdown(expiry_str: str) -> tuple[str, str]:
+    """Return (countdown_text, severity) for a limit order expiry."""
+    try:
+        expiry = datetime.fromisoformat(expiry_str)
+        remaining = (expiry - datetime.utcnow()).total_seconds()
+        if remaining <= 0:
+            return "EXPIRED", "critical"
+        h, rem = divmod(int(remaining), 3600)
+        m, s   = divmod(rem, 60)
+        text = f"{h}h {m:02d}m" if h > 0 else f"{m}m {s:02d}s"
+        if remaining < 300:
+            return text, "critical"
+        elif remaining < 900:
+            return text, "expiring"
+        return text, "normal"
+    except Exception:
+        return "—", "normal"
+
+
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
 @st.cache_resource
@@ -142,13 +298,20 @@ def init_database():
     db.connect()
     return db
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)
 def load_all_trades(_db, limit=2000):
     return _db.get_trades(limit=limit)
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=10)
 def load_open_trades(_db):
     return _db.get_open_trades()
+
+@st.cache_data(ttl=10)
+def load_pending_limit_orders(_db):
+    try:
+        return _db.get_pending_limit_orders()
+    except Exception:
+        return []
 
 @st.cache_data(ttl=60)
 def load_parameter_versions(_db):
@@ -160,106 +323,70 @@ def load_parameter_versions(_db):
         return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EQUITY BACKFILL
-# Runs once per browser session (stored in session_state).
-# Finds every closed trade that is missing equity_after_close and fills it
-# by working backwards and forwards from the earliest known real equity value.
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Equity backfill ───────────────────────────────────────────────────────────
 
 def backfill_equity_once(db_path: str = "data/trading.db") -> None:
-    """
-    One-time backfill of equity_after_close for historical trades.
-
-    Strategy:
-      1. Load all closed trades ordered by exit_time ASC.
-      2. Find the earliest row that already has a real equity_after_close.
-      3. Walk backwards: equity before trade N = equity_after_close[N] - pnl[N]
-      4. Walk forwards:  equity after trade N  = equity_after_close[N-1] + pnl[N]
-         (only fills rows that still have NULL — real values are never overwritten)
-      5. UPDATE those rows in the database.
-    """
     try:
-        conn = sqlite3.connect(db_path)
+        conn   = sqlite3.connect(db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        cursor = conn.cursor()
 
-        cols = [r[1] for r in cur.execute("PRAGMA table_info(trades)")]
-        if "equity_after_close" not in cols:
-            conn.close()
-            return
-
-        rows = cur.execute("""
-            SELECT trade_id, exit_time, pnl, equity_after_close
+        cursor.execute("""
+            SELECT trade_id, pnl, equity_after_close
             FROM   trades
-            WHERE  status IN ('closed', 'pending_exit')
-              AND  exit_time IS NOT NULL
+            WHERE  status = 'closed' AND exit_time IS NOT NULL
             ORDER  BY exit_time ASC
-        """).fetchall()
-
+        """)
+        rows = [dict(r) for r in cursor.fetchall()]
         if not rows:
             conn.close()
             return
 
-        # Find first row with a real equity snapshot
+        # Find anchor — earliest row with a real equity value
         anchor_idx = next(
-            (i for i, r in enumerate(rows) if r["equity_after_close"] is not None),
-            None,
+            (i for i, r in enumerate(rows) if r.get("equity_after_close")),
+            None
         )
         if anchor_idx is None:
             conn.close()
             return
 
-        anchor_equity = float(rows[anchor_idx]["equity_after_close"])
-        updates = []
-
-        # Backwards: reconstruct equity for rows before the anchor
-        running = anchor_equity
+        # Walk backwards from anchor
+        anchor_eq = float(rows[anchor_idx]["equity_after_close"])
         for i in range(anchor_idx - 1, -1, -1):
-            pnl     = float(rows[i]["pnl"] or 0.0)
-            running = running - pnl          # what equity was AFTER this earlier close
-            if rows[i]["equity_after_close"] is None:
-                updates.append((round(running, 2), rows[i]["trade_id"]))
-
-        # Forwards: fill gaps after the anchor
-        running = anchor_equity
-        for i in range(anchor_idx + 1, len(rows)):
-            if rows[i]["equity_after_close"] is not None:
-                running = float(rows[i]["equity_after_close"])   # re-anchor on real value
-            else:
-                pnl     = float(rows[i]["pnl"] or 0.0)
-                running = running + pnl
-                updates.append((round(running, 2), rows[i]["trade_id"]))
-
-        if updates:
-            cur.executemany(
-                "UPDATE trades SET equity_after_close = ? WHERE trade_id = ?",
-                updates,
+            if rows[i].get("equity_after_close"):
+                break
+            rows[i]["equity_after_close"] = anchor_eq - sum(
+                safe_float(rows[j]["pnl"]) for j in range(i + 1, anchor_idx + 1)
             )
-            conn.commit()
 
+        # Walk forwards from anchor
+        for i in range(anchor_idx + 1, len(rows)):
+            if rows[i].get("equity_after_close"):
+                anchor_eq = float(rows[i]["equity_after_close"])
+                continue
+            prev_eq = float(rows[i - 1].get("equity_after_close") or anchor_eq)
+            rows[i]["equity_after_close"] = prev_eq + safe_float(rows[i]["pnl"])
+
+        updates = {
+            r["trade_id"]: r["equity_after_close"]
+            for r in rows
+            if r.get("equity_after_close")
+        }
+        for trade_id, eq in updates.items():
+            conn.execute(
+                "UPDATE trades SET equity_after_close = ? WHERE trade_id = ?",
+                (eq, trade_id),
+            )
+        conn.commit()
         conn.close()
-
     except Exception as e:
-        # Non-fatal — just log, don't crash the dashboard
         st.toast(f"Equity backfill skipped: {e}", icon="⚠️")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TOP NAVIGATION BAR
-# ══════════════════════════════════════════════════════════════════════════════
-
-NAV_PAGES = ["📊 Overview", "📈 Trades", "📉 Analytics", "⚙️ Config", "🧠 Learning"]
+# ── Nav bar ───────────────────────────────────────────────────────────────────
 
 def render_top_nav() -> str:
-    """
-    Render the horizontal nav bar and return the active page name.
-
-    Active page is stored in BOTH session_state (fast within-session) and
-    st.query_params so it survives F5 / hard reload — the browser URL keeps
-    ?page=<name> and Streamlit reads it back on the next load.
-    """
-    # On first load of a session: restore from URL query param if present
     if "active_page" not in st.session_state:
         from_url = st.query_params.get("page", NAV_PAGES[0])
         st.session_state["active_page"] = (
@@ -273,11 +400,10 @@ def render_top_nav() -> str:
         btn_type = "primary" if page == active else "secondary"
         if cols[i].button(page, key=f"nav_{i}", type=btn_type, use_container_width=True):
             st.session_state["active_page"] = page
-            st.query_params["page"] = page   # persist in URL — survives F5
+            st.query_params["page"] = page
             st.rerun()
 
-    st.markdown("<hr style='margin:0 0 16px 0; border-color:#1e3a5f'>",
-                unsafe_allow_html=True)
+    st.markdown("<hr>", unsafe_allow_html=True)
     return st.session_state["active_page"]
 
 
@@ -285,9 +411,8 @@ def render_top_nav() -> str:
 # TAB 1 — OVERVIEW
 # ══════════════════════════════════════════════════════════════════════════════
 
-def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt):
-    st.header(f"📊 Overview — {time_range}")
-
+def show_overview_tab(db, open_trades, pending_orders, closed_filt, time_range):
+    # ── KPI row ───────────────────────────────────────────────────────────────
     total_pnl   = sum(safe_float(t.get("pnl")) for t in closed_filt)
     win_trades  = [t for t in closed_filt if safe_float(t.get("pnl")) > 0]
     loss_trades = [t for t in closed_filt if safe_float(t.get("pnl")) < 0]
@@ -295,22 +420,30 @@ def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt
     win_rate    = len(win_trades) / n_trades * 100 if n_trades else 0
     avg_rr      = (sum(safe_float(t.get("realized_rr")) for t in closed_filt) / n_trades
                    if n_trades else 0)
+    gross_profit = sum(safe_float(t.get("pnl")) for t in win_trades)
+    gross_loss   = sum(safe_float(t.get("pnl")) for t in loss_trades)
+    profit_factor = abs(gross_profit / gross_loss) if gross_loss != 0 else float('inf')
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: st.metric("Closed Trades",  n_trades)
-    with c2: st.metric("Win Rate",       f"{win_rate:.1f}%",
-                        delta=f"{win_rate-50:.1f}%" if n_trades else None)
-    with c3: st.metric("Period P&L",     f"${total_pnl:,.2f}",
-                        delta=f"+${total_pnl:,.2f}" if total_pnl >= 0 else f"${total_pnl:,.2f}")
-    with c4: st.metric("Avg R:R",        f"{avg_rr:.2f}",
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    with c1: st.metric("NET P&L", f"${total_pnl:,.2f}",
+                        delta=f"{total_pnl:+,.2f}")
+    with c2: st.metric("WIN RATE", f"{win_rate:.1f}%",
+                        delta=f"{win_rate-50:.1f}% vs 50%" if n_trades else None)
+    with c3: st.metric("TRADES", f"{n_trades}",
+                        delta=f"{len(win_trades)}W / {len(loss_trades)}L")
+    with c4: st.metric("AVG R:R", f"{avg_rr:.2f}R",
                         delta=f"{avg_rr-1:.2f}" if n_trades else None)
-    with c5: st.metric("Open Positions", len(open_trades))
+    with c5: st.metric("PROFIT FACTOR",
+                        f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞")
+    with c6: st.metric("OPEN + PENDING", f"{len(open_trades)} + {len(pending_orders)}")
 
-    st.markdown("---")
-    col_left, col_right = st.columns([3, 2])
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    with col_left:
-        st.subheader("📍 Open Positions")
+    left, right = st.columns([3, 2])
+
+    with left:
+        # ── Open positions ────────────────────────────────────────────────────
+        st.markdown(f"### 🟢 OPEN POSITIONS ({len(open_trades)})")
         if open_trades:
             for idx, trade in enumerate(open_trades):
                 ticket    = trade.get("ticket")
@@ -319,71 +452,176 @@ def show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt
                 ep        = safe_float(trade.get("entry_price"))
                 sl        = safe_float(trade.get("stop_loss"))
                 pnl       = safe_float(trade.get("profit", trade.get("pnl")))
-                color     = "positive" if pnl >= 0 else "negative"
-                sign      = "+" if pnl >= 0 else ""
+                pnl_sign  = "profit" if pnl >= 0 else "loss"
+                dir_cls   = "long-dir" if direction == "long" else "short-dir"
+                dir_sym   = "▲" if direction == "long" else "▼"
 
-                r1, r2 = st.columns([5, 1])
+                r1, r2 = st.columns([6, 1])
                 with r1:
                     st.markdown(
-                        f"**{symbol}** {direction.upper()} &nbsp;|&nbsp; "
-                        f"Entry: `{ep:,.4f}` &nbsp;|&nbsp; SL: `{sl:,.4f}` &nbsp;|&nbsp; "
-                        f"<span class='{color}'>{sign}${pnl:,.2f}</span>",
+                        f"<div class='trade-row'>"
+                        f"<span style='color:#e2e8f0;font-weight:600'>{symbol}</span>"
+                        f"&nbsp;&nbsp;<span class='{dir_cls}'>{dir_sym} {direction.upper()}</span>"
+                        f"&nbsp;&nbsp;Entry: <span class='mono'>{ep:,.4f}</span>"
+                        f"&nbsp;&nbsp;SL: <span class='mono'>{sl:,.4f}</span>"
+                        f"&nbsp;&nbsp;<span class='{pnl_sign}'>"
+                        f"{'+'if pnl>=0 else ''}${pnl:,.2f}</span>"
+                        f"</div>",
                         unsafe_allow_html=True,
                     )
                 with r2:
-                    if st.button("✕ Close", key=f"close_{idx}_{ticket}"):
+                    if st.button("✕", key=f"close_{idx}_{ticket}", help="Close position"):
                         if ticket:
                             issue_close_command(ticket, symbol, trade.get("trade_id"))
-                            st.success(f"Close command issued for {symbol}")
+                            st.success(f"Close queued: {symbol}")
                         else:
-                            st.warning("No ticket — cannot close from dashboard.")
-            st.caption("ℹ️ Close button writes a command file; main.py executes the MT5 close.")
+                            st.warning("No ticket")
         else:
-            st.info("No open positions.")
+            st.markdown("<div class='trade-row neutral'>No open positions</div>",
+                        unsafe_allow_html=True)
 
-    with col_right:
-        st.subheader("💰 Period P&L")
-        gross_profit = sum(safe_float(t.get("pnl")) for t in win_trades)
-        gross_loss   = sum(safe_float(t.get("pnl")) for t in loss_trades)
-        avg_dur      = (sum(safe_float(t.get("duration_minutes")) for t in closed_filt) / n_trades
-                        if n_trades else 0)
+        st.markdown("<br>", unsafe_allow_html=True)
 
+        # ── Pending limit orders (overview summary) ────────────────────────
+        st.markdown(f"### ⏳ PENDING LIMITS ({len(pending_orders)})")
+        if pending_orders:
+            for order in pending_orders[:5]:   # show top 5 in overview
+                symbol     = order.get("symbol", "?")
+                direction  = order.get("direction", "?")
+                limit_px   = safe_float(order.get("limit_price"))
+                entry_type = order.get("entry_type", "?")
+                expiry_str = order.get("expiry_time", "")
+                countdown, severity = format_countdown(expiry_str)
+                dir_cls = "long-dir" if direction == "long" else "short-dir"
+                dir_sym = "▲" if direction == "long" else "▼"
+
+                st.markdown(
+                    f"<div class='order-card {severity}'>"
+                    f"<span style='color:#e2e8f0;font-weight:600'>{symbol}</span>"
+                    f"&nbsp;&nbsp;<span class='{dir_cls}'>{dir_sym} {direction.upper()}</span>"
+                    f"&nbsp;&nbsp;@ <span class='mono pending'>{limit_px:,.5f}</span>"
+                    f"&nbsp;&nbsp;<span style='color:#6b7280;font-size:11px'>[{entry_type}]</span>"
+                    f"&nbsp;&nbsp;expires: <span class='mono' style='color:#f59e0b'>{countdown}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            if len(pending_orders) > 5:
+                st.caption(f"+{len(pending_orders)-5} more — see ⏳ Orders tab")
+        else:
+            st.markdown("<div class='trade-row neutral'>No pending limit orders</div>",
+                        unsafe_allow_html=True)
+
+    with right:
+        # ── P&L gauge ─────────────────────────────────────────────────────────
         fig = go.Figure(go.Indicator(
             mode="number+delta",
             value=round(total_pnl, 2),
-            delta={"reference": 0, "valueformat": "$.2f",
-                   "increasing": {"color": "#00cc44"}, "decreasing": {"color": "#ff4444"}},
-            number={"prefix": "$", "valueformat": ",.2f", "font": {"size": 36}},
-            title={"text": f"Net P&L ({time_range})"},
+            delta={
+                "reference": 0,
+                "valueformat": "$.2f",
+                "increasing": {"color": "#f0b429"},
+                "decreasing": {"color": "#f87171"},
+            },
+            number={
+                "prefix": "$",
+                "valueformat": ",.2f",
+                "font": {"size": 32, "color": "#f0f6fc", "family": "IBM Plex Mono"},
+            },
+            title={"text": f"Net P&L — {time_range}",
+                   "font": {"size": 13, "color": "#6b7280"}},
         ))
-        fig.update_layout(height=160, margin=dict(t=40, b=0, l=0, r=0))
-        st.plotly_chart(fig, width="stretch")
+        fig.update_layout(
+            height=150,
+            margin=dict(t=35, b=5, l=5, r=5),
+            paper_bgcolor="#111827",
+            plot_bgcolor="#111827",
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown(f"""
-| | |
-|---|---|
-| ✅ Gross Profit | `${gross_profit:,.2f}` |
-| ❌ Gross Loss   | `${gross_loss:,.2f}` |
-| 🏆 Win / Loss  | `{len(win_trades)} / {len(loss_trades)}` |
-| ⏱ Avg Duration | `{avg_dur:.0f} min` |
-""")
-
-    st.markdown("---")
-    st.subheader("📝 Recent Closed Trades")
-    recent = sorted(closed_filt, key=lambda t: t.get("entry_time") or "", reverse=True)[:8]
-    if recent:
-        for t in recent:
-            pnl   = safe_float(t.get("pnl"))
-            color = "positive" if pnl > 0 else ("negative" if pnl < 0 else "neutral")
-            sign  = "+" if pnl > 0 else ""
-            st.markdown(
-                f"**{t.get('symbol','?')}** {t.get('direction','')} &nbsp;|&nbsp; "
-                f"<span class='{color}'>{sign}${pnl:,.2f}</span> &nbsp;|&nbsp; "
-                f"RR: {safe_float(t.get('realized_rr')):.2f} &nbsp;|&nbsp; "
-                f"{t.get('exit_reason','?')} &nbsp;|&nbsp; "
-                f"{str(t.get('entry_time',''))[:16]}",
-                unsafe_allow_html=True,
+        # ── Win/loss bar ──────────────────────────────────────────────────────
+        if n_trades:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                name="Wins",
+                x=["Wins"],
+                y=[len(win_trades)],
+                marker_color="#f0b429",
+                text=[f"{len(win_trades)}"],
+                textposition="inside",
+                textfont={"family": "IBM Plex Mono", "color": "#000"},
+            ))
+            fig2.add_trace(go.Bar(
+                name="Losses",
+                x=["Losses"],
+                y=[len(loss_trades)],
+                marker_color="#f87171",
+                text=[f"{len(loss_trades)}"],
+                textposition="inside",
+                textfont={"family": "IBM Plex Mono", "color": "#fff"},
+            ))
+            fig2.update_layout(
+                height=160,
+                showlegend=False,
+                paper_bgcolor="#111827",
+                plot_bgcolor="#111827",
+                margin=dict(t=10, b=30, l=10, r=10),
+                xaxis=dict(showgrid=False, color="#6b7280",
+                           tickfont={"family": "IBM Plex Mono", "size": 11}),
+                yaxis=dict(showgrid=False, color="#6b7280"),
+                font={"family": "IBM Plex Mono"},
+                barmode="group",
             )
+            st.plotly_chart(fig2, use_container_width=True)
+
+        # ── Quick stats table ─────────────────────────────────────────────────
+        avg_dur = (sum(safe_float(t.get("duration_minutes")) for t in closed_filt) / n_trades
+                   if n_trades else 0)
+        st.markdown(f"""
+<div style='background:#111827;border:1px solid #1f2937;border-radius:6px;
+     padding:14px;font-family:"IBM Plex Mono",monospace;font-size:13px;
+     line-height:2'>
+<span style='color:#6b7280'>GROSS PROFIT </span>
+<span class='profit'>${gross_profit:,.2f}</span><br>
+<span style='color:#6b7280'>GROSS LOSS   </span>
+<span class='loss'>${gross_loss:,.2f}</span><br>
+<span style='color:#6b7280'>PROFIT FACTOR </span>
+<span style='color:#e2e8f0'>{profit_factor:.2f if profit_factor != float("inf") else "∞"}</span><br>
+<span style='color:#6b7280'>AVG DURATION  </span>
+<span style='color:#e2e8f0'>{avg_dur:.0f} min</span>
+</div>
+""", unsafe_allow_html=True)
+
+    # ── Recent closed trades ──────────────────────────────────────────────────
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("### 📝 RECENT CLOSED TRADES")
+    recent = sorted(closed_filt, key=lambda t: t.get("entry_time") or "", reverse=True)[:10]
+    if recent:
+        cols = st.columns([2, 1, 2, 2, 2, 2, 2])
+        headers = ["Symbol", "Dir", "Entry", "Exit", "P&L", "R:R", "Reason"]
+        for col, h in zip(cols, headers):
+            col.markdown(f"<span style='color:#6b7280;font-size:11px;letter-spacing:1px'>"
+                         f"{h}</span>", unsafe_allow_html=True)
+
+        for t in recent:
+            pnl = safe_float(t.get("pnl"))
+            rr  = safe_float(t.get("realized_rr"))
+            pnl_cls = "profit" if pnl > 0 else "loss" if pnl < 0 else "neutral"
+            dir_cls = "long-dir" if t.get("direction") == "long" else "short-dir"
+            cols = st.columns([2, 1, 2, 2, 2, 2, 2])
+            cols[0].markdown(f"<span class='mono' style='color:#e2e8f0'>"
+                             f"{t.get('symbol','?')}</span>", unsafe_allow_html=True)
+            cols[1].markdown(f"<span class='{dir_cls}'>"
+                             f"{'▲' if t.get('direction')=='long' else '▼'}</span>",
+                             unsafe_allow_html=True)
+            cols[2].markdown(f"<span class='mono'>{safe_float(t.get('entry_price')):,.4f}</span>",
+                             unsafe_allow_html=True)
+            cols[3].markdown(f"<span class='mono'>{safe_float(t.get('exit_price')):,.4f}</span>",
+                             unsafe_allow_html=True)
+            cols[4].markdown(f"<span class='{pnl_cls}'>${pnl:,.2f}</span>",
+                             unsafe_allow_html=True)
+            cols[5].markdown(f"<span class='mono'>{rr:.2f}R</span>", unsafe_allow_html=True)
+            cols[6].markdown(f"<span class='mono' style='color:#6b7280;font-size:11px'>"
+                             f"{t.get('exit_reason','?')}</span>", unsafe_allow_html=True)
     else:
         st.info("No closed trades in this period.")
 
@@ -397,23 +635,23 @@ def show_trades_tab(db, closed_filt, open_trades):
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        syms       = sorted(set(t.get("symbol", "?") for t in closed_filt))
+        syms = sorted(set(t.get("symbol", "?") for t in closed_filt))
         sym_filter = st.selectbox("Symbol", ["All"] + syms)
     with c2:
         dir_filter = st.selectbox("Direction", ["All", "long", "short"])
     with c3:
         reason_filter = st.selectbox("Exit Reason",
             ["All", "stop_loss", "take_profit", "trailing_stop",
-             "manual", "external_close", "ea"])
+             "manual", "external_close"])
 
     display = closed_filt[:]
     if sym_filter    != "All": display = [t for t in display if t.get("symbol")      == sym_filter]
     if dir_filter    != "All": display = [t for t in display if t.get("direction")   == dir_filter]
     if reason_filter != "All": display = [t for t in display if t.get("exit_reason") == reason_filter]
 
-    st.caption(f"{len(display)} trades shown")
+    st.caption(f"{len(display)} trades")
     if not display:
-        st.info("No trades match the current filters.")
+        st.info("No trades match.")
         return
 
     df = pd.DataFrame(display)
@@ -423,76 +661,182 @@ def show_trades_tab(db, closed_filt, open_trades):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    preferred  = ["symbol", "direction", "entry_time", "entry_price",
-                  "exit_price", "pnl", "realized_rr", "exit_reason",
-                  "duration_minutes", "status"]
+    preferred = ["symbol", "direction", "entry_time", "entry_price",
+                 "exit_price", "pnl", "realized_rr", "exit_reason",
+                 "duration_minutes", "status"]
     show_cols  = [c for c in preferred if c in df.columns]
     df_display = df[show_cols].copy()
 
     fmt = {
-        "pnl":               lambda x: f"${x:,.2f}" if pd.notna(x) else "—",
-        "realized_rr":       lambda x: f"{x:.2f}"   if pd.notna(x) else "—",
-        "entry_price":       lambda x: f"{x:,.4f}"  if pd.notna(x) else "—",
-        "exit_price":        lambda x: f"{x:,.4f}"  if pd.notna(x) else "—",
-        "duration_minutes":  lambda x: f"{x:.0f}m"  if pd.notna(x) else "—",
-        "entry_time":        lambda x: str(x)[:16],
+        "pnl":              lambda x: f"${x:,.2f}" if pd.notna(x) else "—",
+        "realized_rr":      lambda x: f"{x:.2f}R"  if pd.notna(x) else "—",
+        "entry_price":      lambda x: f"{x:,.4f}"  if pd.notna(x) else "—",
+        "exit_price":       lambda x: f"{x:,.4f}"  if pd.notna(x) else "—",
+        "duration_minutes": lambda x: f"{x:.0f}m"  if pd.notna(x) else "—",
+        "entry_time":       lambda x: str(x)[:16],
     }
     for col, fn in fmt.items():
         if col in df_display.columns:
             df_display[col] = df_display[col].apply(fn)
 
-    st.markdown("**Click a row to view full details.**")
     selection = st.dataframe(
         df_display,
-        width="stretch",
+        use_container_width=True,
         selection_mode="single-row",
         on_select="rerun",
         key="trade_table",
     )
 
-    selected_rows = selection.selection.rows if hasattr(selection, "selection") else []
+    selected_rows = (selection.selection.rows
+                     if hasattr(selection, "selection") else [])
     if selected_rows:
         orig = display[selected_rows[0]]
-        st.markdown("---")
+        st.markdown("<hr>", unsafe_allow_html=True)
+        dir_sym = "▲ LONG" if orig.get("direction") == "long" else "▼ SHORT"
         st.subheader(
-            f"🔍 {orig.get('symbol','?')} {orig.get('direction','').upper()} — "
+            f"{orig.get('symbol','?')} {dir_sym} — "
             f"{str(orig.get('entry_time',''))[:16]}"
         )
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("Entry Price",   f"{safe_float(orig.get('entry_price')):,.4f}")
-            st.metric("Stop Loss",     f"{safe_float(orig.get('stop_loss')):,.4f}")
-            st.metric("Take Profit 1", f"{safe_float(orig.get('take_profit_1')):,.4f}")
+            st.metric("Entry",    f"{safe_float(orig.get('entry_price')):,.4f}")
+            st.metric("Stop Loss",f"{safe_float(orig.get('stop_loss')):,.4f}")
+            st.metric("TP1",      f"{safe_float(orig.get('take_profit_1')):,.4f}")
         with c2:
-            st.metric("Exit Price",    f"{safe_float(orig.get('exit_price')):,.4f}")
-            st.metric("Net P&L",       f"${safe_float(orig.get('pnl')):,.2f}")
-            st.metric("P&L %",         f"{safe_float(orig.get('pnl_percent')):.3f}%")
+            st.metric("Exit",     f"{safe_float(orig.get('exit_price')):,.4f}")
+            st.metric("Net P&L",  f"${safe_float(orig.get('pnl')):,.2f}")
+            st.metric("P&L %",    f"{safe_float(orig.get('pnl_percent')):.3f}%")
         with c3:
-            st.metric("Realized R:R",  f"{safe_float(orig.get('realized_rr')):.2f}")
-            st.metric("Duration",      f"{safe_float(orig.get('duration_minutes')):.0f} min")
-            st.metric("Exit Reason",   str(orig.get("exit_reason") or "—"))
+            st.metric("R:R",      f"{safe_float(orig.get('realized_rr')):.2f}R")
+            st.metric("Duration", f"{safe_float(orig.get('duration_minutes')):.0f} min")
+            st.metric("Reason",   str(orig.get("exit_reason") or "—"))
         with c4:
-            st.metric("Commission",    f"${safe_float(orig.get('commission')):.2f}")
-            st.metric("Slippage",      f"{safe_float(orig.get('slippage')):.5f}")
+            st.metric("MFE",      f"{safe_float(orig.get('max_favorable_excursion')):.4f}")
+            st.metric("MAE",      f"{safe_float(orig.get('max_adverse_excursion')):.4f}")
             eq = orig.get("equity_after_close")
-            st.metric("Equity After",  f"${safe_float(eq):,.2f}" if eq else "—")
-        c1, c2 = st.columns(2)
-        with c1: st.metric("Max Favorable Excursion",
-                            f"{safe_float(orig.get('max_favorable_excursion')):.4f}")
-        with c2: st.metric("Max Adverse Excursion",
-                            f"{safe_float(orig.get('max_adverse_excursion')):.4f}")
+            st.metric("Equity ↗", f"${safe_float(eq):,.2f}" if eq else "—")
         st.caption(
-            f"Trade ID: `{orig.get('trade_id','?')}` | "
-            f"Analysis ID: `{orig.get('analysis_id','?')}`"
+            f"Trade: `{orig.get('trade_id','?')}` | "
+            f"Ticket: `{orig.get('ticket','?')}` | "
+            f"Analysis: `{orig.get('analysis_id','?')}`"
         )
 
-    st.markdown("---")
+    st.markdown("<hr>", unsafe_allow_html=True)
     csv = pd.DataFrame(display).to_csv(index=False)
-    st.download_button("📥 Download CSV", csv, "trades_filtered.csv", "text/csv")
+    st.download_button("📥 Export CSV", csv, "trades.csv", "text/csv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — ANALYTICS
+# TAB 3 — PENDING LIMIT ORDERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_orders_tab(db, pending_orders):
+    st.header("⏳ Pending Limit Orders")
+
+    if not pending_orders:
+        st.info("No pending limit orders. The system places limit orders when entry type "
+                "is ema_stack_pullback, pullback_to_sr, or rsi_divergence.")
+        return
+
+    # Summary row
+    c1, c2, c3, c4 = st.columns(4)
+    expiring_soon = [o for o in pending_orders
+                     if format_countdown(o.get("expiry_time",""))[1] in ("critical","expiring")]
+    c1.metric("PENDING ORDERS", len(pending_orders))
+    c2.metric("EXPIRING SOON (<15m)", len(expiring_soon))
+    long_orders  = [o for o in pending_orders if o.get("direction") == "long"]
+    short_orders = [o for o in pending_orders if o.get("direction") == "short"]
+    c3.metric("LONG / SHORT", f"{len(long_orders)} / {len(short_orders)}")
+    c4.metric("ENTRY TYPES",
+              len(set(o.get("entry_type","?") for o in pending_orders)))
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    for order in pending_orders:
+        ticket      = order.get("ticket")
+        trade_id    = order.get("trade_id", "?")
+        symbol      = order.get("symbol", "?")
+        direction   = order.get("direction", "?")
+        entry_type  = order.get("entry_type", "?")
+        limit_px    = safe_float(order.get("limit_price"))
+        inv_px      = order.get("invalidation_price")
+        placed_at   = order.get("placed_at", "?")[:16]
+        expiry_str  = order.get("expiry_time", "")
+        countdown, severity = format_countdown(expiry_str)
+        atr         = safe_float(order.get("atr_at_placement"))
+        dir_sym     = "▲" if direction == "long" else "▼"
+        dir_cls     = "long-dir" if direction == "long" else "short-dir"
+
+        col_info, col_action = st.columns([8, 1])
+        with col_info:
+            inv_str = f"{safe_float(inv_px):,.5f}" if inv_px else "—"
+            color_count = ("#f87171" if severity == "critical"
+                           else "#f59e0b" if severity == "expiring"
+                           else "#38bdf8")
+            st.markdown(
+                f"<div class='order-card {severity}'>"
+                f"<span style='color:#e2e8f0;font-weight:600;font-size:14px'>"
+                f"{symbol}</span>"
+                f"&nbsp;&nbsp;<span class='{dir_cls}'>{dir_sym} {direction.upper()}</span>"
+                f"&nbsp;&nbsp;"
+                f"<span style='color:#6b7280;font-size:11px'>[{entry_type}]</span>"
+                f"<br>"
+                f"<span style='color:#6b7280'>LIMIT  </span>"
+                f"<span class='pending' style='font-size:15px'>{limit_px:,.5f}</span>"
+                f"&nbsp;&nbsp;"
+                f"<span style='color:#6b7280'>INVALID IF &lt; </span>"
+                f"<span class='mono loss'>{inv_str}</span>"
+                f"&nbsp;&nbsp;"
+                f"<span style='color:#6b7280'>ATR  </span>"
+                f"<span class='mono'>{atr:.4f}</span>"
+                f"<br>"
+                f"<span style='color:#6b7280'>PLACED  </span>"
+                f"<span class='mono'>{placed_at}</span>"
+                f"&nbsp;&nbsp;"
+                f"<span style='color:#6b7280'>EXPIRES IN  </span>"
+                f"<span class='mono' style='color:{color_count}'>{countdown}</span>"
+                f"&nbsp;&nbsp;"
+                f"<span style='color:#374151;font-size:11px'>ticket={ticket}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with col_action:
+            if st.button("✕", key=f"cancel_order_{ticket}",
+                         help="Cancel this limit order"):
+                issue_close_command(ticket, symbol, trade_id)
+                st.warning(f"Cancel queued for {symbol} ticket {ticket}. "
+                           f"main.py will execute on next cycle.")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.caption(
+        "⚠️ Cancel button queues a close command — main.py's position monitor "
+        "executes it on the next 15-second cycle. Refresh the page to see updated status."
+    )
+
+    # Historical cancelled / expired orders
+    with st.expander("📋 Order History (cancelled / expired / filled)"):
+        try:
+            cur = db.conn.cursor()
+            cur.execute("""
+                SELECT symbol, direction, entry_type, limit_price,
+                       placed_at, expiry_time, status, cancelled_reason
+                FROM   pending_limit_orders
+                WHERE  status != 'pending'
+                ORDER  BY placed_at DESC
+                LIMIT  50
+            """)
+            rows = [dict(r) for r in cur.fetchall()]
+            if rows:
+                df_hist = pd.DataFrame(rows)
+                st.dataframe(df_hist, use_container_width=True)
+            else:
+                st.info("No historical order records yet.")
+        except Exception as e:
+            st.info(f"Order history unavailable: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — ANALYTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def show_analytics_tab(closed_filt):
@@ -508,210 +852,288 @@ def show_analytics_tab(closed_filt):
     df["pnl"]                = pd.to_numeric(df.get("pnl"),                errors="coerce").fillna(0.0)
     df["realized_rr"]        = pd.to_numeric(df.get("realized_rr"),        errors="coerce").fillna(0.0)
     df["equity_after_close"] = pd.to_numeric(df.get("equity_after_close"), errors="coerce")
-
     df_sorted = df.dropna(subset=["exit_time"]).sort_values("exit_time").copy()
 
-    # ── Build equity series ───────────────────────────────────────────────────
-    # After backfill_equity_once() all rows should have equity_after_close.
-    # ffill + bfill handles any remaining edge-case gaps.
-    has_real = df_sorted["equity_after_close"].notna().any()
+    CHART_COLORS = {
+        "bg":     "#111827",
+        "grid":   "#1f2937",
+        "text":   "#6b7280",
+        "profit": "#f0b429",
+        "loss":   "#f87171",
+        "line":   "#38bdf8",
+    }
 
-    if has_real:
-        df_sorted["equity_plot"] = (
-            df_sorted["equity_after_close"].ffill().bfill()
+    def _base_layout(height=300, title=""):
+        return dict(
+            height=height,
+            title=dict(text=title, font=dict(size=12, color="#6b7280"), x=0.01),
+            paper_bgcolor=CHART_COLORS["bg"],
+            plot_bgcolor=CHART_COLORS["bg"],
+            margin=dict(t=35, b=40, l=50, r=20),
+            font=dict(family="IBM Plex Mono", color=CHART_COLORS["text"], size=11),
+            xaxis=dict(showgrid=False, color=CHART_COLORS["text"],
+                       zeroline=False, tickfont=dict(size=10)),
+            yaxis=dict(showgrid=True, gridcolor=CHART_COLORS["grid"],
+                       color=CHART_COLORS["text"], zeroline=True,
+                       zerolinecolor=CHART_COLORS["grid"], tickfont=dict(size=10)),
         )
-        equity_caption = "📡 Real account equity — sourced from MT5 balance snapshots"
-        equity_warning = False
+
+    # ── Row 1: equity curve + drawdown ────────────────────────────────────────
+    st.markdown("### EQUITY CURVE")
+
+    has_real = df_sorted["equity_after_close"].notna().any()
+    if has_real:
+        df_sorted["equity_plot"] = df_sorted["equity_after_close"].ffill().bfill()
+        eq_caption = "Real equity from MT5 balance snapshots"
     else:
-        # No snapshots yet — use cumsum anchored to config starting equity
         try:
-            cfg      = load_config()
+            cfg     = load_config()
             start_eq = float(cfg.get("general", {}).get("starting_equity", 100_000.0))
         except Exception:
             start_eq = 100_000.0
         df_sorted["equity_plot"] = start_eq + df_sorted["pnl"].cumsum()
-        equity_caption = ("⚠️ Estimated equity (P&L cumsum from configured starting equity — "
-                          "run the updated system to get real values)")
-        equity_warning = True
+        eq_caption = "⚠️ Estimated equity (P&L cumsum — run system to get real values)"
 
     df_sorted["peak"]     = df_sorted["equity_plot"].cummax()
-    df_sorted["drawdown"] = df_sorted["equity_plot"] - df_sorted["peak"]
+    df_sorted["drawdown"] = (df_sorted["equity_plot"] - df_sorted["peak"])
 
-    # ── Equity Curve chart ────────────────────────────────────────────────────
-    st.subheader("Equity Curve")
-    if equity_warning:
-        st.warning(equity_caption)
-    else:
-        st.caption(equity_caption)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
+    fig_eq = go.Figure()
+    fig_eq.add_trace(go.Scatter(
         x=df_sorted["exit_time"], y=df_sorted["equity_plot"],
-        mode="lines", name="Equity",
-        line=dict(color="#2196f3", width=2),
-        fill="tozeroy", fillcolor="rgba(33,150,243,0.07)",
-        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Equity: $%{y:,.2f}<extra></extra>",
+        name="Equity",
+        line=dict(color=CHART_COLORS["profit"], width=2),
+        fill="tozeroy",
+        fillcolor="rgba(240,180,41,0.06)",
+        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>$%{y:,.2f}<extra></extra>",
     ))
-    fig.add_trace(go.Scatter(
+    fig_eq.add_trace(go.Scatter(
         x=df_sorted["exit_time"], y=df_sorted["peak"],
-        mode="lines", name="Peak",
-        line=dict(color="rgba(0,200,0,0.5)", width=1, dash="dash"),
-        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>Peak: $%{y:,.2f}<extra></extra>",
+        name="Peak",
+        line=dict(color=CHART_COLORS["line"], width=1, dash="dot"),
+        hovertemplate="Peak: $%{y:,.2f}<extra></extra>",
     ))
-    fig.add_trace(go.Scatter(
+    fig_eq.update_layout(**_base_layout(280, "EQUITY"))
+    fig_eq.update_layout(showlegend=True,
+                         legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)",
+                                     font=dict(size=10)))
+    st.plotly_chart(fig_eq, use_container_width=True)
+    st.caption(eq_caption)
+
+    fig_dd = go.Figure()
+    fig_dd.add_trace(go.Bar(
         x=df_sorted["exit_time"], y=df_sorted["drawdown"],
-        mode="lines", name="Drawdown",
-        line=dict(color="rgba(220,50,50,0.6)", width=1),
-        fill="tozeroy", fillcolor="rgba(220,50,50,0.06)",
-        yaxis="y2",
-        hovertemplate="<b>%{x|%Y-%m-%d %H:%M}</b><br>DD: $%{y:,.2f}<extra></extra>",
+        marker_color=CHART_COLORS["loss"],
+        opacity=0.7,
+        name="Drawdown",
+        hovertemplate="<b>%{x|%Y-%m-%d}</b><br>DD: $%{y:,.2f}<extra></extra>",
     ))
-    fig.update_layout(
-        xaxis_title="Date (UTC)", yaxis_title="Equity ($)",
-        yaxis2=dict(title="Drawdown ($)", overlaying="y", side="right", showgrid=False),
-        hovermode="x unified", height=380,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=0, r=0, t=30, b=0),
-    )
-    st.plotly_chart(fig, width="stretch")
+    fig_dd.update_layout(**_base_layout(160, "DRAWDOWN"))
+    st.plotly_chart(fig_dd, use_container_width=True)
 
-    # ── Equity summary ────────────────────────────────────────────────────────
-    max_dd     = df_sorted["drawdown"].min()
-    max_dd_pct = (max_dd / df_sorted["peak"].max() * 100) if df_sorted["peak"].max() > 0 else 0
-    current_eq = df_sorted["equity_plot"].iloc[-1] if not df_sorted.empty else 0
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    d1, d2, d3 = st.columns(3)
-    with d1: st.metric("Current Equity",   f"${current_eq:,.2f}")
-    with d2: st.metric("Max Drawdown",     f"${max_dd:,.2f}",
-                        delta=f"{max_dd_pct:.2f}%", delta_color="inverse")
-    with d3: st.metric("Net P&L (period)", f"${df_sorted['pnl'].sum():,.2f}")
+    # ── Row 2: entry type breakdown + session heatmap ─────────────────────────
+    col_a, col_b = st.columns(2)
 
-    st.markdown("---")
+    with col_a:
+        st.markdown("### ENTRY TYPE BREAKDOWN")
+        if "entry_reason" in df.columns or "exit_reason" in df.columns:
+            # Use entry_reason from analysis_logs if we had it; use exit_reason as proxy
+            entry_col = "entry_reason" if "entry_reason" in df.columns else "exit_reason"
+            type_stats = (
+                df.groupby(entry_col)
+                  .agg(count=("pnl", "count"), total_pnl=("pnl", "sum"),
+                       win_rate=("pnl", lambda x: (x > 0).mean() * 100))
+                  .reset_index()
+                  .sort_values("total_pnl", ascending=False)
+            )
+            fig_et = go.Figure()
+            colors = [CHART_COLORS["profit"] if p >= 0 else CHART_COLORS["loss"]
+                      for p in type_stats["total_pnl"]]
+            fig_et.add_trace(go.Bar(
+                x=type_stats[entry_col],
+                y=type_stats["total_pnl"],
+                marker_color=colors,
+                text=[f"${v:,.0f}" for v in type_stats["total_pnl"]],
+                textposition="outside",
+                textfont=dict(family="IBM Plex Mono", size=10),
+                hovertemplate="<b>%{x}</b><br>P&L: $%{y:,.2f}<extra></extra>",
+            ))
+            fig_et.update_layout(**_base_layout(260, "P&L BY EXIT TYPE"))
+            st.plotly_chart(fig_et, use_container_width=True)
+        else:
+            st.info("Entry type data not available.")
 
-    # ── Summary stats ─────────────────────────────────────────────────────────
-    st.subheader("Summary Statistics")
-    wins   = df[df["pnl"] > 0]["pnl"]
-    losses = df[df["pnl"] < 0]["pnl"]
-    n      = len(df)
+    with col_b:
+        st.markdown("### TRADE HOUR DISTRIBUTION (UTC)")
+        if df_sorted["entry_time"].notna().any():
+            df_sorted["entry_hour"] = df_sorted["entry_time"].dt.hour
+            hour_stats = (
+                df_sorted.groupby("entry_hour")
+                         .agg(count=("pnl", "count"),
+                              total_pnl=("pnl", "sum"))
+                         .reindex(range(24), fill_value=0)
+                         .reset_index()
+            )
+            # Colour by session
+            def _session_color(h):
+                if 0 <= h < 7:   return "#334155"
+                elif 7 <= h < 12: return "#1d4ed8"
+                elif 12 <= h < 20:return "#7c3aed"
+                return "#44403c"
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("Total Trades", n)
-        st.metric("Win Rate", f"{len(wins)/n*100:.1f}%" if n else "—")
-    with c2:
-        st.metric("Net P&L",   f"${df['pnl'].sum():,.2f}")
-        st.metric("Avg Trade", f"${df['pnl'].mean():,.2f}")
-    with c3:
-        st.metric("Best Trade",  f"${df['pnl'].max():,.2f}")
-        st.metric("Worst Trade", f"${df['pnl'].min():,.2f}")
-    with c4:
-        st.metric("Avg Win",  f"${wins.mean():,.2f}"  if not wins.empty  else "—")
-        st.metric("Avg Loss", f"${losses.mean():,.2f}" if not losses.empty else "—")
+            fig_hr = go.Figure()
+            fig_hr.add_trace(go.Bar(
+                x=hour_stats["entry_hour"],
+                y=hour_stats["count"],
+                marker_color=[_session_color(h) for h in hour_stats["entry_hour"]],
+                hovertemplate="Hour %{x}:00 UTC<br>Trades: %{y}<extra></extra>",
+            ))
+            fig_hr.update_layout(**_base_layout(260, "TRADES BY HOUR (UTC)"))
+            fig_hr.update_layout(xaxis=dict(
+                tickvals=list(range(0, 24, 3)),
+                ticktext=[f"{h:02d}:00" for h in range(0, 24, 3)],
+            ))
+            st.plotly_chart(fig_hr, use_container_width=True)
+        else:
+            st.info("Entry time data not available.")
 
-    st.markdown("---")
+    st.markdown("<hr>", unsafe_allow_html=True)
 
-    # ── Per-symbol + distribution ─────────────────────────────────────────────
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("By Symbol")
-        if "symbol" in df.columns:
-            sym_stats = df.groupby("symbol").agg(
-                trades    = ("pnl", "count"),
-                total_pnl = ("pnl", "sum"),
-                avg_rr    = ("realized_rr", "mean"),
-            ).round(2)
-            st.dataframe(sym_stats, width="stretch")
-    with col2:
-        st.subheader("Win / Loss Distribution")
-        fig2 = go.Figure()
-        if not wins.empty:
-            fig2.add_trace(go.Histogram(x=wins,   name="Wins",   marker_color="#00cc44", opacity=0.7))
-        if not losses.empty:
-            fig2.add_trace(go.Histogram(x=losses, name="Losses", marker_color="#ff4444", opacity=0.7))
-        fig2.update_layout(barmode="overlay", height=280,
-                           xaxis_title="P&L ($)", yaxis_title="Count")
-        st.plotly_chart(fig2, width="stretch")
+    # ── Row 3: R:R histogram + win streak ─────────────────────────────────────
+    col_c, col_d = st.columns(2)
 
-    # ── Time-based ────────────────────────────────────────────────────────────
-    st.subheader("Time-Based Analysis")
-    df_t = df.dropna(subset=["entry_time"]).copy()
-    df_t["hour"]        = df_t["entry_time"].dt.hour
-    df_t["day_of_week"] = df_t["entry_time"].dt.day_name()
+    with col_c:
+        st.markdown("### R:R DISTRIBUTION")
+        rr_data = df_sorted["realized_rr"].dropna()
+        if len(rr_data) > 2:
+            fig_rr = go.Figure()
+            fig_rr.add_trace(go.Histogram(
+                x=rr_data,
+                nbinsx=20,
+                marker_color=CHART_COLORS["line"],
+                opacity=0.8,
+                hovertemplate="R:R: %{x:.1f}<br>Count: %{y}<extra></extra>",
+            ))
+            fig_rr.add_vline(x=1.0, line_dash="dash", line_color="#6b7280",
+                             annotation_text="1R", annotation_font_size=10)
+            avg_rr = rr_data.mean()
+            fig_rr.add_vline(x=avg_rr, line_dash="dash", line_color=CHART_COLORS["profit"],
+                             annotation_text=f"avg {avg_rr:.2f}R",
+                             annotation_font_size=10)
+            fig_rr.update_layout(**_base_layout(260, "R:R DISTRIBUTION"))
+            st.plotly_chart(fig_rr, use_container_width=True)
+        else:
+            st.info("Need more trades for R:R distribution.")
 
-    if not df_t.empty:
-        col1, col2 = st.columns(2)
-        with col1:
-            hour_pnl = df_t.groupby("hour")["pnl"].sum()
-            fig3 = px.bar(x=hour_pnl.index, y=hour_pnl.values,
-                          labels={"x": "Hour (UTC)", "y": "P&L ($)"},
-                          title="P&L by Hour",
-                          color=hour_pnl.values,
-                          color_continuous_scale=["red", "yellow", "green"])
-            st.plotly_chart(fig3, width="stretch")
-        with col2:
-            day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-            day_pnl   = df_t.groupby("day_of_week")["pnl"].sum()
-            day_pnl   = day_pnl.reindex([d for d in day_order if d in day_pnl.index])
-            fig4 = px.bar(x=day_pnl.index, y=day_pnl.values,
-                          labels={"x": "Day", "y": "P&L ($)"},
-                          title="P&L by Day of Week",
-                          color=day_pnl.values,
-                          color_continuous_scale=["red", "yellow", "green"])
-            st.plotly_chart(fig4, width="stretch")
+    with col_d:
+        st.markdown("### CUMULATIVE P&L WATERFALL")
+        if len(df_sorted) > 1:
+            fig_wf = go.Figure()
+            colors_wf = [CHART_COLORS["profit"] if p >= 0 else CHART_COLORS["loss"]
+                         for p in df_sorted["pnl"]]
+            fig_wf.add_trace(go.Bar(
+                x=list(range(1, len(df_sorted) + 1)),
+                y=df_sorted["pnl"],
+                marker_color=colors_wf,
+                opacity=0.85,
+                hovertemplate="Trade %{x}<br>P&L: $%{y:,.2f}<extra></extra>",
+            ))
+            fig_wf.update_layout(**_base_layout(260, "P&L PER TRADE"))
+            fig_wf.add_hline(y=0, line_color="#374151", line_width=1)
+            st.plotly_chart(fig_wf, use_container_width=True)
+        else:
+            st.info("Need more trades for waterfall chart.")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    # ── Symbol breakdown table ─────────────────────────────────────────────────
+    st.markdown("### SYMBOL BREAKDOWN")
+    if "symbol" in df.columns:
+        sym_stats = (
+            df.groupby("symbol")
+              .agg(
+                  trades    = ("pnl", "count"),
+                  total_pnl = ("pnl", "sum"),
+                  avg_pnl   = ("pnl", "mean"),
+                  win_rate  = ("pnl", lambda x: f"{(x > 0).mean()*100:.1f}%"),
+                  avg_rr    = ("realized_rr", "mean"),
+              )
+              .reset_index()
+              .sort_values("total_pnl", ascending=False)
+        )
+        sym_stats["total_pnl"] = sym_stats["total_pnl"].apply(lambda x: f"${x:,.2f}")
+        sym_stats["avg_pnl"]   = sym_stats["avg_pnl"].apply(lambda x: f"${x:,.2f}")
+        sym_stats["avg_rr"]    = sym_stats["avg_rr"].apply(lambda x: f"{x:.2f}R")
+        st.dataframe(sym_stats, use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — CONFIGURATION
+# TAB 5 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-def show_configuration_tab(config: dict):
-    st.header("⚙️ System Configuration")
-    st.info("Changes write to config/config.yaml. **Restart main.py to apply.**")
+def show_configuration_tab(config):
+    st.header("⚙️ Configuration")
 
-    rm  = config.get("risk_management", {})
-    gl  = rm.get("global_limits", {})
-    sl  = rm.get("stop_loss", {})
-    tr  = rm.get("trailing_stop", {})
-    stg = config.get("strategy", {})
+    rm   = config.get("risk_management", {})
+    gl   = rm.get("global_limits", {})
+    sl   = rm.get("stop_loss", {})
+    tr   = rm.get("trailing_stop", {})
+    stg  = config.get("strategy", {})
+    sess = stg.get("session_atr_multipliers", {})
 
     with st.form("config_form"):
-        st.subheader("⚠️ Risk Management")
-        c1, c2 = st.columns(2)
-        with c1:
-            max_risk   = st.number_input("Max Risk Per Trade (%)", 0.1, 5.0, step=0.1,
-                value=float(clamp(rm.get("max_risk_percent_per_trade", 1.0), 0.1, 5.0)))
-            max_dd_pct = st.number_input("Max Daily Drawdown (%)", 1.0, 20.0, step=0.5,
-                value=float(clamp(gl.get("daily_max_drawdown_percent", 5.0), 1.0, 20.0)))
-        with c2:
-            max_conc = st.number_input("Max Concurrent Trades", 1, 20, step=1,
-                value=int(clamp(gl.get("max_concurrent_trades", 3), 1, 20)))
-            max_day  = st.number_input("Max Trades Per Day", 1, 999, step=1,
-                value=int(clamp(gl.get("max_trades_per_day", 10), 1, 999)))
-
-        st.subheader("🎯 Strategy Parameters")
-        c1, c2 = st.columns(2)
-        with c1:
-            atr_mult   = st.number_input("ATR Multiplier (SL)", 0.5, 10.0, step=0.1,
+        st.subheader("Risk Management")
+        r1, r2, r3 = st.columns(3)
+        with r1:
+            max_risk  = st.number_input("Max Risk % / Trade", 0.01, 10.0, step=0.01,
+                value=float(clamp(rm.get("max_risk_percent_per_trade", 1.0), 0.01, 10.0)))
+            atr_mult  = st.number_input("ATR Multiplier (SL)", 0.5, 10.0, step=0.1,
                 value=float(clamp(sl.get("atr_multiplier", 2.0), 0.5, 10.0)))
-            confluence = st.number_input("Confluence Required", 1, 5, step=1,
-                value=int(clamp(stg.get("confluence_required", 2), 1, 5)))
-        with c2:
-            trail_rr  = st.number_input("Trailing Activation R:R", 0.1, 5.0, step=0.1,
+        with r2:
+            max_dd_pct = st.number_input("Daily Max DD %", 0.1, 50.0, step=0.1,
+                value=float(clamp(gl.get("daily_max_drawdown_percent", 5.0), 0.1, 50.0)))
+            max_conc   = st.number_input("Max Concurrent Trades", 1, 20, step=1,
+                value=int(clamp(gl.get("max_concurrent_trades", 3), 1, 20)))
+        with r3:
+            max_day    = st.number_input("Max Trades / Day", 1, 100, step=1,
+                value=int(clamp(gl.get("max_trades_per_day", 10), 1, 100)))
+            trail_rr   = st.number_input("Trailing Activation R:R", 0.1, 5.0, step=0.1,
                 value=float(clamp(tr.get("activation_rr", 1.0), 0.1, 5.0)))
-            sl_methods = ["conservative", "atr", "structure"]
-            cur_method = sl.get("method", "conservative")
-            sl_method  = st.selectbox("Stop Loss Method", sl_methods,
-                index=sl_methods.index(cur_method) if cur_method in sl_methods else 0)
 
-        st.subheader("⏱️ Cooldown Settings")
+        sl_methods = ["conservative", "atr", "structure"]
+        cur_method = sl.get("method", "conservative")
+        sl_method  = st.selectbox("Stop Loss Method", sl_methods,
+            index=sl_methods.index(cur_method) if cur_method in sl_methods else 0)
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.subheader("Session ATR Multipliers")
+        s1, s2, s3, s4 = st.columns(4)
+        with s1: asian_m  = st.number_input("Asian (00-07 UTC)",   0.5, 5.0, step=0.1,
+                                value=float(clamp(sess.get("asian",   1.5), 0.5, 5.0)))
+        with s2: london_m = st.number_input("London (07-12 UTC)",  0.5, 5.0, step=0.1,
+                                value=float(clamp(sess.get("london",  2.5), 0.5, 5.0)))
+        with s3: ny_m     = st.number_input("New York (12-20 UTC)",0.5, 5.0, step=0.1,
+                                value=float(clamp(sess.get("ny",      2.5), 0.5, 5.0)))
+        with s4: ov_m     = st.number_input("Overlap (20-24 UTC)", 0.5, 5.0, step=0.1,
+                                value=float(clamp(sess.get("overlap",  2.0), 0.5, 5.0)))
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.subheader("Confluence Threshold")
+        cc1, cc2 = st.columns(2)
+        with cc1: conf_volatile = st.number_input("Volatile symbols (XAUUSD, BTC, NAS)", 1, 20, step=1,
+                                      value=int(clamp(stg.get("confluence_required", 7), 1, 20)))
+        with cc2: conf_calm     = st.number_input("Calm symbols (EURUSD, GBPUSD, XAGUSD)", 1, 20, step=1,
+                                      value=int(clamp(stg.get("confluence_threshold_calm", 5), 1, 20)))
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+        st.subheader("Cooldown After Losses")
+        cd1, cd2 = st.columns(2)
         cooldown = gl.get("cooldown_after_losses", {})
-        c1, c2 = st.columns(2)
-        with c1:
-            cd_losses = st.number_input("Losses Before Cooldown", 1, 10, step=1,
-                value=int(clamp(cooldown.get("consecutive_losses", 3), 1, 10)))
-        with c2:
-            cd_secs = st.number_input("Cooldown Duration (seconds)", 60, 86400, step=60,
-                value=int(clamp(cooldown.get("cooldown_seconds", 3600), 60, 86400)))
+        with cd1: cd_losses = st.number_input("Consecutive Losses Trigger", 1, 10, step=1,
+                                  value=int(clamp(cooldown.get("consecutive_losses", 3), 1, 10)))
+        with cd2: cd_secs   = st.number_input("Cooldown Duration (seconds)", 60, 86400, step=60,
+                                  value=int(clamp(cooldown.get("cooldown_seconds", 3600), 60, 86400)))
 
         submitted = st.form_submit_button("💾 Save Configuration", type="primary")
 
@@ -720,7 +1142,6 @@ def show_configuration_tab(config: dict):
         config["risk_management"].setdefault("stop_loss", {}).update(
             {"atr_multiplier": atr_mult, "method": sl_method})
         config["risk_management"].setdefault("trailing_stop", {})["activation_rr"] = trail_rr
-        config.setdefault("strategy", {})["confluence_required"] = confluence
         gl_block = config["risk_management"].setdefault("global_limits", {})
         gl_block.update({
             "daily_max_drawdown_percent": max_dd_pct,
@@ -731,20 +1152,88 @@ def show_configuration_tab(config: dict):
             "consecutive_losses": cd_losses,
             "cooldown_seconds": cd_secs,
         })
+        config.setdefault("strategy", {})["confluence_required"]        = conf_volatile
+        config["strategy"]["confluence_threshold_calm"]                  = conf_calm
+        config["strategy"].setdefault("session_atr_multipliers", {}).update({
+            "asian": asian_m, "london": london_m, "ny": ny_m, "overlap": ov_m
+        })
         if save_config(config):
-            st.success("✅ Configuration saved. Restart main.py to apply.")
+            st.success("✅ Saved. Restart main.py to apply.")
             st.cache_data.clear()
 
-    st.markdown("---")
-    st.subheader("📚 Parameter Versions")
-    db = init_database()
+    # ── Symbols ────────────────────────────────────────────────────────────────
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.subheader("Symbol Configuration")
+    symbols = config.get("symbols", {})
+    if symbols:
+        rows = []
+        for sym, cfg in symbols.items():
+            rows.append({
+                "Symbol":    sym,
+                "Enabled":   "✅" if cfg.get("enabled") else "❌",
+                "Platform":  cfg.get("platform", "—"),
+                "Primary TF": cfg.get("primary_timeframe", "—"),
+                "Entry TF":  cfg.get("entry_timeframe", "—"),
+                "Confluence": cfg.get("confluence_threshold", "default"),
+                "Timeframes": ", ".join(cfg.get("timeframes", [])),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.caption("Edit config.yaml directly to enable/disable symbols or change timeframes.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — LEARNING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_learning_tab(db):
+    st.header("🧠 Learning Engine")
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("30-Day Performance")
+        try:
+            stats = db.get_trade_statistics(days=30)
+            st.metric("Total Trades", stats.get("total_trades", 0))
+            st.metric("Win Rate",     f"{safe_float(stats.get('win_rate'))*100:.1f}%")
+            st.metric("Avg P&L",      f"${safe_float(stats.get('avg_pnl')):.2f}")
+            st.metric("Total P&L",    f"${safe_float(stats.get('total_pnl')):.2f}")
+            st.metric("Avg R:R",      f"{safe_float(stats.get('avg_rr')):.2f}R")
+            st.metric("Avg Duration", f"{safe_float(stats.get('avg_duration_minutes')):.0f} min")
+        except Exception as e:
+            st.error(f"Stats unavailable: {e}")
+
+    with col2:
+        st.subheader("Optimizer Controls")
+        st.info("The learning engine analyses closed trades and suggests better parameters.")
+        try:
+            from learning.learner import StrategyLearner as Learner
+            cfg     = load_config()
+            learner = Learner(db, cfg)
+            ca, cb  = st.columns(2)
+            with ca:
+                if st.button("🔍 Grid Search"):
+                    with st.spinner("Running..."):
+                        result = learner.run_grid_search()
+                    st.success(result.get("message", "Done"))
+                    st.cache_data.clear()
+            with cb:
+                if st.button("🎰 RL Bandit"):
+                    with st.spinner("Running..."):
+                        result = learner.run_rl_bandit()
+                    st.success(result.get("message", "Done"))
+                    st.cache_data.clear()
+        except Exception as e:
+            st.warning(f"Learner unavailable: {e}")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.subheader("Parameter Versions")
     versions = load_parameter_versions(db)
     if versions:
         rows = []
         for v in versions:
-            metrics = {}
+            m = {}
             try:
-                metrics = json.loads(v.get("backtest_metrics") or "{}")
+                m = json.loads(v.get("backtest_metrics") or "{}")
             except Exception:
                 pass
             rows.append({
@@ -753,72 +1242,12 @@ def show_configuration_tab(config: dict):
                 "Created":    str(v.get("created_at",""))[:16],
                 "Source":     v.get("source"),
                 "Status":     v.get("status"),
-                "Win Rate":   f"{safe_float(metrics.get('win_rate'))*100:.1f}%"
-                              if metrics.get("win_rate") else "—",
-                "Expectancy": f"{safe_float(metrics.get('expectancy')):.2f}"
-                              if metrics.get("expectancy") else "—",
+                "Win Rate":   f"{safe_float(m.get('win_rate'))*100:.1f}%" if m.get("win_rate") else "—",
+                "Expectancy": f"${safe_float(m.get('expectancy')):.2f}" if m.get("expectancy") else "—",
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("No parameter versions yet.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — LEARNING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def show_learning_tab(db):
-    st.header("🧠 Learning Engine")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("30-Day Performance Metrics")
-        try:
-            stats = db.get_trade_statistics(days=30)
-            st.metric("Total Trades", stats.get("total_trades", 0))
-            st.metric("Win Rate",     f"{safe_float(stats.get('win_rate'))*100:.1f}%")
-            st.metric("Avg P&L",      f"${safe_float(stats.get('avg_pnl')):.2f}")
-            st.metric("Total P&L",    f"${safe_float(stats.get('total_pnl')):.2f}")
-            st.metric("Avg R:R",      f"{safe_float(stats.get('avg_rr')):.2f}")
-            st.metric("Avg Duration", f"{safe_float(stats.get('avg_duration_minutes')):.0f} min")
-        except Exception as e:
-            st.error(f"Error: {e}")
-
-    with col2:
-        st.subheader("Optimization Controls")
-        st.info("The learning engine analyses closed trades and suggests better parameters.")
-        try:
-            from learning.learner import StrategyLearner as Learner
-            cfg     = load_config()
-            learner = Learner(db, cfg)
-            ca, cb  = st.columns(2)
-            with ca:
-                if st.button("🔍 Run Grid Search"):
-                    with st.spinner("Running..."):
-                        result = learner.run_grid_search()
-                    st.success(result.get("message", "Done"))
-                    st.cache_data.clear()
-            with cb:
-                if st.button("🎰 Run RL Bandit"):
-                    with st.spinner("Running..."):
-                        result = learner.run_rl_bandit()
-                    st.success(result.get("message", "Done"))
-                    st.cache_data.clear()
-        except Exception as e:
-            st.warning(f"Learner unavailable: {e}")
-
-    st.markdown("---")
-    st.subheader("Recent Learning Runs")
-    try:
-        cur = db.conn.cursor()
-        cur.execute("SELECT * FROM learning_runs ORDER BY started_at DESC LIMIT 10")
-        runs = [dict(r) for r in cur.fetchall()]
-        if runs:
-            st.dataframe(pd.DataFrame(runs), width="stretch")
-        else:
-            st.info("No learning runs recorded yet.")
-    except Exception as e:
-        st.info(f"Learning runs table not available: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -829,94 +1258,84 @@ def main():
     db     = init_database()
     config = load_config()
 
-    # One-time equity backfill per browser session
     if not st.session_state.get("equity_backfill_done", False):
         backfill_equity_once("data/trading.db")
         st.session_state["equity_backfill_done"] = True
 
-    # ── Sidebar: controls + time filter ───────────────────────────────────────
+    # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.title("⚙️ Control Panel")
-        st.markdown("---")
+        st.title("⚡ TERMINAL")
+        st.markdown("<hr>", unsafe_allow_html=True)
 
         current_mode = config.get("general", {}).get("mode", "demo")
         is_live      = current_mode == "live"
-        badge = ('<span class="mode-live">⚡ LIVE TRADING</span>' if is_live
-                 else '<span class="mode-demo">🧪 DEMO MODE</span>')
+        badge = (f'<span class="badge-live">● LIVE</span>' if is_live
+                 else f'<span class="badge-demo">● DEMO</span>')
         st.markdown(badge, unsafe_allow_html=True)
 
+        # Session indicator
+        session_name, session_cls = get_current_session()
+        st.markdown(
+            f"<br><span class='session-badge {session_cls}'>{session_name} SESSION</span>"
+            f"<br><span style='color:#6b7280;font-size:11px;font-family:\"IBM Plex Mono\"'>"
+            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</span>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+
         new_mode = st.radio("Mode", ["demo", "live"], index=1 if is_live else 0,
-                            horizontal=True,
-                            help="Writes to config.yaml — restart main.py to apply.")
+                            horizontal=True)
         if new_mode != current_mode:
             if new_mode == "live":
                 if st.checkbox("⚠️ Confirm LIVE trading", key="live_confirm"):
                     config.setdefault("general", {})["mode"] = "live"
                     if save_config(config):
                         st.success("Set to LIVE. Restart main.py.")
-                        st.cache_data.clear()
+                    st.cache_data.clear()
             else:
                 config.setdefault("general", {})["mode"] = "demo"
                 if save_config(config):
-                    st.success("Set to DEMO. Restart main.py.")
-                    st.cache_data.clear()
+                    st.success("Set to DEMO.")
+                st.cache_data.clear()
 
-        st.markdown("---")
-        st.markdown("**Quick Actions**")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("⏸️ Pause"):
-                (CONTROL_DIR / "pause.flag").touch()
-                st.warning("Paused.")
-        with c2:
-            if st.button("▶️ Resume"):
-                flag = CONTROL_DIR / "pause.flag"
-                if flag.exists():
-                    flag.unlink()
-                st.success("Resumed.")
-        if st.button("🚨 Emergency Close All", type="primary"):
-            (CONTROL_DIR / "emergency_close.flag").touch()
-            st.error("Emergency close flag set!")
-
-        st.markdown("---")
+        st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("**Time Filter**")
-        time_range = st.selectbox(
-            "Period",
-            ["Today", "Last 7 Days", "Last 30 Days", "All Time", "Custom"],
-            index=0, label_visibility="collapsed",
-        )
+        time_range = st.selectbox("Period", ["Today", "Last 7 Days", "Last 30 Days",
+                                              "All Time", "Custom"],
+                                   index=0, label_visibility="collapsed")
         custom_start = custom_end = None
         if time_range == "Custom":
             custom_start = st.date_input("From", value=date.today() - timedelta(days=7))
             custom_end   = st.date_input("To",   value=date.today())
-            if custom_start > custom_end:
-                st.error("Start must be before end.")
 
         start_dt, end_dt = get_time_bounds(time_range, custom_start, custom_end)
-        st.caption(
-            f"{start_dt.strftime('%Y-%m-%d %H:%M')} →\n"
-            f"{end_dt.strftime('%Y-%m-%d %H:%M')} UTC"
-        )
+        st.caption(f"{start_dt.strftime('%Y-%m-%d %H:%M')} →\n"
+                   f"{end_dt.strftime('%Y-%m-%d %H:%M')} UTC")
 
-        st.markdown("---")
-        if st.checkbox("Auto-refresh (30s)", value=False):
-            import time as _t; _t.sleep(0.5)
+        st.markdown("<hr>", unsafe_allow_html=True)
+        if st.checkbox("Auto-refresh (30s)"):
+            import time as _t
+            _t.sleep(0.5)
             st.rerun()
 
     # ── Load data ─────────────────────────────────────────────────────────────
-    all_trades  = load_all_trades(db)
-    open_trades = load_open_trades(db)
-    filtered    = filter_trades_by_time(all_trades, start_dt, end_dt)
-    closed_filt = [t for t in filtered if t.get("status") == "closed"]
+    all_trades     = load_all_trades(db)
+    open_trades    = load_open_trades(db)
+    pending_orders = load_pending_limit_orders(db)
+    filtered       = filter_trades_by_time(all_trades, start_dt, end_dt)
+    closed_filt    = [t for t in filtered if t.get("status") == "closed"]
 
-    # ── Top nav bar ───────────────────────────────────────────────────────────
+    # ── Nav ───────────────────────────────────────────────────────────────────
     active_page = render_top_nav()
 
     # ── Route ─────────────────────────────────────────────────────────────────
     if active_page == "📊 Overview":
-        show_overview_tab(db, open_trades, closed_filt, time_range, start_dt, end_dt)
+        show_overview_tab(db, open_trades, pending_orders, closed_filt, time_range)
     elif active_page == "📈 Trades":
         show_trades_tab(db, closed_filt, open_trades)
+    elif active_page == "⏳ Orders":
+        show_orders_tab(db, pending_orders)
     elif active_page == "📉 Analytics":
         show_analytics_tab(closed_filt)
     elif active_page == "⚙️ Config":

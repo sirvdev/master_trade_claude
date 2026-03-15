@@ -22,6 +22,7 @@ class StopManager:
         Args:
             config: Risk management configuration
         """
+        self.full_config = config
         self.config = config.get('risk_management', {})
         self.sl_config = self.config.get('stop_loss', {})
         self.tp_config = self.config.get('take_profit', {})
@@ -270,7 +271,7 @@ class StopManager:
         they can be tuned without code changes.
         """
         sess_cfg = (
-            self.config
+            self.full_config
             .get('strategy', {})
             .get('session_atr_multipliers', {})
         )
