@@ -14,6 +14,7 @@ symbols:
     - 5m
     primary_timeframe: 15m
     entry_timeframe: 5m
+    confluence_threshold: 7
   XAU/USD:
     enabled: false
     platform: mt5
@@ -24,6 +25,7 @@ symbols:
     - 1m
     primary_timeframe: 15m
     entry_timeframe: 1m
+    confluence_threshold: 7
   XAG/USD:
     enabled: false
     platform: mt5
@@ -34,6 +36,18 @@ symbols:
     - 15m
     primary_timeframe: 4H
     entry_timeframe: 15m
+    confluence_threshold: 5
+  EUR/USD:
+    enabled: false
+    platform: mt5
+    mode: live
+    timeframes:
+    - 1D
+    - 4H
+    - 15m
+    primary_timeframe: 4H
+    entry_timeframe: 15m
+    confluence_threshold: 5
 indicators:
   ema:
     periods:
@@ -84,13 +98,50 @@ indicators:
     auto_detect_swing: true
     lookback_bars: 50
 strategy:
+  # Entry types — evaluated in order, first passing type wins.
+  # Each type has its own order placement logic (market vs limit).
   entry_types:
-  - breakout_retest
-  - pullback_to_sr
-  - momentum_breakout
-  - fibonacci_retracement
-  - fair_value_gap
-  confluence_required: 2
+    - breakout_retest        # Market order — retest already confirmed at bar close
+    - ema_stack_pullback     # Limit order  — enter at EMA20 level
+    - pullback_to_sr         # Limit order  — enter at S/R zone
+    - bb_squeeze_breakout    # Market order — volatility expansion
+    - macd_zero_cross        # Market order — momentum shift confirmed
+    - momentum_breakout      # Market order — always immediate
+    - rsi_divergence         # Limit order  — reversal at structure
+ 
+  # Score threshold for volatile symbols (XAUUSD, BTC, NAS100).
+  # Override per-symbol with confluence_threshold in the symbol block.
+  confluence_required: 7
+ 
+  # Score threshold for calmer instruments (EURUSD, GBPUSD, XAGUSD).
+  confluence_threshold_calm: 5
+ 
+  # Breakout retest specific params
+  breakout_retest:
+    lookback_bars: 5                  # How many prior bars to scan for the broken level
+    max_distance_atr: 0.5             # Max distance from level in ATR multiples
+    require_rejection: true           # Close must be back above (long) / below (short) level
+ 
+  # Session-aware ATR multiplier for stop sizing.
+  # Prevents Asian-range stops from being blown in London/NY.
+  session_atr_multipliers:
+    asian:   1.5    # UTC 00:00–07:00  — quiet, tight range
+    london:  2.5    # UTC 07:00–12:00  — high volatility
+    ny:      2.5    # UTC 12:00–20:00  — high volatility
+    overlap: 2.0    # UTC 20:00–24:00  — winding down
+ 
+  # Limit order expiry — how many primary_timeframe bars after the
+  # NEXT bar close before the order is considered stale and cancelled.
+  # The 60-second minimum floor prevents any cancellation within 1 min of placement.
+  limit_order_expiry:
+    ema_stack_pullback_bars:           2   # EMA moves, stale quickly
+    pullback_to_sr_bars:               5   # S/R is sticky
+    rsi_divergence_bars:               3   # Divergence window is medium
+    bb_squeeze_breakout_bars:          1   # Must break out immediately
+    price_invalidation_atr_multiplier: 1.0 # Cancel if price moves 1×ATR past entry level
+    min_cancel_floor_seconds:         60   # Never cancel within 60s of placement
+ 
+  # Existing filters — unchanged
   filters:
     respect_higher_tf_bias: true
     allow_override: false
@@ -99,35 +150,12 @@ strategy:
     news_blackout:
       enabled: false
       windows:
-      - start: '13:30'
-        end: '14:30'
-        days:
-        - 1
-        - 2
-        - 3
-        - 4
-        - 5
-      - start: 07:30
-        end: 08:30
-        days:
-        - 1
-        - 2
-        - 3
-        - 4
-        - 5
-  candle_patterns:
-    enabled: true
-    patterns:
-    - engulfing
-    - pin_bar
-    - doji
-    - hammer
-    - shooting_star
-  price_action:
-    detect_structure: true
-    hhhl_for_uptrend: true
-    lhlh_for_downtrend: true
-    structure_break_confirmation: true
+        - start: '13:30'
+          end: '14:30'
+          days: [1, 2, 3, 4, 5]
+        - start: '07:30'
+          end: '08:30'
+          days: [1, 2, 3]
 risk_management:
   max_risk_percent_per_trade: 0.2
   use_dynamic_sizing: true

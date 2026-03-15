@@ -90,44 +90,48 @@ class StopManager:
         direction: str,
         atr: float,
         swing_high: Optional[float],
-        swing_low: Optional[float]
+        swing_low: Optional[float],
     ) -> float:
-        """Calculate stop loss using configured method."""
-        method = self.sl_config.get('method', 'conservative')
-        atr_multiplier = self.sl_config.get('atr_multiplier', 2.0)
-        structure_buffer_pips = self.sl_config.get('structure_buffer_pips', 2)
-        
-        # ATR-based stop
+        """
+        Calculate stop loss using configured method with session-aware ATR.
+        The base atr_multiplier from config is COMBINED with the session
+        multiplier: effective_mult = config_mult × session_mult.
+        """
+        method                = self.sl_config.get('method', 'conservative')
+        base_multiplier       = float(self.sl_config.get('atr_multiplier', 2.0))
+        structure_buffer_pips = int(self.sl_config.get('structure_buffer_pips', 2))
+ 
+        # Session adjustment — widen stops during high-volatility sessions
+        session_mult      = self._get_session_atr_multiplier()
+        effective_mult    = base_multiplier * session_mult
+ 
+        # ATR-based stop with session-adjusted multiplier
         if direction == 'long':
-            atr_stop = entry_price - (atr * atr_multiplier)
+            atr_stop = entry_price - (atr * effective_mult)
         else:
-            atr_stop = entry_price + (atr * atr_multiplier)
-            
-        # Structure-based stop
+            atr_stop = entry_price + (atr * effective_mult)
+ 
+        # Structure-based stop (unchanged logic)
         structure_stop = None
         if direction == 'long' and swing_low is not None:
-            # Place stop below swing low with buffer
-            pip_value = entry_price * 0.0001  # Approximate pip value
+            pip_value      = entry_price * 0.0001
             structure_stop = swing_low - (structure_buffer_pips * pip_value)
         elif direction == 'short' and swing_high is not None:
-            pip_value = entry_price * 0.0001
+            pip_value      = entry_price * 0.0001
             structure_stop = swing_high + (structure_buffer_pips * pip_value)
-            
-        # Choose stop based on method
+ 
         if method == 'atr':
-            stop_loss = atr_stop
+            return atr_stop
         elif method == 'structure' and structure_stop is not None:
-            stop_loss = structure_stop
-        else:  # conservative - use wider of the two
+            return structure_stop
+        else:  # conservative — use wider of the two
             if structure_stop is None:
-                stop_loss = atr_stop
+                return atr_stop
+            if direction == 'long':
+                return min(atr_stop, structure_stop)
             else:
-                if direction == 'long':
-                    stop_loss = min(atr_stop, structure_stop)  # Wider stop
-                else:
-                    stop_loss = max(atr_stop, structure_stop)
-                    
-        return stop_loss
+                return max(atr_stop, structure_stop)
+
         
     def _calculate_take_profit_levels(
         self,
@@ -250,6 +254,36 @@ class StopManager:
             'trigger_reason': f'Trailing activated at {current_rr:.2f}R',
             'method': trailing_method
         }
+    
+    def _get_session_atr_multiplier(self) -> float:
+        """
+        Return ATR multiplier based on current UTC trading session.
+        Prevents Asian-range stops being blown out in London/NY.
+ 
+        Sessions (UTC):
+          Asian   00:00–07:00 → 1.5×  (quiet, tight range)
+          London  07:00–12:00 → 2.5×  (high volatility)
+          NY      12:00–20:00 → 2.5×  (high volatility)
+          Overlap 20:00–24:00 → 2.0×  (winding down)
+ 
+        Values are read from config strategy.session_atr_multipliers so
+        they can be tuned without code changes.
+        """
+        sess_cfg = (
+            self.config
+            .get('strategy', {})
+            .get('session_atr_multipliers', {})
+        )
+        hour = datetime.utcnow().hour
+ 
+        if 0 <= hour < 7:
+            return float(sess_cfg.get('asian',   1.5))
+        elif 7 <= hour < 12:
+            return float(sess_cfg.get('london',  2.5))
+        elif 12 <= hour < 20:
+            return float(sess_cfg.get('ny',      2.5))
+        else:
+            return float(sess_cfg.get('overlap', 2.0))
     
     def compute_trailing_sl(
         self,

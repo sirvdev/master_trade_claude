@@ -8,11 +8,12 @@ import logging
 import signal
 import sys
 import time as _time
-from datetime import datetime, time
-from pathlib import Path
 import yaml
-from dotenv import load_dotenv
 import os
+import math
+from dotenv import load_dotenv
+from datetime import datetime, timedelta
+from pathlib import Path
 
 # Import all modules
 from logger.db import DatabaseManager
@@ -39,6 +40,63 @@ logging.basicConfig(
     handlers=[_file_handler, _stream_handler]
 )
 logger = logging.getLogger(__name__)
+
+
+# ── Helper functions ───────────────────────────────────────────────────────────────
+
+def _tf_to_seconds(tf: str) -> int:
+    """Convert timeframe string to seconds."""
+    mapping = {
+        '1m': 60,    '5m': 300,   '15m': 900,  '30m': 1800,
+        '1H': 3600,  '4H': 14400, '1D': 86400,
+        # Aliases
+        '1h': 3600,  '4h': 14400, '1d': 86400,
+    }
+    return mapping.get(tf, 900)   # default 15m
+ 
+ 
+def _next_bar_close_utc(tf_secs: int) -> datetime:
+    """
+    Return the UTC datetime of the next bar close for the given timeframe.
+    Aligns to clock boundaries: 15m bars close at :00, :15, :30, :45.
+    """
+    now_ts       = datetime.utcnow().timestamp()
+    next_close_ts = math.ceil(now_ts / tf_secs) * tf_secs
+    return datetime.utcfromtimestamp(next_close_ts)
+ 
+ 
+def _limit_expiry_times(
+    placed_at: datetime,
+    primary_tf: str,
+    entry_type: str,
+    strategy_config: dict,
+) -> tuple:
+    """
+    Calculate (expiry_time, min_cancel_floor) for a limit order.
+ 
+    expiry_time      = next_bar_close_after_placement + (expiry_bars × tf_secs)
+    min_cancel_floor = placed_at + min_cancel_floor_seconds (never cancel prematurely)
+    """
+    tf_secs = _tf_to_seconds(primary_tf)
+    exp_cfg = strategy_config.get('limit_order_expiry', {})
+ 
+    bars_map = {
+        'ema_stack_pullback':  exp_cfg.get('ema_stack_pullback_bars',  2),
+        'pullback_to_sr':      exp_cfg.get('pullback_to_sr_bars',      5),
+        'rsi_divergence':      exp_cfg.get('rsi_divergence_bars',      3),
+        'bb_squeeze_breakout': exp_cfg.get('bb_squeeze_breakout_bars', 1),
+    }
+    expiry_bars = int(bars_map.get(entry_type, 3))
+    floor_secs  = int(exp_cfg.get('min_cancel_floor_seconds', 60))
+ 
+    placed_ts       = placed_at.timestamp()
+    next_bar_close  = math.ceil(placed_ts / tf_secs) * tf_secs
+    expiry_ts       = next_bar_close + expiry_bars * tf_secs
+ 
+    expiry_time      = datetime.utcfromtimestamp(expiry_ts)
+    min_cancel_floor = placed_at + timedelta(seconds=floor_secs)
+ 
+    return expiry_time, min_cancel_floor
 
 
 class TradingSystem:
@@ -566,306 +624,358 @@ class TradingSystem:
 
             
     async def _trading_loop(self):
-        """Main trading loop - WITH POSITION COUNT CHECK."""
-        import time as _time
-        logger.info("Trading loop started")
-        
-        while self.running:
-            loop_start_time = _time.monotonic()
-            try:
-                # ✅ CHECK: Verify we haven't exceeded limits BEFORE analyzing
-                current_positions = len(self.open_positions)
-                max_concurrent = self.config.get('risk_management', {}).get(
-                    'global_limits', {}
-                ).get('max_concurrent_trades', 3)
-                
-                if current_positions >= max_concurrent:
-                    logger.debug(
-                        f"Skipping analysis - at max positions "
-                        f"({current_positions}/{max_concurrent})"
-                    )
-                    await asyncio.sleep(903)
-                    continue
-                
-                # Get enabled symbols — shuffle each cycle so no single symbol
-                import random as _random
-                symbols_config = self.config.get('symbols', {})
-                enabled_symbols = [
-                    (symbol, cfg)
-                    for symbol, cfg in symbols_config.items()
-                    if cfg.get('enabled', False)
-                ]
-                _random.shuffle(enabled_symbols)
-                
-                for symbol, symbol_config in enabled_symbols:
-                    # ── Drawdown hard stop ────────────────────────────────────
-                    if self.halt_new_trades:
-                        logger.info(
-                            "[TRADING] Daily drawdown limit active — "
-                            "skipping all new entries."
-                        )
-                        break
-
-                    # ✅ DOUBLE CHECK before each symbol
-                    if len(self.open_positions) >= max_concurrent:
-                        logger.info(
-                            f"Reached max positions ({max_concurrent}), "
-                            f"stopping new entries this cycle"
-                        )
-                        break
-                    # ── Market hours guard ────────────────────────────────────
-                    if not self.market_hours.is_open(symbol):
-                        logger.debug(
-                            f"[MARKET_HOURS] {symbol} closed — "
-                            f"next open: {self.market_hours.next_open_str(symbol)}"
-                        )
-                        continue
-
-                    # ✅ CHECK: Don't analyze if already have position in this symbol
-                    # Normalize symbols by removing slashes to handle XAU/USD vs XAUUSD format
-                    normalized_symbol = symbol.replace('/', '')
-                    symbol_has_position = any(
-                        pos['symbol'].replace('/', '') == normalized_symbol 
-                        for pos in self.open_positions.values()
-                    )
-                    
-                    if symbol_has_position:
-                        logger.debug(f"Skipping {symbol} - already have open position")
-                        continue
-                    
-                    platform = symbol_config['platform']
-                    timeframes = symbol_config['timeframes']
-                    
-                    # Fetch multi-timeframe data
-                    multi_tf_data = await self.market_client.fetch_multiple_timeframes(
-                        symbol,
-                        platform,
-                        timeframes
-                    )
-                    
-                    if not multi_tf_data:
-                        logger.warning(f"No data fetched for {symbol}")
-                        continue
-                    
-                    # Run strategy analysis
-                    try:
-                        analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
-                        
-                        # Log analysis
-                        try:
-                            analysis_id = self.audit_logger.log_analysis(analysis)
-                            analysis['analysis_id'] = analysis_id
-                        except Exception as e:
-                            logger.error(f"Error logging analysis: {e}", exc_info=True)
-                            analysis['analysis_id'] = None
-                        
-                        # ✅ FINAL CHECK before processing entry
-                        if analysis['entry_signal']:
-                            current_count = len(self.open_positions)
-                            if current_count >= max_concurrent:
-                                logger.warning(
-                                    f"Signal detected but max positions reached "
-                                    f"({current_count}/{max_concurrent}), skipping"
-                                )
-                                continue
-                            
-                            await self._process_entry_signal(
-                                symbol,
-                                symbol_config,
-                                analysis,
-                                multi_tf_data
-                            )
-                        
-                    except Exception as e:
-                        logger.error(f"Error in strategy analysis: {e}", exc_info=True)
-                        continue
-                
-                # ── Sleep with elapsed-time compensation ────────────────────────
-                target_interval = 303  # seconds between analysis cycles
-                elapsed = _time.monotonic() - loop_start_time
-                sleep_time = max(0, target_interval - elapsed)
-                if sleep_time > 0:
-                    await asyncio.sleep(sleep_time)
-                
-            except Exception as e:
-                logger.error(f"Error in trading loop: {e}", exc_info=True)
+        """
+        Spawn one bar-close aligned analysis task per enabled symbol.
+        Each symbol wakes independently at its own primary_timeframe boundary.
+        The outer while-loop monitors the tasks and restarts any that die.
+        """
+        import asyncio as _asyncio
+ 
+        symbols_config = self.config.get('symbols', {})
+        enabled = [
+            (sym, cfg)
+            for sym, cfg in symbols_config.items()
+            if cfg.get('enabled', False)
+        ]
+ 
+        if not enabled:
+            logger.warning("[TRADING] No enabled symbols — trading loop idle.")
+            while self.running:
                 await asyncio.sleep(60)
+            return
+ 
+        sym_names = [s for s, _ in enabled]
+        logger.info(
+            f"[TRADING] Bar-close sync started for {len(enabled)} symbol(s): "
+            f"{', '.join(sym_names)}"
+        )
+ 
+        tasks = {
+            sym: asyncio.create_task(
+                self._symbol_bar_close_loop(sym, cfg),
+                name=f"bar_close_{sym.replace('/', '')}"
+            )
+            for sym, cfg in enabled
+        }
+ 
+        try:
+            while self.running:
+                await asyncio.sleep(15)
+                # Detect and restart dead tasks
+                for sym, cfg in enabled:
+                    task = tasks[sym]
+                    if task.done() and not task.cancelled():
+                        exc = task.exception()
+                        if exc:
+                            logger.error(
+                                f"[TRADING] Task for {sym} crashed: {exc} — restarting",
+                                exc_info=exc,
+                            )
+                        else:
+                            logger.warning(f"[TRADING] Task for {sym} ended — restarting")
+                        tasks[sym] = asyncio.create_task(
+                            self._symbol_bar_close_loop(sym, cfg),
+                            name=f"bar_close_{sym.replace('/', '')}",
+                        )
+        finally:
+            for t in tasks.values():
+                t.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            logger.info("[TRADING] All bar-close tasks stopped.")
+    
+    async def _symbol_bar_close_loop(self, symbol: str, symbol_config: dict):
+        """
+        Per-symbol loop: sleep until the next primary_timeframe bar closes,
+        then run the full analysis and entry cycle for this symbol.
+        3-second post-close buffer lets the broker finalize the bar.
+        """
+        primary_tf  = symbol_config.get('primary_timeframe', '15m')
+        tf_secs     = _tf_to_seconds(primary_tf)
+        buffer_secs = 3    # broker finalization buffer
+ 
+        logger.info(
+            f"[{symbol}] Bar-close loop started "
+            f"(primary_tf={primary_tf}, tf_secs={tf_secs})"
+        )
+ 
+        while self.running:
+            try:
+                # Calculate sleep duration to next bar close
+                next_close   = _next_bar_close_utc(tf_secs)
+                sleep_target = next_close + timedelta(seconds=buffer_secs)
+                wait_secs    = (sleep_target - datetime.utcnow()).total_seconds()
+ 
+                if wait_secs > 0:
+                    await asyncio.sleep(wait_secs)
+ 
+                # ── Guard: global limits before doing any work ────────────────
+                if self.halt_new_trades:
+                    logger.debug(
+                        f"[{symbol}] Daily drawdown halt active — skipping cycle."
+                    )
+                    continue
+ 
+                max_concurrent = (
+                    self.config.get('risk_management', {})
+                               .get('global_limits', {})
+                               .get('max_concurrent_trades', 3)
+                )
+                if len(self.open_positions) >= max_concurrent:
+                    logger.debug(
+                        f"[{symbol}] At max positions "
+                        f"({len(self.open_positions)}/{max_concurrent}) — skipping."
+                    )
+                    continue
+ 
+                if not self.market_hours.is_open(symbol):
+                    logger.debug(
+                        f"[{symbol}] Market closed — "
+                        f"next open: {self.market_hours.next_open_str(symbol)}"
+                    )
+                    continue
+ 
+                # Skip if already holding a position in this symbol
+                norm_sym = symbol.replace('/', '')
+                if any(
+                    p.get('symbol', '').replace('/', '') == norm_sym
+                    for p in self.open_positions.values()
+                ):
+                    logger.debug(f"[{symbol}] Already have open position — skip.")
+                    continue
+ 
+                # ── Run analysis ──────────────────────────────────────────────
+                await self._analyze_symbol(symbol, symbol_config)
+ 
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(
+                    f"[{symbol}] Error in bar-close loop: {e}", exc_info=True
+                )
+                await asyncio.sleep(60)
+ 
+        logger.info(f"[{symbol}] Bar-close loop stopped.")
+
+    async def _analyze_symbol(self, symbol: str, symbol_config: dict):
+        """
+        Fetch multi-timeframe data, run analysis, and fire entry signal
+        if conditions are met. Called after confirmed bar close.
+        """
+        try:
+            platform   = symbol_config.get('platform', 'mt5')
+            timeframes = symbol_config.get('timeframes', [])
+ 
+            multi_tf_data = await self.market_client.fetch_multiple_timeframes(
+                symbol, platform, timeframes
+            )
+            if not multi_tf_data:
+                logger.warning(f"[{symbol}] No data fetched — skipping cycle.")
+                return
+ 
+            analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
+ 
+            try:
+                analysis_id = self.audit_logger.log_analysis(analysis)
+                analysis['analysis_id'] = analysis_id
+            except Exception as e:
+                logger.error(f"Error logging analysis: {e}", exc_info=True)
+                analysis['analysis_id'] = None
+ 
+            if analysis['entry_signal']:
+                # Final position count guard before processing
+                max_concurrent = (
+                    self.config.get('risk_management', {})
+                               .get('global_limits', {})
+                               .get('max_concurrent_trades', 3)
+                )
+                if len(self.open_positions) >= max_concurrent:
+                    logger.warning(
+                        f"[{symbol}] Signal detected but max positions reached "
+                        f"({len(self.open_positions)}/{max_concurrent}) — skipped."
+                    )
+                    return
+ 
+                await self._process_entry_signal(
+                    symbol, symbol_config, analysis, multi_tf_data
+                )
+ 
+        except Exception as e:
+            logger.error(f"[{symbol}] _analyze_symbol error: {e}", exc_info=True)
                 
-    async def _process_entry_signal(self, symbol: str, symbol_config: dict,
-                                analysis: dict, multi_tf_data: dict):
-        """Process entry signal - FINAL VALIDATION BEFORE ORDER."""
+    async def _process_entry_signal(
+        self,
+        symbol:        str,
+        symbol_config: dict,
+        analysis:      dict,
+        multi_tf_data: dict,
+    ):
+        """
+        Place order after a confirmed entry signal.
+ 
+        Market orders: registered in open_positions immediately.
+        Limit  orders: saved to pending_limit_orders; NOT in open_positions
+                       until the order fills (detected by position monitor).
+        """
         try:
             analysis_id = analysis.get('analysis_id', 'unknown')
-            platform = symbol_config['platform']
-            
-            # ✅ ABSOLUTE FINAL CHECK (defensive programming)
-            max_concurrent = self.config.get('risk_management', {}).get(
-                'global_limits', {}
-            ).get('max_concurrent_trades', 3)
-            
-            current_count = len(self.open_positions)
-            
-            if current_count >= max_concurrent:
+            platform    = symbol_config.get('platform', 'mt5')
+ 
+            # ── Absolute final guard ──────────────────────────────────────────
+            max_concurrent = (
+                self.config.get('risk_management', {})
+                           .get('global_limits', {})
+                           .get('max_concurrent_trades', 3)
+            )
+            if len(self.open_positions) >= max_concurrent:
                 logger.error(
-                    f"CRITICAL: Attempted to place order with {current_count} positions "
-                    f"(max: {max_concurrent}). This should never happen!"
+                    f"[{symbol}] Attempted entry at max positions — aborting."
                 )
                 return
-            
-            # Get current price from broker
-            if platform == 'mt5':
-                price_data = await self.mt5_client.get_current_price(symbol.replace('/', ''))
-                if not price_data:
-                    logger.error("Could not get current price from MT5")
-                    return
-                
-                if analysis['direction'] == 'long':
-                    current_price = price_data['ask']
-                else:
-                    current_price = price_data['bid']
-                
-                logger.info(f"Current price from MT5: {current_price:.4f}")
-            
-            # Calculate stops with current price
-            entry_tf = symbol_config['timeframes'][-1]
-            df = multi_tf_data[entry_tf]
-            
-            from indicators.indicators import TechnicalIndicators
-            indicators = TechnicalIndicators()
-            atr_result = indicators.calculate_atr(df)
-            atr = atr_result['current']
-            
-            atr_multiplier = self.config.get('risk_management', {}).get(
-                'stop_loss', {}
-            ).get('atr_multiplier', 2.0)
-            
-            # ── TP levels read from config, not hardcoded ──────────────────
-            _tp_targets = self.config.get('risk_management', {}).get(
-                'take_profit', {}
-            ).get('targets', [])
-            # Filter out the trailing-only entry (rr_ratio: 999)
-            _real_tps = [t for t in _tp_targets if float(t.get('rr_ratio', 999)) < 999]
-            # Fall back to 2R / 3R if config section missing
-            _tp1_rr       = float(_real_tps[0]['rr_ratio']) if len(_real_tps) >= 1 else 2.0
-            _tp2_rr       = float(_real_tps[1]['rr_ratio']) if len(_real_tps) >= 2 else 3.0
-            _tp1_fraction = float(_real_tps[0].get('close_percent', 50)) / 100.0 if _real_tps else 0.5
-                            
-
-            if analysis['direction'] == 'long':
-                stop_loss    = current_price - (atr * atr_multiplier)
-                risk         = current_price - stop_loss
-                take_profit_1 = current_price + (risk * _tp1_rr)
-                take_profit_2 = current_price + (risk * _tp2_rr)
-            else:
-                stop_loss    = current_price + (atr * atr_multiplier)
-                risk         = stop_loss - current_price
-                take_profit_1 = current_price - (risk * _tp1_rr)
-                take_profit_2 = current_price - (risk * _tp2_rr)
-
-            logger.info(
-                f"[TP] {symbol} {analysis['direction']}: "
-                f"SL={stop_loss:.5f}  TP1={take_profit_1:.5f} ({_tp1_rr}R, "
-                f"{_tp1_fraction*100:.0f}% close)  TP2={take_profit_2:.5f} ({_tp2_rr}R)"
-            )
-            
-            # Get balance
-            balance = await self._get_total_balance()
-            
-            # ✅ Validate trade with current exposure
-            sizing = self.money_manager.validate_trade(
-                account_equity=balance,
-                entry_price=current_price,
-                stop_loss=stop_loss,
-                symbol=symbol,
-                direction=analysis['direction'],
-                platform=platform,
-                current_exposure=self._get_current_exposure(),  # Gets actual count
-                daily_stats=self.daily_stats,
-                recent_trades=self._get_recent_trades()
-            )
-            
-            if not sizing['approved']:
-                logger.info(f"Trade rejected: {sizing.get('reason')}")
+ 
+            # ── Calculate levels ──────────────────────────────────────────────
+            levels = self.strategy_engine.calculate_entry_levels(analysis, multi_tf_data)
+            if not levels:
+                logger.warning(f"[{symbol}] Could not calculate entry levels — skipped.")
                 return
-            
-            # ── Per-symbol drawdown guard ─────────────────────────────────────
-            # Check symbol-specific daily loss against config limit before entry.
-            symbol_dd_limit = self.config.get('risk_management', {}).get(
-                'global_limits', {}
-            ).get('max_drawdown_per_symbol_percent', 3.0)
-
-            symbol_pnl_today = self.daily_stats.get('symbol_pnl', {}).get(symbol, 0.0)
-            symbol_dd_pct = (-symbol_pnl_today / balance * 100) if symbol_pnl_today < 0 else 0.0
-
+ 
+            current_price  = levels.get('entry_price', 0.0)
+            order_price    = levels.get('order_price', current_price)
+            order_type     = levels.get('order_type', 'market')
+            limit_price    = levels.get('limit_price')
+            stop_loss      = levels.get('stop_loss', 0.0)
+            take_profit_1  = levels.get('take_profit_1', 0.0)
+            take_profit_2  = levels.get('take_profit_2', 0.0)
+            atr            = levels.get('atr', 0.0)
+            entry_type     = analysis.get('entry_type', 'unknown')
+ 
+            # ── Risk checks ───────────────────────────────────────────────────
+            if not self._check_cooldown_after_losses():
+                return
+ 
+            balance = await self._get_total_balance()
+            if balance <= 0:
+                logger.error(f"[{symbol}] Cannot size position — balance=0.")
+                return
+ 
+            sizing = self.money_manager.calculate_position_size(
+                account_equity = balance,
+                entry_price    = order_price,
+                stop_loss      = stop_loss,
+                symbol         = symbol,
+                direction      = analysis['direction'],
+                platform       = platform,
+            )
+            if not sizing.get('approved') or sizing.get('position_size', 0) <= 0:
+                logger.info(f"[{symbol}] Position sizing rejected: {sizing}")
+                return
+ 
+            # ── Per-symbol drawdown guard ────────────────────────────────────
+            symbol_dd_limit = (
+                self.config.get('risk_management', {})
+                           .get('global_limits', {})
+                           .get('max_drawdown_per_symbol_percent', 3.0)
+            )
+            symbol_pnl   = self.daily_stats.get('symbol_pnl', {}).get(symbol, 0.0)
+            symbol_dd_pct = (-symbol_pnl / balance * 100) if symbol_pnl < 0 else 0.0
             if symbol_dd_pct >= symbol_dd_limit:
                 logger.warning(
-                    f"[RISK] {symbol} per-symbol drawdown {symbol_dd_pct:.2f}% "
-                    f">= limit {symbol_dd_limit}% — rejecting entry."
+                    f"[{symbol}] Per-symbol DD {symbol_dd_pct:.2f}% >= "
+                    f"limit {symbol_dd_limit}% — rejecting."
                 )
                 return
-            
-            # Place order
+ 
+            # ── Place order ───────────────────────────────────────────────────
             if platform == 'mt5':
                 result = await self.mt5_client.place_order(
-                    symbol=symbol.replace('/', ''),
-                    direction=analysis['direction'],
-                    volume=sizing['position_size'],
-                    order_type='market',
-                    price=None,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit_2,
-                    comment=f"Analysis_{analysis_id[:8]}" if analysis_id != 'unknown' else "Python"
+                    symbol      = symbol.replace('/', ''),
+                    direction   = analysis['direction'],
+                    volume      = sizing['position_size'],
+                    order_type  = order_type,
+                    price       = limit_price if order_type == 'limit' else None,
+                    stop_loss   = stop_loss,
+                    take_profit = take_profit_2,
+                    comment     = f"Analysis_{analysis_id[:8]}"
+                                  if analysis_id != 'unknown' else "Python",
                 )
-            
-            
-            if result['success']:
-                executed_price = result.get('filled_price') or result.get('price') or current_price
-                ticket = result.get('ticket') or result.get('order_id')
-
-                trade_id = self.audit_logger.log_trade_entry({
-                    'analysis_id'  : analysis_id,
-                    'symbol'       : symbol,
-                    'platform'     : platform,
-                    'direction'    : analysis['direction'],
-                    'entry_price'  : executed_price,
-                    'stop_loss'    : stop_loss,
-                    'take_profit_1': take_profit_1,
-                    'take_profit_2': take_profit_2,
-                    'position_size': sizing['position_size'],
+            else:
+                logger.warning(f"[{symbol}] Unsupported platform: {platform}")
+                return
+ 
+            if not result.get('success'):
+                logger.error(f"[{symbol}] Order failed: {result.get('error')}")
+                return
+ 
+            ticket         = result.get('ticket') or result.get('order_id')
+            executed_price = result.get('filled_price') or result.get('price') or order_price
+            placed_at      = datetime.utcnow()
+ 
+            # ── Log trade ─────────────────────────────────────────────────────
+            trade_status = 'pending_limit' if order_type == 'limit' else 'open'
+            trade_id = self.audit_logger.log_trade_entry({
+                'analysis_id'  : analysis_id,
+                'symbol'       : symbol,
+                'platform'     : platform,
+                'direction'    : analysis['direction'],
+                'entry_price'  : executed_price,
+                'stop_loss'    : stop_loss,
+                'take_profit_1': take_profit_1,
+                'take_profit_2': take_profit_2,
+                'position_size': sizing['position_size'],
+                'status'       : trade_status,
+            })
+            self.db.update_trade(trade_id, {'ticket': ticket})
+ 
+            # ── Route: limit vs market ─────────────────────────────────────────
+            if order_type == 'limit':
+                # Limit order is PENDING — save to tracker, do NOT open position
+                primary_tf = symbol_config.get('primary_timeframe', '15m')
+                expiry_time, min_floor = _limit_expiry_times(
+                    placed_at, primary_tf, entry_type,
+                    self.config.get('strategy', {})
+                )
+ 
+                invalidation_atr_mult = float(
+                    self.config.get('strategy', {})
+                               .get('limit_order_expiry', {})
+                               .get('price_invalidation_atr_multiplier', 1.0)
+                )
+                if analysis['direction'] == 'long':
+                    invalidation_price = float(limit_price) - invalidation_atr_mult * atr
+                else:
+                    invalidation_price = float(limit_price) + invalidation_atr_mult * atr
+ 
+                self.db.save_pending_limit_order({
+                    'trade_id':           trade_id,
+                    'ticket':             ticket,
+                    'symbol':             symbol,
+                    'direction':          analysis['direction'],
+                    'entry_type':         entry_type,
+                    'limit_price':        limit_price or executed_price,
+                    'placed_at':          placed_at.isoformat(),
+                    'expiry_time':        expiry_time.isoformat(),
+                    'min_cancel_floor':   min_floor.isoformat(),
+                    'invalidation_price': invalidation_price,
+                    'atr_at_placement':   atr,
                 })
-
-                # Backfill analysis_logs with the price levels that were only
-                # known at execution time (SL/TP/size are computed after analysis
-                # is initially logged — this fills the empty columns).
-                if analysis_id and analysis_id != 'unknown':
-                    try:
-                        risk = abs(executed_price - stop_loss)
-                        rr_1 = abs(take_profit_1 - executed_price) / risk if risk > 0 else None
-                        with self.db._db_lock:
-                            self.db.conn.execute("""
-                                UPDATE analysis_logs SET
-                                    entry_price   = ?,
-                                    stop_loss     = ?,
-                                    take_profit_1 = ?,
-                                    take_profit_2 = ?,
-                                    position_size = ?,
-                                    expected_rr   = ?
-                                WHERE analysis_id = ?
-                            """, (
-                                executed_price,
-                                stop_loss,
-                                take_profit_1,
-                                take_profit_2,
-                                sizing['position_size'],
-                                rr_1,
-                                analysis_id,
-                            ))
-                            self.db.conn.commit()
-                    except Exception as e:
-                        logger.warning(f"Could not backfill analysis_logs for {analysis_id}: {e}")
-
-                self.db.update_trade(trade_id, {'ticket': ticket, 'status': 'open'})
-
+ 
+                logger.info(
+                    f"[{symbol}] LIMIT ORDER placed — ticket={ticket} "
+                    f"type={entry_type} price={limit_price:.5f} "
+                    f"expiry={expiry_time.strftime('%H:%M:%S')} UTC"
+                )
+                if hasattr(self, 'notifier'):
+                    asyncio.ensure_future(self.notifier.send(
+                        f"⏳ <b>Limit Order Placed</b> — {symbol}\n"
+                        f"<b>{analysis['direction'].upper()}</b> "
+                        f"@ <code>{limit_price:.5f}</code> [{entry_type}]\n"
+                        f"SL: <code>{stop_loss:.5f}</code>  "
+                        f"TP1: <code>{take_profit_1:.5f}</code>\n"
+                        f"Expires: <code>{expiry_time.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
+                        f"Ticket: <code>{ticket}</code>"
+                    ))
+ 
+            else:
+                # Market order — register in open_positions immediately
                 self._register_new_position(
                     trade_id    = trade_id,
                     ticket      = ticket,
@@ -876,22 +986,209 @@ class TradingSystem:
                     sl          = stop_loss,
                     tp1         = take_profit_1,
                     tp2         = take_profit_2,
-                    tp1_fraction= _tp1_fraction,   
+                    tp1_fraction = 0.5,
                     platform    = platform,
                     analysis_id = analysis_id,
                 )
-
                 self.daily_stats['trades_today'] += 1
                 logger.info(
-                    f"Trade #{len(self.open_positions)}: {symbol} {analysis['direction']} "
-                    f"@ {executed_price:.4f}, Ticket: {ticket}"
+                    f"[{symbol}] MARKET ORDER filled — ticket={ticket} "
+                    f"price={executed_price:.5f} "
+                    f"dir={analysis['direction']} type={entry_type}"
                 )
-            else:
-                logger.error(f" Order failed: {result.get('error')}")
-        
+ 
         except Exception as e:
-            logger.error(f"Error processing entry signal: {e}", exc_info=True)
+            logger.error(
+                f"[{symbol}] Error processing entry signal: {e}", exc_info=True
+            )
 
+    async def _check_pending_limit_orders(self):
+        """
+        Check all pending limit orders for fill, expiry, or price invalidation.
+        Called every position-monitor cycle (every ~15s).
+ 
+        Logic per order:
+          - Not past min_cancel_floor → skip (never cancel within 60s of placement)
+          - Ticket not in EA's order list → filled → promote to open position
+          - Past expiry_time → cancel and mark expired
+          - Price past invalidation_price → cancel and mark invalidated
+        """
+        try:
+            pending = self.db.get_pending_limit_orders()
+            if not pending:
+                return
+ 
+            # Single EA call for all pending orders
+            ea_orders = await self.mt5_client.get_all_orders() or []
+            ea_order_tickets = {int(o.get('ticket', 0)) for o in ea_orders}
+ 
+            # Also get all positions to detect fills
+            ea_positions = await self.mt5_client.get_all_positions() or []
+            ea_pos_by_comment = {}
+            for p in ea_positions:
+                comment = str(p.get('comment', ''))
+                ea_pos_by_comment[comment] = p
+ 
+            now = datetime.utcnow()
+ 
+            for order in pending:
+                ticket              = int(order['ticket'])
+                trade_id            = order['trade_id']
+                symbol              = order['symbol']
+                direction           = order['direction']
+                entry_type          = order['entry_type']
+                limit_price         = float(order['limit_price'])
+                atr                 = float(order.get('atr_at_placement') or 0.0)
+                invalidation_price  = order.get('invalidation_price')
+                expiry_time         = datetime.fromisoformat(order['expiry_time'])
+                min_floor           = datetime.fromisoformat(order['min_cancel_floor'])
+ 
+                # Never cancel before the minimum floor
+                if now < min_floor:
+                    continue
+ 
+                # ── Filled: ticket no longer in pending orders ─────────────────
+                if ticket not in ea_order_tickets:
+                    # Find the resulting position by matching our comment
+                    analysis_id_short = (trade_id.split('_')[2][:8]
+                                         if '_' in trade_id else trade_id[:8])
+                    comment_key = f"Analysis_{analysis_id_short}"
+                    filled_pos  = ea_pos_by_comment.get(comment_key)
+ 
+                    if filled_pos:
+                        pos_ticket     = int(filled_pos.get('ticket', 0))
+                        executed_price = float(filled_pos.get('price', limit_price))
+                        volume         = float(filled_pos.get('volume', 0.0))
+ 
+                        # Update trade record with real position ticket
+                        self.db.update_trade(trade_id, {'ticket': pos_ticket, 'status': 'open'})
+                        self.db.update_pending_limit_order_status(ticket, 'filled')
+ 
+                        # Get original trade data
+                        trade_rows = self.db.get_open_trades()
+                        trade_data = next(
+                            (t for t in trade_rows if t['trade_id'] == trade_id), {}
+                        )
+ 
+                        self._register_new_position(
+                            trade_id     = trade_id,
+                            ticket       = pos_ticket,
+                            symbol       = symbol,
+                            direction    = direction,
+                            entry_price  = executed_price,
+                            volume       = volume,
+                            sl           = float(trade_data.get('stop_loss', 0.0)),
+                            tp1          = float(trade_data.get('take_profit_1') or 0.0),
+                            tp2          = float(trade_data.get('take_profit_2') or 0.0),
+                            tp1_fraction = 0.5,
+                            platform     = 'mt5',
+                            analysis_id  = trade_data.get('analysis_id', ''),
+                        )
+                        self.daily_stats['trades_today'] += 1
+                        logger.info(
+                            f"[LIMIT] Filled — symbol={symbol} "
+                            f"order_ticket={ticket} pos_ticket={pos_ticket} "
+                            f"price={executed_price:.5f}"
+                        )
+                        if hasattr(self, 'notifier'):
+                            asyncio.ensure_future(self.notifier.send(
+                                f"✅ <b>Limit Order Filled</b> — {symbol}\n"
+                                f"<b>{direction.upper()}</b> "
+                                f"@ <code>{executed_price:.5f}</code>\n"
+                                f"Ticket: <code>{pos_ticket}</code>"
+                            ))
+                    else:
+                        # Order gone but no matching position — cancelled externally
+                        logger.info(
+                            f"[LIMIT] Order {ticket} for {symbol} gone with no "
+                            f"matching position — likely manually cancelled."
+                        )
+                        self.db.update_pending_limit_order_status(
+                            ticket, 'cancelled', 'external_cancel'
+                        )
+                    continue
+ 
+                # ── Expired ───────────────────────────────────────────────────
+                if now >= expiry_time:
+                    await self._cancel_limit_order(
+                        ticket, trade_id, symbol, 'expired',
+                        f"Expired at {expiry_time.strftime('%H:%M UTC')} "
+                        f"({entry_type})"
+                    )
+                    continue
+ 
+                # ── Price invalidation ─────────────────────────────────────────
+                if invalidation_price and atr > 0:
+                    # Get a quick current price estimate from open positions
+                    # or from a recent bar (avoid extra bridge call if possible)
+                    current_price = self._estimate_current_price(symbol, ea_positions)
+                    if current_price:
+                        if direction == 'long' and current_price < float(invalidation_price):
+                            await self._cancel_limit_order(
+                                ticket, trade_id, symbol, 'invalidated',
+                                f"Price {current_price:.5f} broke below "
+                                f"invalidation {invalidation_price:.5f}"
+                            )
+                        elif direction == 'short' and current_price > float(invalidation_price):
+                            await self._cancel_limit_order(
+                                ticket, trade_id, symbol, 'invalidated',
+                                f"Price {current_price:.5f} broke above "
+                                f"invalidation {invalidation_price:.5f}"
+                            )
+ 
+        except Exception as e:
+            logger.error(f"[LIMIT] _check_pending_limit_orders error: {e}", exc_info=True)
+
+    async def _cancel_limit_order(
+        self,
+        ticket:   int,
+        trade_id: str,
+        symbol:   str,
+        reason:   str,
+        detail:   str = '',
+    ) -> None:
+        """Cancel a pending limit order on the EA and update the DB."""
+        try:
+            success = await self.mt5_client.cancel_order(ticket)
+            if success:
+                self.db.update_pending_limit_order_status(ticket, reason, detail)
+                self.db.update_trade(trade_id, {'status': 'cancelled'})
+                logger.info(
+                    f"[LIMIT] Cancelled ticket={ticket} symbol={symbol} "
+                    f"reason={reason} {detail}"
+                )
+                if hasattr(self, 'notifier'):
+                    asyncio.ensure_future(self.notifier.send(
+                        f"🗑 <b>Limit Order Cancelled</b> — {symbol}\n"
+                        f"Reason: <code>{reason}</code>\n"
+                        f"{detail}\nTicket: <code>{ticket}</code>"
+                    ))
+            else:
+                logger.warning(
+                    f"[LIMIT] EA cancel failed for ticket={ticket} — "
+                    f"may already be filled or gone."
+                )
+                # Mark as unknown state so it doesn't keep retrying
+                self.db.update_pending_limit_order_status(
+                    ticket, 'cancelled', 'cancel_failed_on_ea'
+                )
+        except Exception as e:
+            logger.error(f"[LIMIT] _cancel_limit_order error: {e}", exc_info=True)
+
+    def _estimate_current_price(
+        self, symbol: str, ea_positions: list
+    ):
+        """
+        Try to infer current price from live position data.
+        Returns None if no data available (caller skips invalidation check).
+        """
+        norm = symbol.replace('/', '').upper()
+        for p in ea_positions:
+            if str(p.get('symbol', '')).upper() == norm:
+                cur = p.get('current_price')
+                if cur:
+                    return float(cur)
+        return None
 
     async def _position_monitor_loop(self):
         """Monitor open positions - BATCHED VERSION."""
@@ -946,6 +1243,7 @@ class TradingSystem:
                 # Batch check MT5 positions (single API call)
                 if mt5_positions:
                     await self._batch_update_mt5_positions(mt5_positions)
+                    await self._check_pending_limit_orders()
                 
                 # Wait before next check (respecting minimum interval)
                 await asyncio.sleep(monitor_interval)

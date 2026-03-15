@@ -198,6 +198,36 @@ class DatabaseManager:
                     resolved BOOLEAN DEFAULT 0
                 )
             """)
+
+            # Pending limit orders — tracks unfilled limit orders until
+            # they are filled, expired, or price-invalidated.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_limit_orders (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id            TEXT NOT NULL,
+                    ticket              INTEGER NOT NULL UNIQUE,
+                    symbol              TEXT NOT NULL,
+                    direction           TEXT NOT NULL,
+                    entry_type          TEXT NOT NULL,
+                    limit_price         REAL NOT NULL,
+                    placed_at           TEXT NOT NULL,
+                    expiry_time         TEXT NOT NULL,
+                    min_cancel_floor    TEXT NOT NULL,
+                    invalidation_price  REAL,
+                    atr_at_placement    REAL,
+                    status              TEXT NOT NULL DEFAULT 'pending',
+                    cancelled_reason    TEXT,
+                    FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plo_status "
+                "ON pending_limit_orders(status)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plo_ticket "
+                "ON pending_limit_orders(ticket)"
+            )
             
             # Create indexes for common queries
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
@@ -244,6 +274,37 @@ class DatabaseManager:
                     "ALTER TABLE trades ADD COLUMN equity_after_close REAL"
                 )
                 logger.info("Migration: added 'equity_after_close' column to trades")
+
+            # ── Migration 4: pending_limit_orders table ───────────────────────
+            # Safe — CREATE TABLE IF NOT EXISTS handles fresh DBs.
+            # Re-running on an existing DB that already has the table is a no-op.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_limit_orders (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trade_id            TEXT NOT NULL,
+                    ticket              INTEGER NOT NULL UNIQUE,
+                    symbol              TEXT NOT NULL,
+                    direction           TEXT NOT NULL,
+                    entry_type          TEXT NOT NULL,
+                    limit_price         REAL NOT NULL,
+                    placed_at           TEXT NOT NULL,
+                    expiry_time         TEXT NOT NULL,
+                    min_cancel_floor    TEXT NOT NULL,
+                    invalidation_price  REAL,
+                    atr_at_placement    REAL,
+                    status              TEXT NOT NULL DEFAULT 'pending',
+                    cancelled_reason    TEXT,
+                    FOREIGN KEY (trade_id) REFERENCES trades(trade_id)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plo_status "
+                "ON pending_limit_orders(status)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_plo_ticket "
+                "ON pending_limit_orders(ticket)"
+            )
 
             self.conn.commit()
 
@@ -645,6 +706,75 @@ class DatabaseManager:
         logger.info(f"Database backed up to {backup_path}")
         
         return backup_path
+    
+    def save_pending_limit_order(self, data: Dict[str, Any]) -> None:
+        """
+        Save a newly placed limit order to the pending tracker.
+ 
+        Args:
+            data: dict with keys: trade_id, ticket, symbol, direction,
+                  entry_type, limit_price, placed_at, expiry_time,
+                  min_cancel_floor, invalidation_price, atr_at_placement
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                INSERT OR IGNORE INTO pending_limit_orders
+                    (trade_id, ticket, symbol, direction, entry_type,
+                     limit_price, placed_at, expiry_time, min_cancel_floor,
+                     invalidation_price, atr_at_placement, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            """, (
+                data['trade_id'],
+                int(data['ticket']),
+                data['symbol'],
+                data['direction'],
+                data['entry_type'],
+                float(data['limit_price']),
+                str(data['placed_at']),
+                str(data['expiry_time']),
+                str(data['min_cancel_floor']),
+                float(data['invalidation_price']) if data.get('invalidation_price') else None,
+                float(data['atr_at_placement']) if data.get('atr_at_placement') else None,
+            ))
+            self.conn.commit()
+ 
+    def get_pending_limit_orders(self) -> List[Dict[str, Any]]:
+        """Return all limit orders with status='pending'."""
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            rows = cursor.execute("""
+                SELECT id, trade_id, ticket, symbol, direction, entry_type,
+                       limit_price, placed_at, expiry_time, min_cancel_floor,
+                       invalidation_price, atr_at_placement, status
+                FROM   pending_limit_orders
+                WHERE  status = 'pending'
+                ORDER  BY placed_at ASC
+            """).fetchall()
+            return [dict(r) for r in rows]
+ 
+    def update_pending_limit_order_status(
+        self,
+        ticket: int,
+        status: str,
+        reason: str = None,
+    ) -> None:
+        """
+        Update the status of a pending limit order.
+ 
+        Args:
+            ticket:  MT5 order ticket
+            status:  New status — 'filled' | 'expired' | 'invalidated' | 'cancelled'
+            reason:  Optional human-readable cancellation reason
+        """
+        with self._db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                UPDATE pending_limit_orders
+                SET    status = ?, cancelled_reason = ?
+                WHERE  ticket = ?
+            """, (status, reason, int(ticket)))
+            self.conn.commit()
 
 
 # Example usage and testing
