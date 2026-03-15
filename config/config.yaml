@@ -15,7 +15,7 @@ symbols:
     primary_timeframe: 15m
     entry_timeframe: 5m
   XAU/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -25,7 +25,7 @@ symbols:
     primary_timeframe: 15m
     entry_timeframe: 1m
   XAG/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:

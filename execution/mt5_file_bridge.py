@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 # Without a shared lock they corrupt each other's commands under concurrency.
 _MT5_GLOBAL_LOCK: Optional[asyncio.Lock] = None
 
+MT5_SESSION_PREFIX   = "main"
+MT5_CMD_FILE_PATTERN = f"python_command_{MT5_SESSION_PREFIX}_"   # + request_id + ".txt"
+MT5_RESP_FILE_PREFIX = f"python_response_{MT5_SESSION_PREFIX}_"   # + request_id + ".txt"
+MT5_STATUS_FILE      = f"mt5_status_{MT5_SESSION_PREFIX}.txt"
+MT5_SESSION_FILE     = f"python_session_{MT5_SESSION_PREFIX}.txt"
+
 def _get_mt5_global_lock() -> asyncio.Lock:
     """Lazy-init the shared lock (must be called from inside a running event loop)."""
     global _MT5_GLOBAL_LOCK
@@ -43,9 +49,9 @@ class MT5FileBridge:
         self.session_id = str(uuid.uuid4())[:8]
         self.common_path = self._find_mt5_common_path()
 
-        self.command_file  = self.common_path / "python_command_main.txt"
-        self.status_file   = self.common_path / "mt5_status_main.txt"
-        self.session_file  = self.common_path / "python_session_main.txt"
+        # self.session_id   = f"{MT5_SESSION_PREFIX}_{str(uuid.uuid4())[:8]}"
+        self.status_file  = self.common_path / MT5_STATUS_FILE
+        self.session_file = self.common_path / MT5_SESSION_FILE
 
         self._connected = False
         self.request_counter = 0
@@ -146,8 +152,8 @@ class MT5FileBridge:
             command['request_id'] = request_id
 
             try:
-                command_json = json.dumps(command, ensure_ascii=True)
-                self.command_file.write_text(command_json, encoding='utf-8')
+                cmd_file = self.common_path / f"{MT5_CMD_FILE_PATTERN}{request_id}.txt"
+                cmd_file.write_text(json.dumps(command, ensure_ascii=True), encoding='utf-8')
                 logger.debug(f"[BRIDGE] → {request_id}: {command.get('action')}")
             except Exception as e:
                 logger.error(f"[BRIDGE] Error writing command {request_id}: {e}")
@@ -177,7 +183,7 @@ class MT5FileBridge:
         return {'status': 'error', 'error': 'timeout'}
 
     async def _read_response_for_id(self, request_id: str) -> Optional[Dict]:
-        response_file = self.common_path / f"python_response_main_{request_id}.txt"
+        response_file = self.common_path / f"{MT5_RESP_FILE_PREFIX}{request_id}.txt"
         try:
             if not response_file.exists():
                 return None
