@@ -86,7 +86,7 @@ class TelegramNotifier:
         risk_pips = abs(entry_price - stop_loss)
 
         msg = (
-            f"<b>🚀 TRADE OPENED</b>\n"
+            f"<b>🚀 TRADE OPENED MAIN</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{arrow}  <b>{symbol}</b>\n\n"
             f"<b>📊 Entry Details</b>\n"
