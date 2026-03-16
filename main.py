@@ -7,12 +7,12 @@ import asyncio
 import logging
 import signal
 import sys
-import time as _time
+import time as _monotime
 import yaml
 import os
 import math
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Import all modules
@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 # ── Helper functions ───────────────────────────────────────────────────────────────
 
+
 def _tf_to_seconds(tf: str) -> int:
     """Convert timeframe string to seconds."""
     mapping = {
@@ -56,46 +57,29 @@ def _tf_to_seconds(tf: str) -> int:
  
  
 def _next_bar_close_utc(tf_secs: int) -> datetime:
-    """
-    Return the UTC datetime of the next bar close for the given timeframe.
-    Aligns to clock boundaries: 15m bars close at :00, :15, :30, :45.
-    """
-    now_ts       = datetime.utcnow().timestamp()
+    import time as _t
+    now_ts        = _t.time()
     next_close_ts = math.ceil(now_ts / tf_secs) * tf_secs
-    return datetime.utcfromtimestamp(next_close_ts)
+    return datetime.fromtimestamp(next_close_ts, timezone.utc).replace(tzinfo=None)
  
  
-def _limit_expiry_times(
-    placed_at: datetime,
-    primary_tf: str,
-    entry_type: str,
-    strategy_config: dict,
-) -> tuple:
-    """
-    Calculate (expiry_time, min_cancel_floor) for a limit order.
- 
-    expiry_time      = next_bar_close_after_placement + (expiry_bars × tf_secs)
-    min_cancel_floor = placed_at + min_cancel_floor_seconds (never cancel prematurely)
-    """
+def _limit_expiry_times(placed_at, primary_tf, entry_type, strategy_config):
+    import time as _t
     tf_secs = _tf_to_seconds(primary_tf)
-    exp_cfg = strategy_config.get('limit_order_expiry', {})
- 
+    exp_cfg = strategy_config.get("limit_order_expiry", {})
     bars_map = {
-        'ema_stack_pullback':  exp_cfg.get('ema_stack_pullback_bars',  2),
-        'pullback_to_sr':      exp_cfg.get('pullback_to_sr_bars',      5),
-        'rsi_divergence':      exp_cfg.get('rsi_divergence_bars',      3),
-        'bb_squeeze_breakout': exp_cfg.get('bb_squeeze_breakout_bars', 1),
+        "ema_stack_pullback":  exp_cfg.get("ema_stack_pullback_bars",  2),
+        "pullback_to_sr":      exp_cfg.get("pullback_to_sr_bars",      5),
+        "rsi_divergence":      exp_cfg.get("rsi_divergence_bars",      3),
+        "bb_squeeze_breakout": exp_cfg.get("bb_squeeze_breakout_bars", 1),
     }
     expiry_bars = int(bars_map.get(entry_type, 3))
-    floor_secs  = int(exp_cfg.get('min_cancel_floor_seconds', 60))
- 
-    placed_ts       = placed_at.timestamp()
-    next_bar_close  = math.ceil(placed_ts / tf_secs) * tf_secs
-    expiry_ts       = next_bar_close + expiry_bars * tf_secs
- 
-    expiry_time      = datetime.utcfromtimestamp(expiry_ts)
+    floor_secs  = int(exp_cfg.get("min_cancel_floor_seconds", 60))
+    placed_ts      = _t.time()
+    next_bar_close = math.ceil(placed_ts / tf_secs) * tf_secs
+    expiry_ts      = next_bar_close + expiry_bars * tf_secs
+    expiry_time      = datetime.fromtimestamp(expiry_ts, timezone.utc).replace(tzinfo=None)
     min_cancel_floor = placed_at + timedelta(seconds=floor_secs)
- 
     return expiry_time, min_cancel_floor
 
 
@@ -501,7 +485,7 @@ class TradingSystem:
                     self.db.update_trade(trade_id, {
                         'status'     : 'closed',
                         'exit_reason': 'missing_ticket_on_restart',
-                        'exit_time'  : datetime.utcnow(),
+                        'exit_time'  : datetime.now(timezone.utc).replace(tzinfo=None),
                     })
                     continue
 
@@ -703,7 +687,7 @@ class TradingSystem:
                 # Calculate sleep duration to next bar close
                 next_close   = _next_bar_close_utc(tf_secs)
                 sleep_target = next_close + timedelta(seconds=buffer_secs)
-                wait_secs    = (sleep_target - datetime.utcnow()).total_seconds()
+                wait_secs    = (sleep_target - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
  
                 if wait_secs > 0:
                     await asyncio.sleep(wait_secs)
@@ -907,7 +891,7 @@ class TradingSystem:
  
             ticket         = result.get('ticket') or result.get('order_id')
             executed_price = result.get('filled_price') or result.get('price') or order_price
-            placed_at      = datetime.utcnow()
+            placed_at      = datetime.now(timezone.utc).replace(tzinfo=None)
  
             # ── Log trade ─────────────────────────────────────────────────────
             trade_status = 'pending_limit' if order_type == 'limit' else 'open'
@@ -1029,7 +1013,7 @@ class TradingSystem:
                 comment = str(p.get('comment', ''))
                 ea_pos_by_comment[comment] = p
  
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
  
             for order in pending:
                 ticket              = int(order['ticket'])
@@ -1382,7 +1366,7 @@ class TradingSystem:
 
         # Rate-limit: avoid hammering MT5 with modify calls
         last_update = position.get('last_sl_update', 0.0)
-        if (_time.time() - last_update) < min_update_interval:
+        if (_monotime.time() - last_update) < min_update_interval:
             return
 
         # Initial risk uses ORIGINAL SL so RR is always relative to entry risk
@@ -1527,7 +1511,7 @@ class TradingSystem:
 
         old_sl = position.get('stop_loss', 0.0)
         position['stop_loss']      = new_sl
-        position['last_sl_update'] = _time.time()
+        position['last_sl_update'] = _monotime.time()
 
         # Persist SL change to database
         try:
@@ -1635,7 +1619,7 @@ class TradingSystem:
             self.db.update_trade(trade_id, {
                 'status':       'closed',
                 'exit_reason':  reason,
-                'exit_time':    datetime.utcnow(),
+                'exit_time':    datetime.now(timezone.utc).replace(tzinfo=None),
             })
             logger.info(
                 f"[PARTIAL] trade_id={trade_id} ticket={ticket} ({symbol}) "
@@ -1867,7 +1851,7 @@ class TradingSystem:
             if close_time and int(close_time) > 0:
                 exit_dt = datetime.utcfromtimestamp(int(close_time))
             else:
-                exit_dt = datetime.utcnow()
+                exit_dt = datetime.now(timezone.utc).replace(tzinfo=None)
             if isinstance(entry_time, datetime):
                 delta = exit_dt - entry_time
                 duration_minutes = round(delta.total_seconds() / 60, 1)
@@ -1897,7 +1881,7 @@ class TradingSystem:
 
         return {
             'exit_price'             : exit_price,
-            'exit_time'              : exit_dt if exit_dt else datetime.utcnow(),
+            'exit_time'              : exit_dt if exit_dt else datetime.now(timezone.utc).replace(tzinfo=None),
             'exit_reason'            : exit_reason,
             'net_pnl'                : round(net_pnl, 2),
             'pnl_percent'            : pnl_percent,
@@ -1919,7 +1903,7 @@ class TradingSystem:
 
         if net_pnl < 0:
             self.consecutive_losses = getattr(self, 'consecutive_losses', 0) + 1
-            self.last_loss_time     = _time.time()
+            self.last_loss_time     = _monotime.time()
             logger.info(f"[CLOSE] Loss — consecutive_losses={self.consecutive_losses}")
         else:
             self.consecutive_losses = 0
@@ -1988,7 +1972,7 @@ class TradingSystem:
             self.db.update_trade(trade_id, {
                 'status'     : 'pending_exit',
                 'exit_reason': 'pending_deal_lookup',
-                'exit_time'  : datetime.utcnow(),
+                'exit_time'  : datetime.now(timezone.utc).replace(tzinfo=None),
             })
             asyncio.ensure_future(
                 self._deferred_deal_lookup(trade_id, ticket, position)
@@ -2306,7 +2290,7 @@ class TradingSystem:
                     entry_dt = datetime.fromisoformat(
                         str(entry_time_raw).replace('Z', '+00:00')
                     ).replace(tzinfo=None)
-                    age_hours = (datetime.utcnow() - entry_dt).total_seconds() / 3600
+                    age_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - entry_dt).total_seconds() / 3600
                     # Cover full age + 24h buffer, minimum base_lookback
                     lookback = max(base_lookback, int(age_hours) + 24)
                 except Exception:
@@ -2384,7 +2368,7 @@ class TradingSystem:
         if self.consecutive_losses < max_losses:
             return True
 
-        elapsed = _time.time() - self.last_loss_time
+        elapsed = _monotime.time() - self.last_loss_time
         if elapsed < cooldown_s:
             remaining = int(cooldown_s - elapsed)
             logger.info(
@@ -2479,8 +2463,8 @@ class TradingSystem:
             'last_sl_update' : 0.0,
             'profit'         : 0.0,
             'analysis_id'    : analysis_id,
-            'entry_time'     : datetime.utcnow(),
-            'open_time'      : _time.time(),
+            'entry_time'     : datetime.now(timezone.utc).replace(tzinfo=None),
+            'open_time'      : _monotime.time(),
         }
         self.open_positions[trade_id] = position
 
@@ -2549,7 +2533,7 @@ class TradingSystem:
 
         if profit < 0:
             self.consecutive_losses += 1
-            self.last_loss_time = _time.time()
+            self.last_loss_time = _monotime.time()
         else:
             self.consecutive_losses = 0
 

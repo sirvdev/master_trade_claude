@@ -228,13 +228,13 @@ def issue_close_command(ticket, symbol, trade_id):
     cmds.append({
         "action": "close_position", "ticket": ticket,
         "symbol": symbol, "trade_id": trade_id,
-        "issued_at": datetime.utcnow().isoformat(),
+        "issued_at": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
     })
     CLOSE_CMD_FILE.write_text(json.dumps(cmds, indent=2))
 
 def get_current_session() -> tuple[str, str]:
     """Return (session_name, css_class) based on UTC hour."""
-    h = datetime.utcnow().hour
+    h = datetime.now(timezone.utc).replace(tzinfo=None).hour
     if 0 <= h < 7:
         return "ASIAN", "session-asian"
     elif 7 <= h < 12:
@@ -245,7 +245,7 @@ def get_current_session() -> tuple[str, str]:
         return "OVERLAP", "session-overlap"
 
 def get_time_bounds(time_range: str, custom_start=None, custom_end=None):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     if time_range == "Today":
         return now.replace(hour=0, minute=0, second=0, microsecond=0), now
     elif time_range == "Last 7 Days":
@@ -278,7 +278,7 @@ def format_countdown(expiry_str: str) -> tuple[str, str]:
     """Return (countdown_text, severity) for a limit order expiry."""
     try:
         expiry = datetime.fromisoformat(expiry_str)
-        remaining = (expiry - datetime.utcnow()).total_seconds()
+        remaining = (expiry - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()
         if remaining <= 0:
             return "EXPIRED", "critical"
         h, rem = divmod(int(remaining), 3600)
@@ -1282,7 +1282,7 @@ def main():
         st.markdown(
             f"<br><span class='session-badge {session_cls}'>{session_name} SESSION</span>"
             f"<br><span style='color:#6b7280;font-size:11px;font-family:\"IBM Plex Mono\"'>"
-            f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC</span>",
+            f"{datetime.now(timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M')} UTC</span>",
             unsafe_allow_html=True,
         )
 
