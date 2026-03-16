@@ -1763,7 +1763,7 @@ class TradingSystem:
                 open_time_raw = mt5_pos.get("open_time") or mt5_pos.get("time")
                 if open_time_raw:
                     try:
-                        entry_time = datetime.utcfromtimestamp(int(open_time_raw))
+                        entry_time = datetime.fromtimestamp(int(open_time_raw), timezone.utc).replace(tzinfo=None)
                     except Exception:
                         entry_time = None
                 else:
@@ -1849,7 +1849,7 @@ class TradingSystem:
         duration_minutes = None
         if entry_time:
             if close_time and int(close_time) > 0:
-                exit_dt = datetime.utcfromtimestamp(int(close_time))
+                exit_dt = datetime.fromtimestamp(int(close_time), timezone.utc).replace(tzinfo=None)
             else:
                 exit_dt = datetime.now(timezone.utc).replace(tzinfo=None)
             if isinstance(entry_time, datetime):
