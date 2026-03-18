@@ -444,7 +444,7 @@ class DatabaseManager:
                 trade_data.get('take_profit_2'),
                 trade_data.get('take_profit_3'),
                 trade_data.get('position_size'),
-                'open',
+                trade_data.get('status', 'open'),
             ))
 
             self.conn.commit()

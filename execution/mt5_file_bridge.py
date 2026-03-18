@@ -574,7 +574,6 @@ class MT5FileBridge:
             logger.error(f"Cancel failed ticket={ticket}: {response.get('error')}")
             return {'success': False, 'error': response.get('error')}
 
-    @_with_retry(max_attempts=3, backoff_seconds=5.0)
     async def get_deal_history(
         self,
         ticket: int,
@@ -582,8 +581,10 @@ class MT5FileBridge:
     ) -> Dict:
         """
         Fetch all closing deal records for a given position ticket.
-        Retries up to 3 times with 5-second backoff — post-close so no urgency,
-        but must eventually complete for accurate P&L logging.
+        No retry decorator — main.py._handle_external_close already runs its own
+        3-attempt loop with growing lookback windows (48h → 96h → 192h).
+        Adding a decorator here caused 9 EA calls instead of 3 and 30+ seconds
+        of startup delay every time a trade was closed while the system was down.
         """
         now_ts   = int(time.time())
         from_ts  = now_ts - lookback_hours * 3600
@@ -613,6 +614,7 @@ class MT5FileBridge:
             last_deal = deals[-1] if deals else {}
 
             return {
+                'status':       'success',   # main.py checks deal.get('status') == 'success'
                 'success':      True,
                 'ticket':       ticket,
                 'deal_count':   deal_count,
@@ -627,6 +629,7 @@ class MT5FileBridge:
                 f"{response.get('error', 'unknown error')}"
             )
             return {
+                'status':  'error',
                 'success': False,
                 'error':   response.get('error', 'unknown'),
             }

@@ -489,6 +489,46 @@ class TradingSystem:
                     })
                     continue
 
+                # ── Guard: if DB status is pending_limit, this is an unfilled
+                #    limit order, not an open position. Don't try to reconcile
+                #    as a position — check pending orders instead.
+                db_status = trade.get('status', 'open')
+                if db_status == 'pending_limit':
+                    logger.info(
+                        f"[STARTUP] trade_id={trade_id} ticket={ticket} "
+                        f"is a pending limit order — checking EA order book."
+                    )
+                    try:
+                        ea_orders = await self.mt5_client.get_all_orders() or []
+                        ea_tickets = {int(o.get('ticket', 0)) for o in ea_orders}
+
+                        if int(ticket) in ea_tickets:
+                            # Still pending on EA — register in pending tracker
+                            logger.info(
+                                f"[STARTUP] Limit order ticket={ticket} still pending "
+                                f"on EA — leaving in pending_limit_orders for monitor."
+                            )
+                        else:
+                            # Not in orders, not a position — expired or cancelled
+                            logger.info(
+                                f"[STARTUP] Limit order ticket={ticket} not found "
+                                f"in EA orders — marking cancelled."
+                            )
+                            self.db.update_trade(trade_id, {
+                                'status':      'cancelled',
+                                'exit_reason': 'not_found_on_restart',
+                                'exit_time':   datetime.now(timezone.utc).replace(tzinfo=None),
+                            })
+                            self.db.update_pending_limit_order_status(
+                                int(ticket), 'cancelled', 'not_found_on_restart'
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[STARTUP] Could not check order book for ticket={ticket}: {e} "
+                            f"— leaving as pending_limit for monitor to resolve."
+                        )
+                    continue  # skip position reconciliation entirely for limit orders
+
                 # ── MT5 verification ──────────────────────────────────────────
                 if platform == 'mt5':
                     pos_info = await self.mt5_client.get_position_info(int(ticket))
@@ -1191,6 +1231,9 @@ class TradingSystem:
                 if len(self.open_positions) == 0:
                     # No positions to monitor, wait longer
                     await asyncio.sleep(30)
+
+                    # Don't continue — still need to check pending limit orders
+                    await self._check_pending_limit_orders()
                     continue
                 
                 # ── Market hours guard: don't poll the EA when market is closed ──
