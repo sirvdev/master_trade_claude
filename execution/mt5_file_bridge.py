@@ -1,6 +1,15 @@
 """
-MT5 File-based bridge with single concatenated response file.
-v2.1: Added fetch_historical_range for backtest date-range fetching.
+execution/mt5_file_bridge.py
+============================
+MT5 File-based bridge — Per-Request-ID response system.
+
+Changes v2.1+:
+  - Retry decorator applied to place_order (3×,2s), close_position (5×,1s),
+    cancel_order (3×,1s), get_deal_history (3×,5s).
+  - Added get_all_orders() and cancel_order() — were missing from main bridge,
+    causing AttributeError in _check_pending_limit_orders every 15s.
+  - Retry only on genuine failure (status!=success or exception).
+    Never retries on success.
 """
 
 import asyncio
@@ -8,73 +17,127 @@ import json
 import logging
 import os
 import uuid
+import time
+import functools
 from typing import Dict, Optional
 from datetime import datetime, timezone
-import time
 from pathlib import Path
-from click import command
+
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level singleton — shared across ALL MT5FileBridge instances ─────────
-# This is critical: both the execution bridge and the market data bridge
-# create separate instances but use the same physical command/response files.
-# Without a shared lock they corrupt each other's commands under concurrency.
+# ── Module-level singleton lock shared across ALL MT5FileBridge instances ──────
+# Both the execution bridge and the market data bridge share the same physical
+# command/response files. Without a shared lock they corrupt each other.
 _MT5_GLOBAL_LOCK: Optional[asyncio.Lock] = None
+_MT5_PREFIX = "main"
 
-_MT5_PREFIX   = "main"
-# MT5_CMD_FILE_PATTERN = f"python_command_{MT5_SESSION_PREFIX}_"   # + request_id + ".txt"
-# MT5_RESP_FILE_PREFIX = f"python_response_{MT5_SESSION_PREFIX}_"   # + request_id + ".txt"
-# MT5_STATUS_FILE      = f"mt5_status_{MT5_SESSION_PREFIX}.txt"
-# MT5_SESSION_FILE     = f"python_session_{MT5_SESSION_PREFIX}.txt"
 
 def _get_mt5_global_lock() -> asyncio.Lock:
-    """Lazy-init the shared lock (must be called from inside a running event loop)."""
     global _MT5_GLOBAL_LOCK
     if _MT5_GLOBAL_LOCK is None:
         _MT5_GLOBAL_LOCK = asyncio.Lock()
     return _MT5_GLOBAL_LOCK
 
+
+# ── Retry decorator ───────────────────────────────────────────────────────────
+
+def _with_retry(max_attempts: int, backoff_seconds: float):
+    """
+    Async retry decorator for bridge methods.
+
+    Retries only when the response has status != 'success' OR an exception
+    is raised. Never retries on success. Uses fixed backoff between attempts.
+
+    Usage:
+        @_with_retry(max_attempts=3, backoff_seconds=2.0)
+        async def place_order(self, ...): ...
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            last_result = None
+            last_exc    = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = await fn(*args, **kwargs)
+                    if result.get('success') or result.get('status') == 'success':
+                        return result
+                    # Non-success — record and retry
+                    last_result = result
+                    err = result.get('error', 'unknown error')
+                    logger.warning(
+                        f"[RETRY] {fn.__name__} attempt {attempt}/{max_attempts} "
+                        f"failed: {err}"
+                    )
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning(
+                        f"[RETRY] {fn.__name__} attempt {attempt}/{max_attempts} "
+                        f"raised: {exc}"
+                    )
+
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff_seconds)
+
+            # All attempts exhausted
+            if last_exc is not None:
+                logger.error(
+                    f"[RETRY] {fn.__name__} failed after {max_attempts} attempts: "
+                    f"{last_exc}"
+                )
+                return {'success': False, 'error': str(last_exc)}
+
+            logger.error(
+                f"[RETRY] {fn.__name__} failed after {max_attempts} attempts: "
+                f"{last_result.get('error', 'unknown')}"
+            )
+            return last_result or {'success': False, 'error': 'max retries exceeded'}
+
+        return wrapper
+    return decorator
+
+
+# ── Bridge class ──────────────────────────────────────────────────────────────
+
 class MT5FileBridge:
     """
-    MT5 execution bridge using single-file response system.
-    Each request gets a unique ID, all responses concatenated in one file.
+    MT5 execution bridge using per-request command/response files.
+    Each request gets a unique ID; response file is self-cleaning.
     """
 
     def __init__(self, config: Dict, demo_mode: bool = True):
-        self.config = config
-        self.demo_mode = (config.get('mode') == 'demo')
+        self.config       = config
+        self.demo_mode    = (config.get('mode') == 'demo')
         self.magic_number = config.get('magic_number', 654321)
 
-        # self.session_id = str(uuid.uuid4())[:8]
-        self.common_path = self._find_mt5_common_path()
-
+        self.common_path  = self._find_mt5_common_path()
         self.session_id   = f"{_MT5_PREFIX}_{str(uuid.uuid4())[:8]}"
-        # command_file removed — each request writes its own file in _send_command
         self.status_file  = self.common_path / f"mt5_status_{_MT5_PREFIX}.txt"
         self.session_file = self.common_path / f"python_session_{_MT5_PREFIX}.txt"
 
-        self._connected = False
+        self._connected      = False
         self.request_counter = 0
 
-
+        # Demo state
         self.demo_orders    = {}
         self.demo_positions = {}
 
     def _find_mt5_common_path(self) -> Path:
-        possible_paths = [
+        possible = [
             Path(os.environ.get('APPDATA', '')) / "MetaQuotes" / "Terminal" / "Common" / "Files",
             Path.home() / "AppData" / "Roaming" / "MetaQuotes" / "Terminal" / "Common" / "Files",
         ]
-        for path in possible_paths:
-            if path.exists():
-                logger.info(f"Found MT5 Common Files at: {path}")
-                return path
+        for p in possible:
+            if p.exists():
+                logger.info(f"Found MT5 Common Files at: {p}")
+                return p
+        default = possible[0]
+        default.mkdir(parents=True, exist_ok=True)
+        return default
 
-        default_path = possible_paths[0]
-        default_path.mkdir(parents=True, exist_ok=True)
-        return default_path
+    # ── Connection ─────────────────────────────────────────────────────────────
 
     async def connect(self):
         if self.demo_mode:
@@ -104,8 +167,7 @@ class MT5FileBridge:
                 logger.error(f"Error reading status: {e}")
                 self._connected = False
         else:
-            logger.warning("MT5 status file not found - is the EA running?")
-            self._connected = False
+            logger.warning("MT5 status file not found — is the EA running?")
 
     async def disconnect(self):
         self._connected = False
@@ -113,60 +175,31 @@ class MT5FileBridge:
 
     def is_connected(self) -> bool:
         return self._connected
-        
 
-    # ------------------------------------------------------------------
-    # Core command/response layer
-    # ------------------------------------------------------------------
+    # ── Core bridge transport ──────────────────────────────────────────────────
 
     async def _send_command(self, command: Dict, timeout: float = 30.0) -> Dict:
-        """
-        Send command to EA and wait for response.
-
-        Lock design — critical section is very narrow (just the write):
-          The EA's ProcessCommandFile() does:
-            1. read command file
-            2. FileDelete(commandFile)   ← happens immediately, before any processing
-            3. process command (slow: CopyRates, order placement, etc.)
-            4. AppendResponse()          ← appends tagged line to response file
-
-          Once the file is deleted (step 2) the EA holds the command in memory.
-          It's therefore safe for Python to issue another command immediately;
-          we only need a lock to prevent two coroutines from writing at the same
-          instant.  We no longer wait for EA pickup because per-request-ID
-          responses avoid collisions.
-
-          The response file is append‑only and every line is tagged with
-          request_id, so overlapping commands never collide.
-
-        Lock hold time: <5ms (just the file write) instead of up to 30s.
-        """
         if self.demo_mode:
-            return await self._simulate_command(command)
+            return await self._handle_demo_command(command)
 
-        # ── Assign request_id and write to command file (under lock).  We no
-        # longer wait for the EA to delete the command file; per-request-ID
-        # responses make overlapping commands safe.  Lock only protects the
-        # write itself so two coroutines don't stomp each other.
-        async with _get_mt5_global_lock():
-            self.request_counter += 1
-            request_id = f"{self.session_id}_{self.request_counter}"
-            command['request_id'] = request_id
+        self.request_counter += 1
+        request_id = f"{self.session_id}_{self.request_counter}"
+        command['request_id'] = request_id
+        command['magic']      = self.magic_number
 
+        cmd_file = self.common_path / f"python_command_{request_id}.txt"
+
+        lock = _get_mt5_global_lock()
+        async with lock:
             try:
-                cmd_file = self.common_path / f"python_command_{request_id}.txt"
-                cmd_file.write_text(json.dumps(command, ensure_ascii=True), encoding='utf-8')
-                logger.debug(f"[BRIDGE] → {request_id}: {command.get('action')}")
+                cmd_file.write_text(
+                    json.dumps(command, ensure_ascii=True),
+                    encoding='utf-8'
+                )
             except Exception as e:
-                logger.error(f"[BRIDGE] Error writing command {request_id}: {e}")
+                logger.error(f"[BRIDGE] Failed to write command file: {e}")
                 return {'status': 'error', 'error': str(e)}
 
-        # ── Lock released immediately after write.  EA pickup no longer blocks
-        # further commands.
-
-        # ── Lock released — poll for response outside the lock ────────────────
-        # The response file accumulates tagged lines; we find ours by request_id.
-        # Other commands can now proceed in parallel through the lock.
         poll_start = time.time()
         while time.time() - poll_start < timeout:
             response = await self._read_response_for_id(request_id)
@@ -190,7 +223,7 @@ class MT5FileBridge:
             if not response_file.exists():
                 return None
             content = response_file.read_text(encoding='utf-8', errors='ignore').strip()
-            response_file.unlink(missing_ok=True)   # self-cleaning
+            response_file.unlink(missing_ok=True)
             return json.loads(content)
         except (json.JSONDecodeError, PermissionError, FileNotFoundError):
             return None
@@ -198,153 +231,163 @@ class MT5FileBridge:
             logger.debug(f"Error reading response for {request_id}: {e}")
             return None
 
-    # ------------------------------------------------------------------
-    # Historical data methods
-    # ------------------------------------------------------------------
+    # ── Demo handler ───────────────────────────────────────────────────────────
+
+    async def _handle_demo_command(self, command: Dict) -> Dict:
+        import numpy as np
+        action = command.get('action', '')
+
+        if action == 'get_historical':
+            symbol    = command.get('symbol', 'DEMO')
+            timeframe = command.get('timeframe', 'M15')
+            count     = int(command.get('count', 100))
+
+            tf_map = {'M1':60,'M5':300,'M15':900,'M30':1800,
+                      'H1':3600,'H4':14400,'D1':86400}
+            tf_secs   = tf_map.get(timeframe, 900)
+            start_ts  = int(time.time()) - count * tf_secs
+
+            np.random.seed(42)
+            price = 2000.0
+            bars  = []
+            for i in range(count):
+                ts    = start_ts + i * tf_secs
+                chg   = np.random.normal(0, 0.5)
+                price = max(price + chg, 1000.0)
+                rng   = abs(np.random.normal(0, 0.3))
+                bars.append([ts, round(price,2), round(price+rng,2),
+                              round(price-rng,2), round(price,2), 1000])
+            return {'status':'success','count':count,'data':bars}
+
+        if action == 'place_order':
+            ticket = len(self.demo_orders) + 1
+            price  = 2000.0
+            self.demo_orders[ticket]    = command
+            self.demo_positions[ticket] = {'ticket':ticket,'price':price,**command}
+            return {'status':'success','ticket':ticket,'price':price,
+                    'volume':command.get('volume',0.1)}
+
+        if action == 'modify_position':
+            ticket = command.get('ticket')
+            if ticket in self.demo_positions:
+                self.demo_positions[ticket].update(
+                    {'sl': command.get('sl'), 'tp': command.get('tp')}
+                )
+                return {'status':'success','ticket':ticket}
+            return {'status':'error','error':'Position not found'}
+
+        if action == 'close_position':
+            ticket = command.get('ticket')
+            if ticket in self.demo_positions:
+                del self.demo_positions[ticket]
+                return {'status':'success','ticket':ticket}
+            return {'status':'error','error':'Position not found'}
+
+        if action == 'get_all_positions':
+            return {'status':'success','positions':list(self.demo_positions.values())}
+
+        if action == 'get_all_orders':
+            return {'status':'success','count':0,'orders':[]}
+
+        if action == 'cancel_order':
+            ticket = command.get('ticket')
+            self.demo_orders.pop(ticket, None)
+            return {'status':'success','ticket':ticket}
+
+        if action == 'get_deal_history':
+            ticket = command.get('ticket', 0)
+            return {
+                'status':'success','ticket':ticket,
+                'entry_price':0.0,'exit_price':0.0,
+                'volume':0.0,'profit':0.0,'swap':0.0,
+                'commission':0.0,'net_profit':0.0,
+                'close_time':0,'exit_reason':'demo_close',
+            }
+
+        if action == 'authenticate':
+            return {'status':'success','account':99999,
+                    'balance':10000.0,'equity':10000.0}
+
+        return {'status':'error','error':f'Unknown action: {action}'}
+
+    # ── Historical data ────────────────────────────────────────────────────────
 
     async def fetch_historical(
         self,
         symbol: str,
         timeframe: str,
-        count: int = 500
+        count: int = 250,
     ) -> pd.DataFrame:
-        """
-        Fetch the last N closed bars for a symbol/timeframe (live mode use).
-
-        Args:
-            symbol:    e.g. 'XAUUSD'
-            timeframe: e.g. '1m', '15m', '1h'
-            count:     number of bars to fetch
-
-        Returns:
-            DataFrame indexed by timestamp (UTC), columns: open high low close volume
-        """
+        """Fetch the last N closed bars for a symbol/timeframe."""
         tf_map = {
-            '1m': 'M1', '5m': 'M5', '15m': 'M15', '30m': 'M30',
-            '1h': 'H1', '4h': 'H4', '1d': 'D1'
+            '1m':'M1','5m':'M5','15m':'M15','30m':'M30',
+            '1H':'H1','4H':'H4','1D':'D1','1W':'W1',
+            'M1':'M1','M5':'M5','M15':'M15','H1':'H1','H4':'H4','D1':'D1',
         }
-        mt5_tf = tf_map.get(timeframe.lower(), 'H1')
+        mt5_tf = tf_map.get(timeframe, timeframe)
 
         command = {
             'action':    'get_historical',
-            'symbol':    symbol.replace('/', ''),
+            'symbol':    symbol,
             'timeframe': mt5_tf,
-            'count':     count + 1   # +1 to drop current forming bar
+            'count':     count,
         }
 
-        response = await self._send_command(command)
+        response = await self._send_command(command, timeout=30.0)
 
         if response.get('status') != 'success':
-            raise ValueError(
-                f"fetch_historical failed for {symbol} {timeframe}: "
-                f"{response.get('error')}"
-            )
+            raise ValueError(f"Failed to fetch data: {response.get('error','unknown')}")
 
-        return self._bars_to_df(response.get('data', []), drop_last=True)
+        bars = response.get('data', [])
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+        df = df.set_index('timestamp')
+        df = df.astype(float)
+        logger.info(f"Fetched {len(df)} candles for {symbol} from MT5")
+        return df
 
     async def fetch_historical_range(
         self,
         symbol: str,
         timeframe: str,
-        from_date: datetime,
-        to_date: datetime
+        from_dt: datetime,
+        to_dt: datetime,
     ) -> pd.DataFrame:
-        """
-        Fetch ALL bars between from_date and to_date (bulk backtest fetch).
-
-        The EA uses CopyRates(symbol, tf, from_date, to_date) which returns
-        the full range in one call — no bar-count limit.
-
-        Args:
-            symbol:    e.g. 'XAUUSD'
-            timeframe: e.g. '1m', '15m', '1h'
-            from_date: Start datetime (UTC)
-            to_date:   End datetime (UTC)
-
-        Returns:
-            DataFrame indexed by timestamp (UTC), columns: open high low close volume
-        """
         tf_map = {
-            '1m': 'M1', '5m': 'M5', '15m': 'M15', '30m': 'M30',
-            '1h': 'H1', '4h': 'H4', '1d': 'D1'
+            '1m':'M1','5m':'M5','15m':'M15','30m':'M30',
+            '1H':'H1','4H':'H4','1D':'D1',
         }
-        mt5_tf = tf_map.get(timeframe.lower(), 'H1')
-
-        # Convert to UTC unix timestamps
-        from_ts = int(from_date.replace(tzinfo=timezone.utc).timestamp()) \
-                  if from_date.tzinfo is None \
-                  else int(from_date.timestamp())
-        to_ts   = int(to_date.replace(tzinfo=timezone.utc).timestamp()) \
-                  if to_date.tzinfo is None \
-                  else int(to_date.timestamp())
-
-        logger.info(
-            f"Fetching {symbol} {timeframe} range: "
-            f"{from_date.strftime('%Y-%m-%d')} → {to_date.strftime('%Y-%m-%d')}"
-        )
+        mt5_tf = tf_map.get(timeframe, timeframe)
 
         command = {
             'action':    'get_historical_range',
-            'symbol':    symbol.replace('/', ''),
+            'symbol':    symbol,
             'timeframe': mt5_tf,
-            'from_date': from_ts,
-            'to_date':   to_ts
+            'from':      int(from_dt.timestamp()),
+            'to':        int(to_dt.timestamp()),
         }
 
-        # Large date ranges can take a few seconds — use longer timeout
         response = await self._send_command(command, timeout=60.0)
 
         if response.get('status') != 'success':
-            raise ValueError(
-                f"fetch_historical_range failed for {symbol} {timeframe} "
-                f"{from_date} → {to_date}: {response.get('error')}"
-            )
+            raise ValueError(f"Failed to fetch range: {response.get('error','unknown')}")
 
-        df = self._bars_to_df(response.get('data', []), drop_last=False)
+        bars = response.get('data', [])
+        if not bars:
+            return pd.DataFrame()
 
-        logger.info(
-            f"  ✓ {symbol} {timeframe}: {len(df)} bars fetched "
-            f"({df.index[0]} → {df.index[-1]})"
-        )
+        df = pd.DataFrame(bars, columns=['timestamp','open','high','low','close','volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
+        df = df.set_index('timestamp')
+        df = df.astype(float)
         return df
 
-    # ------------------------------------------------------------------
-    # Live trading methods (order execution & position management)
-    # ------------------------------------------------------------------
+    # ── Order / position operations ────────────────────────────────────────────
 
-    async def get_current_price(self, symbol: str) -> Optional[Dict]:
-        """
-        Get current bid/ask prices for a symbol.
-        
-        Args:
-            symbol: Symbol (e.g. 'XAUUSD')
-            
-        Returns:
-            Dict with 'bid', 'ask', 'spread' or None on error
-        """
-        # Get the last bar to extract current price
-        try:
-            df = await self.fetch_historical(symbol, '1m', count=1)
-            if df.empty:
-                return None
-            
-            last_bar = df.iloc[-1]
-            # Approximate bid/ask from close (MT5 doesn't provide tick data via file bridge)
-            close = float(last_bar['close'])
-            # Typical gold spread is ~0.30, use that as approximation
-            spread = 0.30
-            
-            return {
-                'symbol': symbol,
-                'bid': close - spread / 2,
-                'ask': close + spread / 2,
-                'spread': spread,
-                'time': last_bar.name
-            }
-        except Exception as e:
-            logger.error(f"Error getting current price for {symbol}: {e}")
-            return None
-
+    @_with_retry(max_attempts=3, backoff_seconds=2.0)
     async def place_order(
         self,
         symbol: str,
@@ -354,35 +397,23 @@ class MT5FileBridge:
         price: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-        comment: Optional[str] = None
+        comment: Optional[str] = None,
     ) -> Dict:
         """
-        Place an order on MT5.
-        
-        Args:
-            symbol:       e.g. 'XAUUSD'
-            direction:    'long' or 'short'
-            volume:       Lot size (e.g. 0.1)
-            order_type:   'market' or 'limit'
-            price:        Limit price (required for limit orders)
-            stop_loss:    SL price
-            take_profit:  TP price
-            comment:      Order comment
-            
-        Returns:
-            Result dict with 'success', 'ticket', 'filled_price', etc.
+        Place a market or limit order on MT5.
+        Retries up to 3 times with 2-second backoff on failure.
+        Covers both market and limit orders (limit = place_order with price set).
         """
         logger.info(
-            f"Placing MT5 order: {symbol} {direction} {volume} lots, "
-            f"SL: {stop_loss}, TP: {take_profit}"
+            f"Placing MT5 order: {symbol} {direction} {volume} lots "
+            f"type={order_type} SL={stop_loss} TP={take_profit}"
         )
-        
-        # Map direction to MT5 order type
+
         if order_type == 'market':
             mt5_order_type = 'ORDER_TYPE_BUY' if direction == 'long' else 'ORDER_TYPE_SELL'
         else:
             mt5_order_type = 'ORDER_TYPE_BUY_LIMIT' if direction == 'long' else 'ORDER_TYPE_SELL_LIMIT'
-        
+
         command = {
             'action':     'place_order',
             'symbol':     symbol,
@@ -391,11 +422,11 @@ class MT5FileBridge:
             'price':      price or 0,
             'sl':         stop_loss or 0,
             'tp':         take_profit or 0,
-            'comment':    comment or 'Python'
+            'comment':    comment or 'Python',
         }
-        
+
         response = await self._send_command(command, timeout=10.0)
-        
+
         if response.get('status') == 'success':
             result = {
                 'success':       True,
@@ -404,138 +435,97 @@ class MT5FileBridge:
                 'filled_price':  response.get('price'),
                 'price':         response.get('price'),
                 'filled_volume': volume,
-                'timestamp':     datetime.utcnow().isoformat(),
+                'timestamp':     datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 'platform':      'mt5',
-                'demo_mode':     self.demo_mode
+                'demo_mode':     self.demo_mode,
             }
             logger.info(f"Order placed: Ticket {result['ticket']}")
         else:
             result = {
                 'success':   False,
                 'error':     response.get('error', 'Unknown error'),
-                'timestamp': datetime.utcnow().isoformat(),
-                'platform':  'mt5'
+                'timestamp': datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                'platform':  'mt5',
             }
             logger.error(f"Order failed: {result['error']}")
-        
+
         return result
 
     async def modify_position(
         self,
         ticket: int,
         stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None
+        take_profit: Optional[float] = None,
     ) -> Dict:
         """
         Modify position SL/TP.
-        
-        Args:
-            ticket:      MT5 position ticket
-            stop_loss:   New SL price
-            take_profit: New TP price
-            
-        Returns:
-            Modification result
+        No retry — only used for emergency manual SL adjustments.
+        Trailing and breakeven are now fully managed by the EA.
         """
         logger.info(f"Modifying position {ticket}: SL={stop_loss}, TP={take_profit}")
-        
-        command = {
-            'action': 'modify_position',
-            'ticket': ticket
-        }
+
+        command = {'action': 'modify_position', 'ticket': ticket}
         if stop_loss is not None:
             command['sl'] = stop_loss
         if take_profit is not None:
             command['tp'] = take_profit
-        
+
         response = await self._send_command(command)
-        
+
         if response.get('status') == 'success':
-            logger.info(f"Position {ticket} modified")
             return {'success': True, 'ticket': ticket}
         else:
             logger.error(f"Modify failed: {response.get('error')}")
             return {'success': False, 'error': response.get('error')}
 
+    @_with_retry(max_attempts=5, backoff_seconds=1.0)
     async def close_position(
         self,
         ticket: int,
         volume: Optional[float] = None,
-        comment: Optional[str] = None
+        comment: Optional[str] = None,
     ) -> Dict:
         """
         Close position (full or partial).
-        
-        Args:
-            ticket:  MT5 position ticket
-            volume:  Volume to close (None = full close)
-            comment: Close comment
-            
-        Returns:
-            Close result
+        Retries up to 5 times with 1-second backoff — missed close = exposure risk.
         """
         logger.info(f"Closing position {ticket}, volume: {volume or 'full'}")
-        
+
         command = {
             'action':  'close_position',
             'ticket':  ticket,
             'volume':  volume or 0,
-            'comment': comment or 'Python'
+            'comment': comment or 'Python',
         }
-        
+
         response = await self._send_command(command, timeout=10.0)
-        
+
         if response.get('status') == 'success':
             logger.info(f"Position {ticket} closed")
             return {
                 'success':       True,
                 'ticket':        ticket,
                 'closed_volume': volume or 0,
-                'profit':        response.get('profit', 0)
+                'profit':        response.get('profit', 0),
             }
         else:
             logger.error(f"Close failed: {response.get('error')}")
             return {'success': False, 'error': response.get('error')}
 
     async def get_position_info(self, ticket: int) -> Optional[Dict]:
-        """
-        Get position information.
-        
-        Args:
-            ticket: MT5 position ticket
-            
-        Returns:
-            Position dict or None
-        """
-        command = {
-            'action': 'get_position',
-            'ticket': ticket
-        }
-        
-        response = await self._send_command(command)
-        
-        if response.get('status') == 'success':
-            return response
-        else:
-            return None
+        response = await self._send_command({'action': 'get_position', 'ticket': ticket})
+        return response if response.get('status') == 'success' else None
 
     async def get_all_positions(self) -> list | None:
         """
-        Get all open positions.
+        Get all open positions managed by this EA (filtered by magic number).
 
         Returns:
-            List of position dicts if the bridge call succeeded (may be empty
-            if there are genuinely no open positions).
-            None if the bridge call failed (timeout, EA unresponsive, etc.).
-            Callers MUST check for None before processing closes — an empty
-            list from a failed call is indistinguishable from "no positions"
-            otherwise, causing false external-close events.
+            List of position dicts on success (may be empty = no positions).
+            None if the bridge call failed — callers must check for None to
+            avoid false external-close detection.
         """
-        command = {
-            'action': 'get_all_positions',
-            'magic':  self.magic_number
-        }
-
+        command = {'action': 'get_all_positions', 'magic': self.magic_number}
         response = await self._send_command(command)
 
         if response.get('status') == 'success':
@@ -547,221 +537,141 @@ class MT5FileBridge:
             )
             return None
 
-    async def get_balance(self) -> Dict:
-            """
-            Fetch live account balance and equity from MT5 via the authenticate action.
-            The EA's HandleAuthenticate() returns account, balance, and equity.
-
-            Returns:
-                Dict with keys: success (bool), balance (float), equity (float), account (int)
-            """
-            response = await self._send_command({'action': 'authenticate'})
-
-            if response.get('status') == 'success':
-                return {
-                    'success': True,
-                    'balance': response.get('balance', 0.0),
-                    'equity' : response.get('equity',  0.0),
-                    'account': response.get('account', 0),
-                }
-            else:
-                logger.warning(f"get_balance failed: {response.get('error')}")
-                return {'success': False, 'balance': 0.0, 'equity': 0.0}
-
-    async def get_deal_history(self, ticket: int, lookback_hours: int = 48) -> dict:
+    async def get_all_orders(self) -> list | None:
         """
-        Fetch all closing deal records for a given position ticket from MT5.
-        Fixed EA returns a 'deals' array covering all partial closes.
-        """
-        if self.demo_mode:
-            return {
-                'status'              : 'success',
-                'ticket'              : ticket,
-                'deal_count'          : 1,
-                'total_profit'        : 0.0,
-                'total_volume_closed' : 0.0,
-                'exit_price'          : 0.0,   # convenience field
-                'profit'              : 0.0,
-                'exit_reason'         : 'demo_close',
-                'deals'               : []
-            }
-
-        now      = int(time.time())
-        from_ts  = now - (lookback_hours * 3600)
-
-        response = await self._send_command({
-            'action'    : 'get_deal_history',
-            'ticket'    : ticket,
-            'from_time' : from_ts,
-            'to_time'   : now + 3600,
-        })
-
-        if response.get('status') != 'success':
-            logger.warning(f"get_deal_history failed for ticket {ticket}: {response.get('error')}")
-            return {
-                'status'  : 'error',
-                'ticket'  : ticket,
-                'profit'  : 0.0,
-                'deals'   : [],
-                'error'   : response.get('error', 'unknown')
-            }
-
-        deals = response.get('deals', [])
-
-        # Convenience scalars derived from the deals array
-        # Use the LAST closing deal's price as the representative exit price
-        last_deal      = deals[-1] if deals else {}
-        total_profit   = response.get('total_profit', 0.0)
-        exit_price     = last_deal.get('exit_price', 0.0)
-        exit_time      = last_deal.get('exit_time', 0)
-
-        logger.info(
-            f"get_deal_history ticket={ticket}: "
-            f"{response.get('deal_count', 0)} deal(s), "
-            f"total_profit={total_profit:.2f}, "
-            f"exit_price={exit_price}"
-        )
-
-        return {
-            'status'              : 'success',
-            'ticket'              : ticket,
-            'deal_count'          : response.get('deal_count', len(deals)),
-            'total_profit'        : total_profit,
-            'total_volume_closed' : response.get('total_volume_closed', 0.0),
-            'exit_price'          : exit_price,       # last partial close price
-            'profit'              : total_profit,     # alias for callers expecting 'profit'
-            'exit_time'           : exit_time,
-            'exit_reason'         : 'closed',
-            'deals'               : deals,            # full array for audit logging
-        }
-    # ------------------------------------------------------------------
-    # Helper: convert raw bar list to DataFrame
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _bars_to_df(bars: list, drop_last: bool = False) -> pd.DataFrame:
-        """
-        Convert list of [time, open, high, low, close, volume] to DataFrame.
-
-        Args:
-            bars:      Raw bar data from EA
-            drop_last: If True, drop the last (currently forming) bar
+        Get all pending limit/stop orders managed by this EA.
 
         Returns:
-            DataFrame with UTC timestamp index
+            List of order dicts on success, None on bridge failure.
         """
-        if not bars:
-            return pd.DataFrame(
-                columns=['open', 'high', 'low', 'close', 'volume']
+        command = {'action': 'get_all_orders', 'magic': self.magic_number}
+        response = await self._send_command(command)
+
+        if response.get('status') == 'success':
+            return response.get('orders', [])
+        else:
+            logger.warning(
+                f"get_all_orders failed: {response.get('error', 'unknown')}"
+            )
+            return None
+
+    @_with_retry(max_attempts=3, backoff_seconds=1.0)
+    async def cancel_order(self, ticket: int) -> Dict:
+        """
+        Cancel a pending limit or stop order.
+        Retries up to 3 times with 1-second backoff.
+        Returns dict with 'success' key.
+        """
+        logger.info(f"Cancelling order ticket={ticket}")
+
+        command = {'action': 'cancel_order', 'ticket': ticket}
+        response = await self._send_command(command)
+
+        if response.get('status') == 'success':
+            logger.info(f"Order {ticket} cancelled")
+            return {'success': True, 'ticket': ticket}
+        else:
+            logger.error(f"Cancel failed ticket={ticket}: {response.get('error')}")
+            return {'success': False, 'error': response.get('error')}
+
+    @_with_retry(max_attempts=3, backoff_seconds=5.0)
+    async def get_deal_history(
+        self,
+        ticket: int,
+        lookback_hours: int = 48,
+    ) -> Dict:
+        """
+        Fetch all closing deal records for a given position ticket.
+        Retries up to 3 times with 5-second backoff — post-close so no urgency,
+        but must eventually complete for accurate P&L logging.
+        """
+        now_ts   = int(time.time())
+        from_ts  = now_ts - lookback_hours * 3600
+        to_ts    = now_ts + 3600
+
+        command = {
+            'action':    'get_deal_history',
+            'ticket':    ticket,
+            'from_time': from_ts,
+            'to_time':   to_ts,
+        }
+
+        response = await self._send_command(command, timeout=30.0)
+
+        if response.get('status') == 'success':
+            deals        = response.get('deals', [])
+            total_profit = response.get('total_profit', 0.0)
+            total_vol    = response.get('total_volume_closed', 0.0)
+            deal_count   = response.get('deal_count', len(deals))
+
+            logger.info(
+                f"get_deal_history ticket={ticket}: {deal_count} deal(s), "
+                f"total_profit={total_profit:.2f}, "
+                f"exit_price={deals[-1].get('exit_price', 0) if deals else 0}"
             )
 
-        df = pd.DataFrame(
-            bars,
-            columns=['time', 'open', 'high', 'low', 'close', 'volume']
-        )
-        df['timestamp'] = pd.to_datetime(df['time'], unit='s', utc=True)
-        df.set_index('timestamp', inplace=True)
-        df.drop('time', axis=1, inplace=True)
+            last_deal = deals[-1] if deals else {}
 
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-
-        df.dropna(inplace=True)
-        df.sort_index(inplace=True)
-
-        if drop_last and len(df) > 1:
-            df = df.iloc[:-1]
-
-        return df
-
-    # ------------------------------------------------------------------
-    # Demo-mode simulation
-    # ------------------------------------------------------------------
-
-    async def _simulate_command(self, command: Dict) -> Dict:
-        """Simulate EA responses for demo/test mode."""
-        action = command.get('action')
-        await asyncio.sleep(0.01)
-
-        if action == 'ping':
-            return {'status': 'success', 'message': 'pong'}
-
-        if action == 'authenticate':
-            return {'status': 'success', 'account': 99999, 'balance': 100000.0, 'equity': 100000.0}
-
-        if action in ('get_historical', 'get_historical_range'):
-            # Generate synthetic bars for demo
-            import numpy as np
-            count = command.get('count', 500)
-            if action == 'get_historical_range':
-                from_ts = command.get('from_date', 0)
-                to_ts   = command.get('to_date', 0)
-                tf_seconds = {'M1': 60, 'M5': 300, 'M15': 900, 'M30': 1800,
-                              'H1': 3600, 'H4': 14400, 'D1': 86400}
-                tf_secs = tf_seconds.get(command.get('timeframe', 'H1'), 3600)
-                count = max(1, (to_ts - from_ts) // tf_secs)
-                start_ts = from_ts
-            else:
-                tf_seconds = {'M1': 60, 'M5': 300, 'M15': 900, 'M30': 1800,
-                              'H1': 3600, 'H4': 14400, 'D1': 86400}
-                tf_secs  = tf_seconds.get(command.get('timeframe', 'H1'), 3600)
-                start_ts = int(time.time()) - count * tf_secs
-
-            np.random.seed(42)
-            price = 2000.0
-            bars  = []
-            for i in range(count):
-                ts    = start_ts + i * tf_secs
-                chg   = np.random.normal(0, 0.5)
-                price = max(price + chg, 1000.0)
-                rng   = abs(np.random.normal(0, 0.3))
-                bars.append([ts, round(price, 2), round(price + rng, 2),
-                              round(price - rng, 2), round(price, 2), 1000])
-
-            return {'status': 'success', 'count': count, 'data': bars}
-
-        if action == 'place_order':
-            ticket = len(self.demo_orders) + 1
-            price  = 2000.0
-            self.demo_orders[ticket] = command
-            self.demo_positions[ticket] = {'ticket': ticket, 'price': price, **command}
-            return {'status': 'success', 'ticket': ticket, 'price': price, 'volume': command.get('volume', 0.1)}
-
-        if action == 'modify_position':
-            ticket = command.get('ticket')
-            if ticket in self.demo_positions:
-                self.demo_positions[ticket].update({'sl': command.get('sl'), 'tp': command.get('tp')})
-                return {'status': 'success', 'ticket': ticket}
-            return {'status': 'error', 'error': 'Position not found'}
-
-        if action == 'close_position':
-            ticket = command.get('ticket')
-            if ticket in self.demo_positions:
-                del self.demo_positions[ticket]
-                return {'status': 'success', 'ticket': ticket}
-            return {'status': 'error', 'error': 'Position not found'}
-
-        if action == 'get_all_positions':
-            positions = list(self.demo_positions.values())
-            return {'status': 'success', 'positions': positions}
-
-        if action == 'get_deal_history':
-            ticket = command.get('ticket', 0)
             return {
-                'status'     : 'success',
-                'ticket'     : ticket,
-                'entry_price': 0.0,
-                'exit_price' : 0.0,
-                'volume'     : 0.0,
-                'profit'     : 0.0,
-                'swap'       : 0.0,
-                'commission' : 0.0,
-                'net_profit' : 0.0,
-                'close_time' : 0,
-                'exit_reason': 'demo_close',
+                'success':      True,
+                'ticket':       ticket,
+                'deal_count':   deal_count,
+                'total_profit': total_profit,
+                'exit_price':   last_deal.get('exit_price', 0.0),
+                'exit_time':    last_deal.get('exit_time', 0),
+                'deals':        deals,
+            }
+        else:
+            logger.warning(
+                f"get_deal_history ticket={ticket}: "
+                f"{response.get('error', 'unknown error')}"
+            )
+            return {
+                'success': False,
+                'error':   response.get('error', 'unknown'),
             }
 
-        if action == 'authenticate':
-            return {'status': 'success', 'account': 99999, 'balance': 10000.0, 'equity': 10000.0}
+    async def get_balance(self) -> Dict:
+        """Fetch live account balance/equity via the authenticate action."""
+        response = await self._send_command({'action': 'authenticate'})
 
-        return {'status': 'error', 'error': f'Unknown action: {action}'}
+        if response.get('status') == 'success':
+            return {
+                'success': True,
+                'balance': response.get('balance', 0.0),
+                'equity':  response.get('equity',  0.0),
+                'account': response.get('account', 0),
+            }
+        else:
+            logger.warning(f"get_balance failed: {response.get('error')}")
+            return {'success': False, 'balance': 0.0, 'equity': 0.0}
+
+    async def get_symbol_sessions(self, symbol: str) -> Dict:
+        return await self._send_command(
+            {'action': 'get_symbol_sessions', 'symbol': symbol},
+            timeout=15.0,
+        )
+
+    async def get_current_price(self, symbol: str) -> Optional[Dict]:
+        try:
+            df = await self.fetch_historical(symbol, '1m', count=1)
+            if df.empty:
+                return None
+            close  = float(df['close'].iloc[-1])
+            spread = 0.30
+            return {
+                'symbol': symbol,
+                'bid':    close - spread / 2,
+                'ask':    close + spread / 2,
+                'spread': spread,
+                'time':   df.index[-1],
+            }
+        except Exception as e:
+            logger.error(f"Error getting current price for {symbol}: {e}")
+            return None
+
+    async def subscribe_live(self, symbol: str, callback) -> None:
+        logger.warning("Live subscriptions not supported with file bridge")
+
+    async def close(self):
+        await self.disconnect()

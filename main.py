@@ -312,8 +312,8 @@ class TradingSystem:
         
         while self.running:
             try:
-                # Update equity every 30 seconds
-                await asyncio.sleep(30)
+                # Update equity every 300 seconds (5 minutes) to balance freshness with API load
+                await asyncio.sleep(300)
                 
                 current_equity = await self._get_total_balance()
                 
@@ -756,8 +756,10 @@ class TradingSystem:
                 logger.warning(f"[{symbol}] No data fetched — skipping cycle.")
                 return
  
-            analysis = self.strategy_engine.analyze_market(symbol, multi_tf_data)
- 
+            analysis = self.strategy_engine.analyze_market(
+                symbol, multi_tf_data, symbol_config=symbol_config
+                )
+            
             try:
                 analysis_id = self.audit_logger.log_analysis(analysis)
                 analysis['analysis_id'] = analysis_id
@@ -1180,8 +1182,8 @@ class TradingSystem:
         
         # ── Enforce minimum monitor interval to prevent bridge saturation ──────
         monitor_interval = max(
-            5,  # Minimum 5 seconds
-            self.config.get('monitor', {}).get('interval_seconds', 10)
+            70,  # 70 seconds is a safe default to avoid hitting EA timeouts under load
+            self.config.get('monitor', {}).get('interval_seconds', 70)
         )
         
         while self.running:
@@ -1227,7 +1229,9 @@ class TradingSystem:
                 # Batch check MT5 positions (single API call)
                 if mt5_positions:
                     await self._batch_update_mt5_positions(mt5_positions)
-                    await self._check_pending_limit_orders()
+                
+                # Always check pending limit orders regardless of open positions
+                await self._check_pending_limit_orders()
                 
                 # Wait before next check (respecting minimum interval)
                 await asyncio.sleep(monitor_interval)
@@ -1325,9 +1329,6 @@ class TradingSystem:
                 position['current_price'] = current_price
                 self._check_and_handle_tp_levels_sync(trade_id, position, current_price)
 
-                # ── Trailing stop ─────────────────────────────────────────────────
-                await self._update_trailing_stop_if_needed(trade_id, position, current_price)
-
         except Exception as e:
             logger.error(f"[MONITOR] Error batch updating MT5 positions: {e}", exc_info=True)
 
@@ -1339,140 +1340,9 @@ class TradingSystem:
         current_price: float,
         ):
         """
-        Check whether the trailing stop should be moved and, if so, send the
-        modify call to MT5.
-
-        Uses StopManager.compute_trailing_sl() which wraps the existing
-        _calculate_atr_trailing_stop / _calculate_percentage_trailing_stop.
+        Trailing and breakeven are now managed by the EA. Python no-op.
         """
-        cfg_trail   = self.config.get('risk_management', {}).get('trailing_stop', {})
-        if not cfg_trail.get('enabled', True):
-            return
-
-        rr_activate         = cfg_trail.get('activation_rr', 1.0)
-        min_update_interval = cfg_trail.get('min_update_interval_seconds', 30)
-
-        ticket      = position.get('ticket')
-        symbol      = position.get('symbol', '')
-        direction   = position.get('direction', 'long')   # 'long' | 'short'
-        entry_price = position.get('entry_price', 0.0)
-        # Use original SL for RR calc — current_sl may have moved to breakeven
-        original_sl = position.get('original_stop_loss') or position.get('stop_loss', 0.0)
-        current_sl  = position.get('stop_loss', 0.0)
-        current_tp  = position.get('take_profit_1', 0.0) or 0.0
-
-        if not entry_price or not current_sl:
-            return
-
-        # Rate-limit: avoid hammering MT5 with modify calls
-        last_update = position.get('last_sl_update', 0.0)
-        if (_monotime.time() - last_update) < min_update_interval:
-            return
-
-        # Initial risk uses ORIGINAL SL so RR is always relative to entry risk
-        initial_risk = abs(entry_price - original_sl)
-        if initial_risk == 0:
-            return
-
-        price_move = (current_price - entry_price) if direction == 'long' \
-                     else (entry_price - current_price)
-        achieved_rr = price_move / initial_risk
-
-        # ── Activation check ─────────────────────────────────────────────────
-        if not position.get('trailing_active', False):
-            if achieved_rr < rr_activate:
-                return  # Not yet profitable enough to trail
-
-            # Break-even move on first activation
-            be_cfg     = cfg_trail.get('breakeven', {})
-            buffer_pts = be_cfg.get('buffer_pips', 1) * self._pip_size(symbol)
-
-            if direction == 'long':
-                breakeven_sl = entry_price + buffer_pts
-                if current_sl < breakeven_sl:
-                    try:
-                        await self._send_sl_modify(
-                            trade_id, position, breakeven_sl, current_tp, label='breakeven'
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"[TRAIL] Breakeven SL modify failed for trade_id={trade_id} "
-                            f"ticket={ticket}: {e}"
-                        )
-                        # Don't propagate — let position monitoring continue
-            else:
-                breakeven_sl = entry_price - buffer_pts
-                if current_sl > breakeven_sl:
-                    try:
-                        await self._send_sl_modify(
-                            trade_id, position, breakeven_sl, current_tp, label='breakeven'
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"[TRAIL] Breakeven SL modify failed for trade_id={trade_id} "
-                            f"ticket={ticket}: {e}"
-                        )
-                        # Don't propagate — let position monitoring continue
-
-            position['trailing_active'] = True
-            logger.info(
-                f"[TRAIL] trade_id={trade_id} ticket={ticket} ({symbol}) "
-                f"trailing ACTIVATED at RR={achieved_rr:.2f}"
-            )
-
-        # ── Fetch ATR for trail calculation ───────────────────────────────────
-        # Use the ATR already computed during the last analysis pass if cached,
-        # otherwise fall back to a simple price-based estimate.
-        atr = position.get('last_atr')
-        if not atr or atr <= 0:
-            # Rough fallback: 0.1% of price — keeps trailing functional if
-            # no ATR is cached yet
-            atr = current_price * 0.001
-            logger.debug(
-                f"[TRAIL] No cached ATR for {symbol}, using fallback {atr:.4f}"
-            )
-
-        # Track high/low since entry on the position dict
-        if direction == 'long':
-            position['high_since_entry'] = max(
-                position.get('high_since_entry', entry_price), current_price
-            )
-            position['low_since_entry'] = min(
-                position.get('low_since_entry', entry_price), current_price
-            )
-        else:
-            position['high_since_entry'] = max(
-                position.get('high_since_entry', entry_price), current_price
-            )
-            position['low_since_entry'] = min(
-                position.get('low_since_entry', entry_price), current_price
-            )
-
-        # ── Call the real StopManager method ─────────────────────────────────
-        try:
-            new_sl = self.stop_manager.compute_trailing_sl(
-                direction        = direction,
-                current_price    = current_price,
-                current_sl       = current_sl,
-                high_since_entry = position['high_since_entry'],
-                low_since_entry  = position['low_since_entry'],
-                atr              = atr,
-            )
-        except Exception as exc:
-            logger.error(f"[TRAIL] StopManager error for ticket={ticket}: {exc}")
-            return
-
-        if new_sl is None:
-            return
-
-        try:
-            await self._send_sl_modify(trade_id, position, new_sl, current_tp, label='trail')
-        except Exception as e:
-            logger.error(
-                f"[TRAIL] Trailing SL modify failed for trade_id={trade_id} "
-                f"ticket={ticket}: {e}"
-            )
-            # Don't propagate — let position monitoring continue
+        return
 
 
 

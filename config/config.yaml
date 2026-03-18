@@ -121,6 +121,12 @@ strategy:
     - macd_zero_cross        # Market order — momentum shift confirmed
     - momentum_breakout      # Market order — always immediate
     - rsi_divergence         # Limit order  — reversal at structure
+    # - crossover_entry         # Limit order  — e.g. EMA20 crossing EMA50
+    # - candle_pattern_entry    # Limit order  — e.g. bullish engulfing at support
+    # - price_action_entry       # Limit order  — e.g. HHHL structure break retest
+    # - bandbreak_entry           # Limit order  — price breaking above upper BB or below lower BB
+    # - vwap_reversion_entry       # Limit order  — price rejecting from VWAP after touching it
+    # - obv_divergence_entry       # Limit order  — OBV divergence at structure
  
   # Score threshold for volatile symbols (XAUUSD, BTC, NAS100).
   # Override per-symbol with confluence_threshold in the symbol block.

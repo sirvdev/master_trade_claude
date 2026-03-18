@@ -57,7 +57,7 @@ class MT5DataClient(MarketDataClient):
         self._connected = self.bridge.is_connected()
         
     async def fetch_historical(self, symbol: str, timeframe: str, 
-                               limit: int = 500) -> pd.DataFrame:
+                               limit: int = 250) -> pd.DataFrame:
         """
         Fetch historical data via MT5 file bridge.
         
@@ -164,7 +164,7 @@ class MultiMarketClient:
         return self.clients[platform]
         
     async def fetch_historical(self, symbol: str, platform: str, 
-                               timeframe: str, limit: int = 500) -> pd.DataFrame:
+                               timeframe: str, limit: int = 250) -> pd.DataFrame:
         """
         Fetch historical data from appropriate platform.
         
@@ -209,8 +209,7 @@ class MultiMarketClient:
                 try:
                     df = await self.fetch_historical(symbol, platform, tf)
                     data[tf] = df
-                    # Small delay to ensure file operations complete
-                    await asyncio.sleep(0.5)
+                    # Small delay to enure fil\\\
                 except Exception as e:
                     logger.error(f"Error fetching {tf} for {symbol}: {e}")
                     continue
