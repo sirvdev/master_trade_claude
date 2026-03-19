@@ -206,8 +206,26 @@ class StrategyEngine:
                'confluence_signals':[],'order_type':'market','limit_price':None}
 
         snaps = analysis['timeframe_snapshots']
+
+        # ── Bug 3 fix: structure TF timeout fallback ──────────────────────────
+        # If the structure TF fetch failed (e.g. 4H timeout), don't return
+        # score=0 immediately. Fall back to the next available TF for structure
+        # bias. The signal will still fire; it just uses a shorter TF for bias.
         if structure_tf not in snaps:
-            return out
+            # Try primary_tf, then any available TF, in descending timeframe order
+            fallback_order = sorted(
+                snaps.keys(),
+                key=lambda t: self._tf_minutes(t),
+                reverse=True
+            )
+            if not fallback_order:
+                out['entry_reason'] = 'No timeframe data available'
+                return out
+            structure_tf = fallback_order[0]
+            logger.warning(
+                f"[ENGINE] structure TF not in snapshots — "
+                f"falling back to {structure_tf} for bias"
+            )
 
         # Use primary_tf for signal detection; fall back to structure_tf
         sig_tf = primary_tf if primary_tf in snaps else structure_tf
@@ -225,25 +243,60 @@ class StrategyEngine:
         bias      = analysis.get('market_structure', {}).get('trend')
         threshold = self._get_threshold(analysis.get('symbol',''))
 
+        # ── Bug 2 fix: track best score across all attempted entry types ──────
+        # Even when no entry type meets the threshold, record the best score
+        # found so analysts and the learning engine can see how close the system
+        # was to signaling ("score=5, threshold=7" is far more useful than "0").
+        best_score   = 0.0
+        best_signals = []
+        best_etype   = None
+        best_dir     = None
+
         for etype in self.strategy_config.get('entry_types', ['breakout_retest']):
             res = self._check(etype, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias)
             if not res.get('signal'):
                 continue
+
             score = self._score(res['confluence_signals'])
+
+            # Track the highest score seen regardless of whether it passed
+            if score > best_score:
+                best_score   = score
+                best_signals = res['confluence_signals']
+                best_etype   = etype
+                best_dir     = res.get('direction')
+
             if score < threshold:
                 logger.debug(f"[{analysis.get('symbol')}] {etype}: "
-                             f"score={score} < threshold={threshold}")
+                             f"score={score:.0f} < threshold={threshold} "
+                             f"signals={res['confluence_signals']}")
                 continue
+
+            # ── Full match — signal fires ─────────────────────────────────────
             otype = 'limit' if etype in _LIMIT_ORDER_TYPES else 'market'
             out.update({
                 'entry_signal': True, 'entry_reason': res.get('entry_reason', etype),
                 'entry_type': etype, 'direction': res['direction'],
-                'confidence_score': min(1.0, score / max(threshold*1.5, 10.0)),
+                'confidence_score': min(1.0, score / max(threshold * 1.5, 10.0)),
                 'confluence_score': score,
                 'confluence_signals': res['confluence_signals'],
                 'order_type': otype, 'limit_price': res.get('limit_price'),
             })
-            break
+            return out
+
+        # ── No full match — populate best-attempt scores for logging/learning ─
+        if best_score > 0:
+            out.update({
+                'confluence_score':   best_score,
+                'confluence_signals': best_signals,
+                'confidence_score':   min(1.0, best_score / max(threshold * 1.5, 10.0)),
+                'entry_reason':       (
+                    f'Below threshold ({best_score:.0f}/{threshold}) — '
+                    f'best: {best_etype} {best_dir or ""}'
+                ),
+                'direction': best_dir,  # preserves direction for logging even without signal
+            })
+
         return out
 
     def _check(self, etype, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):

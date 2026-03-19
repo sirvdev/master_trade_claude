@@ -318,13 +318,24 @@ class MT5FileBridge:
         timeframe: str,
         count: int = 250,
     ) -> pd.DataFrame:
-        """Fetch the last N closed bars for a symbol/timeframe."""
+        """Fetch the last N closed bars for a symbol/timeframe.
+
+        Timeout scales with timeframe size — 4H/1D bars produce much larger
+        response payloads than 1m/5m bars, causing timeouts at the default 30s.
+        """
         tf_map = {
             '1m':'M1','5m':'M5','15m':'M15','30m':'M30',
             '1H':'H1','4H':'H4','1D':'D1','1W':'W1',
             'M1':'M1','M5':'M5','M15':'M15','H1':'H1','H4':'H4','D1':'D1',
         }
         mt5_tf = tf_map.get(timeframe, timeframe)
+
+        # Longer TFs have larger payloads — scale timeout accordingly
+        timeout_map = {
+            'M1': 30.0, 'M5': 30.0, 'M15': 30.0, 'M30': 30.0,
+            'H1': 45.0, 'H4': 60.0, 'D1': 60.0, 'W1': 60.0,
+        }
+        fetch_timeout = timeout_map.get(mt5_tf, 45.0)
 
         command = {
             'action':    'get_historical',
@@ -333,7 +344,7 @@ class MT5FileBridge:
             'count':     count,
         }
 
-        response = await self._send_command(command, timeout=30.0)
+        response = await self._send_command(command, timeout=fetch_timeout)
 
         if response.get('status') != 'success':
             raise ValueError(f"Failed to fetch data: {response.get('error','unknown')}")
@@ -613,12 +624,26 @@ class MT5FileBridge:
 
             last_deal = deals[-1] if deals else {}
 
+            # Sum swap and commission across all partial deals (EA returns per-deal)
+            total_swap       = sum(float(d.get('swap', 0.0))       for d in deals)
+            total_commission = sum(float(d.get('commission', 0.0)) for d in deals)
+            net_profit       = total_profit + total_swap + total_commission
+
             return {
                 'status':       'success',   # main.py checks deal.get('status') == 'success'
                 'success':      True,
                 'ticket':       ticket,
                 'deal_count':   deal_count,
+                # Aggregated fields (new names)
                 'total_profit': total_profit,
+                # Backward-compat names that _compute_close_fields reads via deal.get(...)
+                'profit':       total_profit,   # deal.get('profit', 0.0)
+                'net_profit':   net_profit,     # deal.get('net_profit', gross+swap+commission)
+                'swap':         total_swap,     # deal.get('swap', 0.0)
+                'commission':   total_commission, # deal.get('commission', 0.0)
+                'exit_reason':  last_deal.get('exit_reason', 'external_close'),
+                'close_time':   last_deal.get('exit_time', 0),  # deal.get('close_time')
+                # Price and time
                 'exit_price':   last_deal.get('exit_price', 0.0),
                 'exit_time':    last_deal.get('exit_time', 0),
                 'deals':        deals,
