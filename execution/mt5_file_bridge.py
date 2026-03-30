@@ -145,6 +145,18 @@ class MT5FileBridge:
             self._connected = True
             return
 
+        # Clean up any orphaned response files from a previous session.
+        # These are left behind when Python times out before the EA finishes.
+        # They will never be read again and accumulate on disk indefinitely.
+        orphans = list(self.common_path.glob("python_response_*.txt"))
+        if orphans:
+            for f in orphans:
+                try:
+                    f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            logger.info(f"[BRIDGE] Cleaned up {len(orphans)} orphaned response file(s) from previous session")
+
         try:
             self.session_file.write_text(self.session_id, encoding='utf-8')
             logger.info(f"Session ID: {self.session_id}")
@@ -222,10 +234,24 @@ class MT5FileBridge:
         try:
             if not response_file.exists():
                 return None
+
             content = response_file.read_text(encoding='utf-8', errors='ignore').strip()
+
+            # Guard against partial write: EA may still be flushing the file.
+            # An incomplete JSON will fail to parse — return None so the next
+            # poll iteration tries again rather than silently losing the response.
+            if not content or not content.endswith('}'):
+                return None
+
+            parsed = json.loads(content)
             response_file.unlink(missing_ok=True)
-            return json.loads(content)
-        except (json.JSONDecodeError, PermissionError, FileNotFoundError):
+            return parsed
+
+        except (json.JSONDecodeError, PermissionError):
+            # File exists but can't be read/parsed yet — EA still writing.
+            # Do NOT delete it; return None and retry on next poll cycle.
+            return None
+        except FileNotFoundError:
             return None
         except Exception as e:
             logger.debug(f"Error reading response for {request_id}: {e}")
@@ -537,7 +563,7 @@ class MT5FileBridge:
             avoid false external-close detection.
         """
         command = {'action': 'get_all_positions', 'magic': self.magic_number}
-        response = await self._send_command(command)
+        response = await self._send_command(command, timeout=45.0)
 
         if response.get('status') == 'success':
             return response.get('positions', [])
@@ -556,7 +582,7 @@ class MT5FileBridge:
             List of order dicts on success, None on bridge failure.
         """
         command = {'action': 'get_all_orders', 'magic': self.magic_number}
-        response = await self._send_command(command)
+        response = await self._send_command(command, timeout=45.0)
 
         if response.get('status') == 'success':
             return response.get('orders', [])
@@ -596,6 +622,12 @@ class MT5FileBridge:
         3-attempt loop with growing lookback windows (48h → 96h → 192h).
         Adding a decorator here caused 9 EA calls instead of 3 and 30+ seconds
         of startup delay every time a trade was closed while the system was down.
+
+        Timeout scales with lookback_hours — scanning 300h of deal history takes
+        far longer than 30s on the EA side. Python was timing out at 30s, the EA
+        then finished and wrote the response to disk which was never read.
+        MT5 Experts tab showed "responded" because the EA DID finish — just late.
+          48h -> 75s  |  96h -> 90s  |  192h -> 120s  |  384h -> 180s
         """
         now_ts   = int(time.time())
         from_ts  = now_ts - lookback_hours * 3600
@@ -608,7 +640,9 @@ class MT5FileBridge:
             'to_time':   to_ts,
         }
 
-        response = await self._send_command(command, timeout=30.0)
+        # Scale timeout: 60s base + 15s per 48h of lookback, capped at 180s
+        scaled_timeout = min(60.0 + (lookback_hours / 48) * 15.0, 180.0)
+        response = await self._send_command(command, timeout=scaled_timeout)
 
         if response.get('status') == 'success':
             deals        = response.get('deals', [])

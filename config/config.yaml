@@ -11,7 +11,7 @@ symbols:
     timeframes:
     - 1H
     - 15m
-    - 5m
+    - 1m
     primary_timeframe: 15m
     entry_timeframe: 5m
     confluence_threshold: 7
@@ -20,11 +20,11 @@ symbols:
     platform: mt5
     mode: live
     timeframes:
-    - 4H
+    - 1H
     - 15m
-    - 1m
+    - 5m
     primary_timeframe: 15m
-    entry_timeframe: 1m
+    entry_timeframe: 5m
     confluence_threshold: 7
   XAG/USD:
     enabled: true
@@ -38,14 +38,14 @@ symbols:
     entry_timeframe: 15m
     confluence_threshold: 5
   EUR/USD:
-    enabled: false
+    enabled: true
     platform: mt5
     mode: live
     timeframes:
-    - 1D
     - 4H
+    - 1H
     - 15m
-    primary_timeframe: 4H
+    primary_timeframe: 1H
     entry_timeframe: 15m
     confluence_threshold: 5
 indicators:
