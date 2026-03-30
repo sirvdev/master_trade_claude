@@ -166,6 +166,17 @@ strategy:
     allow_override: false
     min_atr_threshold: 0.0005
     max_atr_threshold: 0.05
+    session_blockouts:
+      - name: london_market_orders
+        enabled: true
+        start: '07:00'
+        end: '12:00'
+        order_types: ['market']
+      - name: overlap_all_orders
+        enabled: true
+        start: '20:00'
+        end: '24:00'
+        order_types: ['market', 'limit']
     news_blackout:
       enabled: false
       windows:
@@ -177,6 +188,7 @@ strategy:
           days: [1, 2, 3]
 risk_management:
   max_risk_percent_per_trade: 0.2
+  max_position_size_lots: 2.0
   use_dynamic_sizing: true
   stop_loss:
     method: conservative

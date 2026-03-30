@@ -11,7 +11,7 @@ under each symbol block. Fixed by passing symbol_config into analyze_market().
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, time
 from typing import Dict, List, Optional
 import pandas as pd
 from indicators.indicators import TechnicalIndicators
@@ -614,6 +614,34 @@ class StrategyEngine:
             elif atr_pct > mx*100:
                 analysis['entry_signal']=False
                 analysis['entry_reason']=f'Filtered: ATR too high ({atr_pct:.2f}%)'
+
+        # ── Session blackout rules (user-requested trading windows) ──────────
+        now = datetime.utcnow().time()
+
+        # Overlap session (20:00–24:00 UTC) is fully disabled
+        if time(20,0) <= now or now < time(0,0):
+            analysis['entry_signal'] = False
+            analysis['entry_reason'] = 'Filtered: overlap session 20:00-24:00 UTC'
+            return analysis
+
+        # London session market orders (07:00–12:00 UTC) are disabled
+        if time(7,0) <= now < time(12,0) and analysis.get('order_type') == 'market':
+            analysis['entry_signal'] = False
+            analysis['entry_reason'] = 'Filtered: london market orders disabled 07:00-12:00 UTC'
+            return analysis
+
+        # Config-driven session blockout list (future-proof)
+        for window in filters.get('session_blockouts', []):
+            if not window.get('enabled', True):
+                continue
+            start = datetime.strptime(window.get('start', '00:00'), '%H:%M').time()
+            end = datetime.strptime(window.get('end', '24:00'), '%H:%M').time() if window.get('end', '24:00') != '24:00' else time(0,0)
+            in_window = (start <= now < end) if start < end else (now >= start or now < end)
+            blocked_types = set(window.get('order_types', ['market', 'limit']))
+            if in_window and analysis.get('order_type') in blocked_types:
+                analysis['entry_signal'] = False
+                analysis['entry_reason'] = f"Filtered: session blockout {window.get('name', 'unnamed')}"
+                return analysis
 
         if filters.get('news_blackout',{}).get('enabled',False):
             if self._news_blackout():

@@ -21,7 +21,8 @@ class MoneyManager:
         self.max_risk_percent = self.config.get('max_risk_percent_per_trade', 1.0)
         self.use_dynamic_sizing = self.config.get('use_dynamic_sizing', True)
         self.global_limits = self.config.get('global_limits', {})
-        
+        self.max_position_size_lots = float(self.config.get('max_position_size_lots', 2.0))
+
         # MT5 specific limits
         self.mt5_min_lot = 0.01
         self.mt5_max_lot = 100.0  # Conservative default
@@ -172,21 +173,26 @@ class MoneyManager:
     
     def _apply_mt5_constraints(self, lots: float) -> float:
         """Apply MT5 lot size constraints."""
-        # Ensure within min/max bounds
-        lots = max(self.mt5_min_lot, min(lots, self.mt5_max_lot))
-        
+        # Cap position size at both the platform limit and user-configured risk limit
+        max_allowed = min(self.mt5_max_lot, self.max_position_size_lots)
+        lots = max(self.mt5_min_lot, min(lots, max_allowed))
+
         # Round to lot step (usually 0.01)
         lots = round(lots / self.mt5_lot_step) * self.mt5_lot_step
-        
+
         # Final bounds check after rounding
         if lots < self.mt5_min_lot:
             logger.warning(f"Position size {lots} below minimum {self.mt5_min_lot}")
             return 0
-        
+
+        if lots > self.max_position_size_lots:
+            logger.warning(f"Position size {lots} above max_position_size_lots {self.max_position_size_lots}, capping")
+            lots = self.max_position_size_lots
+
         if lots > self.mt5_max_lot:
-            logger.warning(f"Position size {lots} above maximum {self.mt5_max_lot}, capping")
+            logger.warning(f"Position size {lots} above MT5 max_lot {self.mt5_max_lot}, capping")
             lots = self.mt5_max_lot
-        
+
         return lots
     
     def _apply_dynamic_adjustments(
@@ -428,6 +434,26 @@ class MoneyManager:
             'cooldown_active'   : True,
             'consecutive_losses': consecutive_losses,
             'reason'            : f"{consecutive_losses} consecutive losses (no timestamp)",
+        }
+
+    def calculate_portfolio_risk(self, open_positions: list) -> Dict:
+        """Calculate aggregated portfolio risk metrics for open positions."""
+        total_risk = sum(float(p.get('risk_amount', 0.0)) for p in open_positions)
+        total_value = sum(float(p.get('position_value', 0.0)) for p in open_positions)
+        symbols = {
+            p.get('symbol', 'unknown'): {
+                'risk_amount': float(p.get('risk_amount', 0.0)),
+                'position_value': float(p.get('position_value', 0.0)),
+            }
+            for p in open_positions
+        }
+        return {
+            'total_risk': total_risk,
+            'total_value': total_value,
+            'num_positions': len(open_positions),
+            'symbols': symbols,
+            'average_risk': total_risk / len(open_positions) if open_positions else 0.0,
+            'average_position_value': total_value / len(open_positions) if open_positions else 0.0,
         }
 
     def _get_mt5_contract_size(self, symbol: str) -> float:

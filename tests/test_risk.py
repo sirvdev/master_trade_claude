@@ -108,7 +108,23 @@ class TestMoneyManager:
         # Risk amount should be ~1% of equity
         expected_risk = 10000 * 0.01
         assert abs(result['risk_amount'] - expected_risk) < 10
-    
+
+    def test_max_position_size_cap(self, money_manager_config):
+        """Test that position size is capped at configured maximum lots."""
+        money_manager_config['risk_management']['max_position_size_lots'] = 2.0
+        mm = MoneyManager(money_manager_config)
+
+        result = mm.calculate_position_size(
+            account_equity=100000,
+            entry_price=1.1000,
+            stop_loss=1.0000,
+            symbol='EURUSD',
+            direction='long'
+        )
+
+        assert result['position_size'] <= 2.0
+        assert result['approved'] is True
+
     def test_zero_risk_distance(self, money_manager_config):
         """Test handling of zero risk distance."""
         mm = MoneyManager(money_manager_config)
