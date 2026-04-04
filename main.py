@@ -1568,53 +1568,13 @@ class TradingSystem:
         current_price: float,
     ) -> None:
         """
-        Check TP1/TP2 targets and trigger partial closes synchronously.
-        (Actual close calls are fire-and-forget via asyncio.ensure_future.)
+        TP partial closes are now fully managed by EA ManagePositions().
+        Python no-op to avoid dual-close conflict.
+        
+        The EA divides entry→TP into milestones and partials at each one,
+        then trails the runner. Python's role is signal + entry only.
         """
-        direction = position.get('direction', 'long')
-        ticket    = position.get('ticket')
-
-        tp1 = position.get('take_profit_1') or position.get('tp1_price')
-        tp2 = position.get('take_profit_2') or position.get('tp2_price')
-
-        # ── TP1 ──────────────────────────────────────────────────────────────
-        if tp1 and not position.get('tp1_hit', False):
-            hit = (
-                (direction == 'long'  and current_price >= tp1) or
-                (direction == 'short' and current_price <= tp1)
-            )
-            if hit:
-                fraction = position.get(
-                    'tp1_fraction',
-                    self.config.get('risk_management', {}).get(
-                        'take_profit', {}
-                    ).get('tp1_close_fraction', 0.5),
-                )
-                logger.info(
-                    f"[TP1] trade_id={trade_id} ticket={ticket} hit TP1={tp1:.5f} "
-                    f"at price={current_price:.5f}, closing {fraction*100:.0f}%"
-                )
-                asyncio.ensure_future(
-                    self._partial_close_async(trade_id, position, fraction, reason='tp1')
-                )
-                position['tp1_hit']        = True
-                position['trailing_active'] = True  # activate trailing on the remainder
-
-        # ── TP2 ──────────────────────────────────────────────────────────────
-        if tp2 and position.get('tp1_hit', False) and not position.get('tp2_hit', False):
-            hit = (
-                (direction == 'long'  and current_price >= tp2) or
-                (direction == 'short' and current_price <= tp2)
-            )
-            if hit:
-                logger.info(
-                    f"[TP2] trade_id={trade_id} ticket={ticket} hit TP2={tp2:.5f} "
-                    f"— closing remainder"
-                )
-                asyncio.ensure_future(
-                    self._partial_close_async(trade_id, position, 1.0, reason='tp2')
-                )
-                position['tp2_hit'] = True
+        return
 
 
     def _sync_positions_with_mt5(self) -> None:

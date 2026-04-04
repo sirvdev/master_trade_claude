@@ -22,7 +22,7 @@ _SIGNAL_WEIGHTS: Dict[str, int] = {
     'supertrend_aligned': 3, 'ema_stack_full': 3, 'price_structure_aligned': 3,
     'rsi_divergence_confirmed': 3, 'breakout_held': 3,
     'macd_zero_cross': 2, 'rsi_confirmation': 2, 'bb_squeeze_active': 2,
-    'ema_proximity_bounce': 2, 'pullback_to_ema50': 2, 'adx_strong': 2,
+    'ema_proximity_bounce': 2, 'pullback_to_ema50': 2, 'pullback_to_sr': 2, 'adx_strong': 2,
     'candle_pattern': 1, 'volume_confirmation': 1, 'rsi_oversold_recovery': 1,
     'rsi_overbought_rejection': 1, 'macd_bullish_cross': 1, 'macd_bearish_cross': 1,
     'bollinger_squeeze': 1, 'strong_trend': 1,
@@ -348,8 +348,11 @@ class StrategyEngine:
                 return d
         else:
             dr, lv = 'short', float(prior['low'].min())
-            if not (any(float(r['close']) < lv for _,r in prior.iterrows())
-                    and abs(cc-lv) <= md*atr and cc <= lv): return d
+            closes_above = [float(r['close']) < lv for _, r in prior.iterrows()]
+            consecutive = any(closes_above[i] and closes_above[i+1] 
+                            for i in range(len(closes_above)-1))
+            if not (consecutive and abs(cc-lv) <= md*atr and cc <= lv):
+                return d
 
         sigs = ['breakout_held']
         if pi['supertrend']['trend'] == ('bullish' if dr=='long' else 'bearish'):
@@ -420,13 +423,15 @@ class StrategyEngine:
 
         if bias == 'bullish' and swing_low:
             prox = abs(cp - swing_low) / cp < 0.003
-            dr, ok = 'long', prox and cp > swing_low
+            dr, ok, sr_level = 'long', prox and cp > swing_low, swing_low
         elif bias == 'bearish' and swing_high:
             prox = abs(cp - swing_high) / cp < 0.003
-            dr, ok = 'short', prox and cp < swing_high
+            dr, ok, sr_level = 'short', prox and cp < swing_high, swing_high
+        else:
+            return d
         if not ok: return d
 
-        sigs = ['pullback_to_ema50']
+        sigs = ['pullback_to_sr']
         rsi = pi['rsi']['value']
         if dr=='long' and (pi['rsi']['oversold'] or 30<rsi<45):
             sigs.append('rsi_oversold_recovery')
@@ -439,7 +444,7 @@ class StrategyEngine:
                           ('bearish_engulfing','short'),('shooting_star','short')]:
             if dr==side and pi['candle_patterns'].get(cpat):
                 sigs.append('candle_pattern'); break
-        e20,e200 = pi['ema'].get(20,0),pi['ema'].get(200,0)
+        e20,e50,e200 = pi['ema'].get(20,0),pi['ema'].get(50,0),pi['ema'].get(200,0)
         if dr=='long' and e20>e50>e200>0: sigs.append('ema_stack_full')
         elif dr=='short' and e20<e50 and e200>0 and e50<e200: sigs.append('ema_stack_full')
         if htf['trend']['direction']==('bullish' if dr=='long' else 'bearish'):
@@ -447,18 +452,21 @@ class StrategyEngine:
 
         d.update({'signal':True,'entry_signal':True,'direction':dr,
                   'confluence_signals':sigs,
-                  'entry_reason':f'Pullback to EMA50 {dr} @ {e50:.2f}',
-                  'limit_price':e50})
+                  'entry_reason':f'Pullback to S/R {dr} @ {sr_level:.2f}',
+                  'limit_price':sr_level})
         return d
 
     def _bb_squeeze(self, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):
         d = self._e()
-        if bias not in ('bullish','bearish'): return d
+        if bias not in ('bullish', 'bearish'):
+            return d
         pi = ptf['indicators']
         bb = pi['bollinger']
+        atr = pi['atr']['value']
         cp = ptf['ohlc']['close']
-        
+
         # Check if we WERE in squeeze (prior bars) and are now breaking out
+        was_squeeze = False
         if ptf_df is not None and len(ptf_df) >= 5:
             try:
                 prev_bb = self.indicators.calculate_bollinger_bands(ptf_df.iloc[:-1])
@@ -467,35 +475,41 @@ class StrategyEngine:
                 was_squeeze = bb.get('squeeze', False)
         else:
             was_squeeze = bb.get('squeeze', False)
-        
+
         if not was_squeeze:
             return d
-        
-        # Now check breakout direction
+
+        # Now check breakout direction — price should be moving AWAY from middle
         if bias == 'bullish' and cp <= bb['middle']:
             return d  # Not breaking out upward
         if bias == 'bearish' and cp >= bb['middle']:
             return d  # Not breaking out downward
-        
+
         dr = 'long' if bias == 'bullish' else 'short'
 
+        # Check for ATR expansion (current ATR > recent ATR)
         atr_exp = True
-        if ptf_df is not None and len(ptf_df)>=6:
+        if ptf_df is not None and len(ptf_df) >= 6:
             try:
                 ra = self.indicators.calculate_atr(ptf_df.iloc[-6:-1])['current']
-                atr_exp = atr > ra*1.1
-            except: pass
+                atr_exp = atr > ra * 1.1
+            except:
+                pass
 
-        sigs = ['bb_squeeze_active','bollinger_squeeze']
-        if atr_exp: sigs.append('strong_trend')
-        if pi['supertrend']['trend']==('bullish' if dr=='long' else 'bearish'):
+        sigs = ['bb_squeeze_active', 'bollinger_squeeze']
+        if atr_exp:
+            sigs.append('strong_trend')
+        if pi['supertrend']['trend'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('supertrend_aligned')
-        if pi['adx'].get('trend_strength')=='strong': sigs.append('adx_strong')
-        if htf['trend']['direction']==('bullish' if dr=='long' else 'bearish'):
+        if pi['adx'].get('trend_strength') == 'strong':
+            sigs.append('adx_strong')
+        if htf['trend']['direction'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('price_structure_aligned')
 
-        d.update({'signal':True,'entry_signal':True,'direction':dr,
-                  'confluence_signals':sigs,'entry_reason':f'BB squeeze {dr}'})
+        d.update({
+            'signal': True, 'entry_signal': True, 'direction': dr,
+            'confluence_signals': sigs, 'entry_reason': f'BB squeeze breakout {dr}'
+        })
         return d
 
     def _macd_zero(self, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):
@@ -535,22 +549,27 @@ class StrategyEngine:
         d = self._e()
         pi = ptf['indicators']
         dr = None
-        if pi['bollinger']['squeeze']: d['confluence_signals'].append('bb_squeeze_active')
+        if pi['bollinger']['squeeze']:
+            d['confluence_signals'].append('bb_squeeze_active')
         if pi['macd']['bullish_cross']:
-            d['confluence_signals'].append('macd_bullish_cross'); dr='long'
-        elif pi['macd']['histogram'] < 0 and not pi['macd']['bullish_cross']:
-            # Need actual bearish cross: MACD was above signal, now below
-            # Since bullish_cross = macd > signal, NOT bullish_cross = macd <= signal
-            # But we also need it to have JUST crossed, not been negative for 20 bars
-            d['confluence_signals'].append('macd_bearish_cross'); dr = 'short'
-        else: return d
-        if pi['adx'].get('trend_strength')=='strong': d['confluence_signals'].append('adx_strong')
-        if pi['supertrend']['trend']==('bullish' if dr=='long' else 'bearish'):
+            d['confluence_signals'].append('macd_bullish_cross')
+            dr = 'long'
+        elif pi['macd']['bearish_cross']:
+            # Now uses proper bearish cross detection (prev >= signal, curr < signal)
+            d['confluence_signals'].append('macd_bearish_cross')
+            dr = 'short'
+        else:
+            return d
+        if pi['adx'].get('trend_strength') == 'strong':
+            d['confluence_signals'].append('adx_strong')
+        if pi['supertrend']['trend'] == ('bullish' if dr == 'long' else 'bearish'):
             d['confluence_signals'].append('supertrend_aligned')
-        if htf['trend']['direction']==('bullish' if dr=='long' else 'bearish'):
+        if htf['trend']['direction'] == ('bullish' if dr == 'long' else 'bearish'):
             d['confluence_signals'].append('price_structure_aligned')
-        d.update({'signal':True,'entry_signal':True,'direction':dr,
-                  'entry_reason':f'Momentum breakout {dr}'})
+        d.update({
+            'signal': True, 'entry_signal': True, 'direction': dr,
+            'entry_reason': f'Momentum breakout {dr}'
+        })
         return d
 
     def _find_swing_lows(self, series, order=5):
@@ -562,52 +581,68 @@ class StrategyEngine:
 
     def _rsi_div(self, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):
         d = self._e()
-        if ptf_df is None or len(ptf_df)<20: return d
+        if ptf_df is None or len(ptf_df) < 20:
+            return d
         try:
             ai = self.indicators.calculate_all(ptf_df)
             rs = ai['rsi']['value']
-        except: return d
+        except:
+            return d
 
-        lb  = 20
-        ps  = ptf_df['close'].iloc[-lb:]
+        lb = 20
+        ps = ptf_df['close'].iloc[-lb:]
         rss = rs.iloc[-lb:]
-        div,dr = None,None
+        div, dr = None, None
 
-        if bias=='bullish':
-            try:
-                mi  = ps.idxmin(); mp = ps.min()
-                loc = ps.index.get_loc(mi)
-                if loc>1:
-                    pp = float(ps.iloc[:loc].min())
-                    if mp<pp:
-                        ra = float(rss.loc[mi]); rp = float(rss.iloc[:loc].min())
-                        if ra>rp: div,dr = 'bullish','long'
-            except: pass
-        elif bias=='bearish':
-            try:
-                mi  = ps.idxmax(); mp = ps.max()
-                loc = ps.index.get_loc(mi)
-                if loc>1:
-                    pp = float(ps.iloc[:loc].max())
-                    if mp>pp:
-                        ra = float(rss.loc[mi]); rp = float(rss.iloc[:loc].max())
-                        if ra<rp: div,dr = 'bearish','short'
-            except: pass
+        if bias == 'bullish':
+            swing_lows = self._find_swing_lows(ps, order=3)
+            if len(swing_lows) >= 2:
+                prev_idx, prev_price = swing_lows[-2]
+                curr_idx, curr_price = swing_lows[-1]
+                # Bullish divergence: lower price low, higher RSI low
+                if curr_price < prev_price:
+                    try:
+                        prev_rsi = float(rss.iloc[prev_idx])
+                        curr_rsi = float(rss.iloc[curr_idx])
+                        if curr_rsi > prev_rsi:
+                            div, dr = 'bullish', 'long'
+                    except:
+                        pass
 
-        if not div: return d
+        elif bias == 'bearish':
+            swing_highs = self._find_swing_highs(ps, order=3)
+            if len(swing_highs) >= 2:
+                prev_idx, prev_price = swing_highs[-2]
+                curr_idx, curr_price = swing_highs[-1]
+                # Bearish divergence: higher price high, lower RSI high
+                if curr_price > prev_price:
+                    try:
+                        prev_rsi = float(rss.iloc[prev_idx])
+                        curr_rsi = float(rss.iloc[curr_idx])
+                        if curr_rsi < prev_rsi:
+                            div, dr = 'bearish', 'short'
+                    except:
+                        pass
+
+        if not div:
+            return d
+
         pi = ptf['indicators']
         sigs = ['rsi_divergence_confirmed']
-        if pi['supertrend']['trend']==('bullish' if dr=='long' else 'bearish'):
+        if pi['supertrend']['trend'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('supertrend_aligned')
-        if htf['trend']['direction']==('bullish' if dr=='long' else 'bearish'):
+        if htf['trend']['direction'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('price_structure_aligned')
-        if pi['adx'].get('trend_strength')=='strong': sigs.append('adx_strong')
+        if pi['adx'].get('trend_strength') == 'strong':
+            sigs.append('adx_strong')
 
-        ep = ltf['ohlc']['close']  # limit price from ENTRY TF
-        d.update({'signal':True,'entry_signal':True,'direction':dr,
-                  'confluence_signals':sigs,
-                  'entry_reason':f'RSI {div} divergence {dr}',
-                  'limit_price':ep})
+        ep = ltf['ohlc']['close']
+        d.update({
+            'signal': True, 'entry_signal': True, 'direction': dr,
+            'confluence_signals': sigs,
+            'entry_reason': f'RSI {div} divergence {dr}',
+            'limit_price': ep
+        })
         return d
 
     # ── Scoring ────────────────────────────────────────────────────────────────
@@ -668,7 +703,7 @@ class StrategyEngine:
             if atr_pct < mn:
                 analysis['entry_signal']=False
                 analysis['entry_reason']=f'Filtered: ATR too low ({atr_pct:.2f}%)'
-            elif atr_pct > mx*100:
+            elif atr_pct > mx:
                 analysis['entry_signal']=False
                 analysis['entry_reason']=f'Filtered: ATR too high ({atr_pct:.2f}%)'
 
