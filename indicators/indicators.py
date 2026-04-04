@@ -97,9 +97,9 @@ class TechnicalIndicators:
         
     def calculate_macd(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
         """Calculate MACD indicator."""
-        fast = self.config['macd'].get('fast', 12)  # ✅ Correct
-        slow = self.config['macd'].get('slow', 26)  # ✅ Correct
-        signal = self.config['macd'].get('signal', 9)  # ✅ Correct
+        fast = self.config['macd'].get('fast', self.config['macd'].get('fast_period', 12))
+        slow = self.config['macd'].get('slow', self.config['macd'].get('slow_period', 26))
+        signal = self.config['macd'].get('signal', self.config['macd'].get('signal_period', 9))
         
         ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
         ema_slow = df['close'].ewm(span=slow, adjust=False).mean()

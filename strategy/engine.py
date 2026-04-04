@@ -148,6 +148,10 @@ class StrategyEngine:
 
     def _analyze_tf(self, df: pd.DataFrame) -> Dict:
         ind = self.indicators.calculate_all(df)
+        macd_curr = float(ind['macd']['macd'].iloc[-1])
+        signal_curr = float(ind['macd']['signal'].iloc[-1])
+        macd_prev = float(ind['macd']['macd'].iloc[-2])
+        signal_prev = float(ind['macd']['signal'].iloc[-2])
         snap = {
             'ohlc': {k: float(df[k].iloc[-1]) for k in ['open','high','low','close','volume']},
             'indicators': {
@@ -158,8 +162,8 @@ class StrategyEngine:
                 'macd':        {'macd':     float(ind['macd']['macd'].iloc[-1]),
                                 'signal':   float(ind['macd']['signal'].iloc[-1]),
                                 'histogram':float(ind['macd']['histogram'].iloc[-1]),
-                                'bullish_cross': (float(ind['macd']['macd'].iloc[-1]) >
-                                                  float(ind['macd']['signal'].iloc[-1]))},
+                                'bullish_cross': (macd_prev <= signal_prev and macd_curr > signal_curr),
+                                'bearish_cross': (macd_prev >= signal_prev and macd_curr < signal_curr)},
                 'atr':         {'value':   float(ind['atr']['current']),
                                 'percent': float(ind['atr']['percent_of_price'])},
                 'bollinger':   {'upper':   float(ind['bollinger']['upper'].iloc[-1]),
@@ -337,8 +341,11 @@ class StrategyEngine:
 
         if bias == 'bullish':
             dr, lv = 'long', float(prior['high'].max())
-            if not (any(float(r['close']) > lv for _,r in prior.iterrows())
-                    and abs(cc-lv) <= md*atr and cc >= lv): return d
+            closes_above = [float(r['close']) > lv for _, r in prior.iterrows()]
+            consecutive = any(closes_above[i] and closes_above[i+1] 
+                            for i in range(len(closes_above)-1))
+            if not (consecutive and abs(cc-lv) <= md*atr and cc >= lv):
+                return d
         else:
             dr, lv = 'short', float(prior['low'].min())
             if not (any(float(r['close']) < lv for _,r in prior.iterrows())
@@ -407,13 +414,16 @@ class StrategyEngine:
         if bias not in ('bullish','bearish'): return d
         pi = ptf['indicators']
         cp = ptf['ohlc']['close']
-        e50 = pi['ema'].get(50,0)
-        if e50<=0: return d
-        prox = abs(cp-e50)/e50 < 0.003
-        if bias=='bullish':
-            dr,ok = 'long', prox and cp>e50
-        else:
-            dr,ok = 'short', prox and cp<e50
+        ps = pi['price_structure']
+        swing_high = ps.get('last_swing_high')
+        swing_low = ps.get('last_swing_low')
+
+        if bias == 'bullish' and swing_low:
+            prox = abs(cp - swing_low) / cp < 0.003
+            dr, ok = 'long', prox and cp > swing_low
+        elif bias == 'bearish' and swing_high:
+            prox = abs(cp - swing_high) / cp < 0.003
+            dr, ok = 'short', prox and cp < swing_high
         if not ok: return d
 
         sigs = ['pullback_to_ema50']
@@ -445,11 +455,29 @@ class StrategyEngine:
         d = self._e()
         if bias not in ('bullish','bearish'): return d
         pi = ptf['indicators']
-        bb,atr,cp = pi['bollinger'],pi['atr']['value'],ptf['ohlc']['close']
-        if not bb.get('squeeze'): return d
-        if bias=='bullish' and cp<=bb['upper']: return d
-        if bias=='bearish' and cp>=bb['lower']: return d
-        dr = 'long' if bias=='bullish' else 'short'
+        bb = pi['bollinger']
+        cp = ptf['ohlc']['close']
+        
+        # Check if we WERE in squeeze (prior bars) and are now breaking out
+        if ptf_df is not None and len(ptf_df) >= 5:
+            try:
+                prev_bb = self.indicators.calculate_bollinger_bands(ptf_df.iloc[:-1])
+                was_squeeze = prev_bb['squeeze']
+            except:
+                was_squeeze = bb.get('squeeze', False)
+        else:
+            was_squeeze = bb.get('squeeze', False)
+        
+        if not was_squeeze:
+            return d
+        
+        # Now check breakout direction
+        if bias == 'bullish' and cp <= bb['middle']:
+            return d  # Not breaking out upward
+        if bias == 'bearish' and cp >= bb['middle']:
+            return d  # Not breaking out downward
+        
+        dr = 'long' if bias == 'bullish' else 'short'
 
         atr_exp = True
         if ptf_df is not None and len(ptf_df)>=6:
@@ -510,8 +538,11 @@ class StrategyEngine:
         if pi['bollinger']['squeeze']: d['confluence_signals'].append('bb_squeeze_active')
         if pi['macd']['bullish_cross']:
             d['confluence_signals'].append('macd_bullish_cross'); dr='long'
-        elif pi['macd']['histogram']<0:
-            d['confluence_signals'].append('macd_bearish_cross'); dr='short'
+        elif pi['macd']['histogram'] < 0 and not pi['macd']['bullish_cross']:
+            # Need actual bearish cross: MACD was above signal, now below
+            # Since bullish_cross = macd > signal, NOT bullish_cross = macd <= signal
+            # But we also need it to have JUST crossed, not been negative for 20 bars
+            d['confluence_signals'].append('macd_bearish_cross'); dr = 'short'
         else: return d
         if pi['adx'].get('trend_strength')=='strong': d['confluence_signals'].append('adx_strong')
         if pi['supertrend']['trend']==('bullish' if dr=='long' else 'bearish'):
@@ -521,6 +552,13 @@ class StrategyEngine:
         d.update({'signal':True,'entry_signal':True,'direction':dr,
                   'entry_reason':f'Momentum breakout {dr}'})
         return d
+
+    def _find_swing_lows(self, series, order=5):
+            lows = []
+            for i in range(order, len(series) - order):
+                if series.iloc[i] == series.iloc[i-order:i+order+1].min():
+                    lows.append((i, series.iloc[i]))
+            return lows
 
     def _rsi_div(self, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):
         d = self._e()
@@ -602,13 +640,32 @@ class StrategyEngine:
                     analysis['entry_signal']=False
                     analysis['entry_reason']='Filtered: against HTF bullish'
 
+        if structure_tf in snaps:
+            htf_adx = snaps[structure_tf]['indicators']['adx']
+            htf_trend_strength = snaps[structure_tf]['trend']['strength']
+            
+            # Gate 1: ADX below 20 = ranging market, don't trade
+            adx_val = htf_adx.get('value')
+            if isinstance(adx_val, pd.Series):
+                adx_val = float(adx_val.iloc[-1])
+            if adx_val is not None and adx_val < 20:
+                analysis['entry_signal'] = False
+                analysis['entry_reason'] = f'Filtered: HTF ADX too low ({adx_val:.1f}) — choppy market'
+                return analysis
+            
+            # Gate 2: Trend strength must be > 0.5 (not barely trending)
+            if htf_trend_strength < 0.5:
+                analysis['entry_signal'] = False
+                analysis['entry_reason'] = f'Filtered: HTF trend too weak ({htf_trend_strength:.2f})'
+                return analysis
+
         tf_for_atr = entry_tf if entry_tf in snaps else (
             next(iter(snaps)) if snaps else None)
         if tf_for_atr and tf_for_atr in snaps:
             atr_pct = snaps[tf_for_atr]['indicators']['atr']['percent']
             mn = filters.get('min_atr_threshold',0)
             mx = filters.get('max_atr_threshold',100)
-            if atr_pct < mn*100:
+            if atr_pct < mn:
                 analysis['entry_signal']=False
                 analysis['entry_reason']=f'Filtered: ATR too low ({atr_pct:.2f}%)'
             elif atr_pct > mx*100:

@@ -104,7 +104,7 @@ class StopManager:
  
         # Session adjustment — widen stops during high-volatility sessions
         session_mult      = self._get_session_atr_multiplier()
-        effective_mult    = base_multiplier * session_mult
+        effective_mult    = max(base_multiplier, session_mult)
  
         # ATR-based stop with session-adjusted multiplier
         if direction == 'long':
