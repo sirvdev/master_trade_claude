@@ -602,6 +602,7 @@ class DatabaseManager:
         Matches:
         - pnl IS NULL                          (never written)
         - pnl = 0 AND status != 'open'         (written as zero placeholder)
+        - exit_price IS NULL or 0              (close handler never ran)
         - exit_reason = 'deal_history_unavailable'
         - status = 'pending_exit'
 
@@ -617,7 +618,10 @@ class DatabaseManager:
                 AND  (
                         pnl IS NULL
                     OR pnl = 0
+                    OR exit_price IS NULL
+                    OR exit_price = 0
                     OR exit_reason IN ('deal_history_unavailable', 'pending_deal_lookup')
+                    OR status = 'pending_exit'
                 )
                 ORDER  BY entry_time DESC
             """)
@@ -627,21 +631,13 @@ class DatabaseManager:
         """Get all currently open trades."""
         return self.get_trades(filters={'status': 'open'})
         
-    def get_trade_statistics(self, symbol: Optional[str] = None, days: int = 30) -> Dict:
-        """
-        Calculate trade statistics.
-        
-        Args:
-            symbol: Optional symbol filter
-            days: Number of days to include
-            
-        Returns:
-            Dictionary of statistics
-        """
+    def get_trade_statistics(self, symbol=None, days=30):
+        """Calculate trade statistics including pending_exit with PnL."""
         with self._db_lock:
             cursor = self.conn.cursor()
         
-            where_clause = "WHERE status = 'closed'"
+            # Include pending_exit trades that have actual PnL data
+            where_clause = "WHERE status IN ('closed', 'pending_exit') AND pnl IS NOT NULL"
             params = []
             
             if symbol:
@@ -656,9 +652,11 @@ class DatabaseManager:
                     COUNT(*) as total_trades,
                     SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as winning_trades,
                     SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losing_trades,
+                    SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END) as breakeven_trades,
                     AVG(pnl) as avg_pnl,
                     SUM(pnl) as total_pnl,
-                    AVG(realized_rr) as avg_rr,
+                    AVG(CASE WHEN realized_rr IS NOT NULL AND realized_rr != 0 
+                        THEN realized_rr END) as avg_rr,
                     MAX(pnl) as max_win,
                     MIN(pnl) as max_loss,
                     AVG(duration_minutes) as avg_duration_minutes
@@ -671,13 +669,13 @@ class DatabaseManager:
             
             stats = dict(row) if row else {}
             
-            # Calculate win rate
             if stats.get('total_trades', 0) > 0:
                 stats['win_rate'] = stats.get('winning_trades', 0) / stats['total_trades']
             else:
                 stats['win_rate'] = 0
                 
             return stats
+
         
     def export_to_csv(self, table_name: str, output_path: str):
         """Export a table to CSV."""

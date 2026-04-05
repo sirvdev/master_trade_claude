@@ -20,7 +20,9 @@ from logger.db import DatabaseManager
 from logger.audit_logger import AuditLogger
 from data_feed.market_client import MultiMarketClient
 from indicators.indicators import TechnicalIndicators
-from strategy.engine import StrategyEngine
+# from strategy.engine import StrategyEngine
+from strategy.ict_engine import ICTStrategyEngine as StrategyEngine
+# from strategy.smc_engine import SMCStrategyEngine as StrategyEngine
 from risk_management.money_manager import MoneyManager
 from risk_management.stop_manager import StopManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
@@ -1677,20 +1679,10 @@ class TradingSystem:
     def _compute_close_fields(self, position: dict, deal: dict) -> dict:
         """
         Compute every derived field for a closed trade from a filled deal dict
-        and the position snapshot.  Used by both _handle_external_close and
+        and the position snapshot. Used by both _handle_external_close and
         _deferred_deal_lookup so neither can drift from the other.
 
-        Args:
-            position: Position dict as stored in open_positions (or a snapshot
-                      of it). Must contain: entry_price, stop_loss,
-                      original_stop_loss, direction, take_profit_1, entry_time,
-                      max_favorable_excursion, max_adverse_excursion.
-            deal:     Successful get_deal_history response dict. Must contain:
-                      exit_price, profit, swap, commission, net_profit,
-                      exit_reason, volume, close_time.
-
-        Returns:
-            dict with every field needed for log_trade_exit.
+        v2: Volume-weighted exit price across all partial close deals.
         """
         import time as _time
 
@@ -1700,26 +1692,39 @@ class TradingSystem:
         tp1          = float(position.get('take_profit_1') or 0.0)
         original_sl  = float(position.get('original_stop_loss') or sl)
 
-        # ── Raw numbers from the broker deal ─────────────────────────────────
-        exit_price   = float(deal.get('exit_price', 0.0))
+        # ── Raw numbers from the broker deal ─────────────────────────────
         gross_profit = float(deal.get('profit', 0.0))
         swap         = float(deal.get('swap', 0.0))
         commission   = float(deal.get('commission', 0.0))
         net_pnl      = float(deal.get('net_profit', gross_profit + swap + commission))
         exit_reason  = deal.get('exit_reason', 'external_close')
-        close_time   = deal.get('close_time')   # unix epoch int or None
+        close_time   = deal.get('close_time')
 
-        # ── Duration ─────────────────────────────────────────────────────────
+        # ── Volume-weighted exit price from ALL partial close deals ──────
+        deals_list = deal.get('deals', [])
+        if deals_list and len(deals_list) > 0:
+            total_vol = sum(float(d.get('volume', 0)) for d in deals_list)
+            if total_vol > 0:
+                exit_price = sum(
+                    float(d.get('exit_price', 0)) * float(d.get('volume', 0))
+                    for d in deals_list
+                ) / total_vol
+            else:
+                exit_price = float(deal.get('exit_price', 0.0))
+        else:
+            exit_price = float(deal.get('exit_price', 0.0))
+
+        # ── Duration ─────────────────────────────────────────────────────
         entry_time = position.get('entry_time')
-        # Normalise: DB returns ISO string, live dict holds datetime object
         if isinstance(entry_time, str):
             try:
                 entry_time = datetime.fromisoformat(entry_time.replace('Z', '+00:00'))
-                entry_time = entry_time.replace(tzinfo=None)   # work in naïve UTC
+                entry_time = entry_time.replace(tzinfo=None)
             except Exception:
                 entry_time = None
 
         duration_minutes = None
+        exit_dt = None
         if entry_time:
             if close_time and int(close_time) > 0:
                 exit_dt = datetime.fromtimestamp(int(close_time), timezone.utc).replace(tzinfo=None)
@@ -1729,10 +1734,7 @@ class TradingSystem:
                 delta = exit_dt - entry_time
                 duration_minutes = round(delta.total_seconds() / 60, 1)
 
-        # ── Slippage — difference between intended and actual fill ────────────
-        # SL hit → compare to stop_loss level
-        # TP hit → compare to take_profit_1 level
-        # All other reasons → 0
+        # ── Slippage ─────────────────────────────────────────────────────
         slippage = 0.0
         if exit_price > 0:
             if exit_reason == 'stop_loss' and sl:
@@ -1740,15 +1742,15 @@ class TradingSystem:
             elif exit_reason == 'take_profit' and tp1:
                 slippage = round(abs(exit_price - tp1), 5)
 
-        # ── Realised R:R — MUST use original SL, not post-breakeven SL ───────
+        # ── Realised R:R — uses volume-weighted exit + original SL ───────
         initial_risk = abs(entry_price - original_sl) if original_sl and entry_price else 0.0
-        realized_rr  = 0.0
+        realized_rr = 0.0
         if initial_risk > 0 and exit_price > 0 and entry_price > 0:
-            price_move  = (exit_price - entry_price) if direction == 'long' \
-                          else (entry_price - exit_price)
+            price_move = (exit_price - entry_price) if direction == 'long' \
+                        else (entry_price - exit_price)
             realized_rr = round(price_move / initial_risk, 4)
 
-        # ── P&L as % of live equity — never divide by near-zero ──────────────
+        # ── P&L percent ──────────────────────────────────────────────────
         equity      = self.current_equity if self.current_equity > 0 else 10_000.0
         pnl_percent = round((net_pnl / equity) * 100, 4)
 

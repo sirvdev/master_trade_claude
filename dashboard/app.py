@@ -440,6 +440,26 @@ def show_overview_tab(db, open_trades, pending_orders, closed_filt, time_range):
                         f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞")
     with c6: st.metric("OPEN + PENDING", f"{len(open_trades)} + {len(pending_orders)}")
 
+    # ── Status breakdown — shows data health ──────────────────────────
+    filtered = open_trades + closed_filt
+    status_counts = {}
+    for t in filtered:
+        s = t.get("status", "unknown")
+        status_counts[s] = status_counts.get(s, 0) + 1
+    
+    if len(status_counts) > 1 or 'pending_exit' in status_counts:
+        status_parts = [f"{s}: {c}" for s, c in sorted(status_counts.items())]
+        missing_pnl = len([t for t in closed_filt 
+                          if not t.get('pnl') or float(t.get('pnl', 0)) == 0])
+        st.markdown(
+            f"<div style='background:#1a1d23;padding:8px 14px;border-radius:6px;"
+            f"font-size:12px;color:#6b7280;margin-bottom:12px'>"
+            f"📊 Trade Status: {' | '.join(status_parts)}"
+            f"{'  ⚠️ ' + str(missing_pnl) + ' trades missing P&L data' if missing_pnl > 0 else ''}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
     st.markdown("<hr>", unsafe_allow_html=True)
 
     left, right = st.columns([3, 2])
@@ -646,7 +666,8 @@ def show_trades_tab(db, closed_filt, open_trades):
     with c3:
         reason_filter = st.selectbox("Exit Reason",
             ["All", "stop_loss", "take_profit", "trailing_stop",
-             "manual", "external_close"])
+             "manual", "external_close", "deal_history_unavailable",
+             "pending_deal_lookup"])
 
     display = closed_filt[:]
     if sym_filter    != "All": display = [t for t in display if t.get("symbol")      == sym_filter]
@@ -1305,8 +1326,8 @@ def main():
 
         st.markdown("<hr>", unsafe_allow_html=True)
         st.markdown("**Time Filter**")
-        time_range = st.selectbox("Period", ["Today", "Last 7 Days", "Last 30 Days",
-                                              "All Time", "Custom"],
+        time_range = st.selectbox("Period", ["All Time", "Last 7 Days", "Last 30 Days",
+                                              "Today", "Custom"],
                                    index=0, label_visibility="collapsed")
         custom_start = custom_end = None
         if time_range == "Custom":
@@ -1323,12 +1344,20 @@ def main():
             _t.sleep(0.5)
             st.rerun()
 
-    # ── Load data ─────────────────────────────────────────────────────────────
+    # ── Load data ─────────────────────────────────────────────────────
     all_trades     = load_all_trades(db)
     open_trades    = load_open_trades(db)
     pending_orders = load_pending_limit_orders(db)
     filtered       = filter_trades_by_time(all_trades, start_dt, end_dt)
-    closed_filt    = [t for t in filtered if t.get("status") == "closed"]
+
+    # Include ALL trades that were actually executed (not just status='closed')
+    # pending_exit = deal history lookup failed but trade DID happen
+    # deal_history_unavailable = all retries exhausted  
+    _EXECUTED_STATUSES = {'closed', 'pending_exit'}
+    closed_filt = [t for t in filtered
+                   if t.get("status") in _EXECUTED_STATUSES
+                   or (t.get("status") == "closed" 
+                       and t.get("exit_reason") == "deal_history_unavailable")]
 
     # ── Nav ───────────────────────────────────────────────────────────────────
     active_page = render_top_nav()
