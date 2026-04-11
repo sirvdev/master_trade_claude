@@ -4,6 +4,17 @@ general:
   log_trades: true
   log_analysis: true
 symbols:
+  XAU/USD:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 15m
+    - 5m
+    - 1m
+    primary_timeframe: 5m
+    entry_timeframe: 1m
+    confluence_threshold: 7
   BTC/USD:
     enabled: true
     platform: mt5
@@ -13,28 +24,17 @@ symbols:
     - 15m
     - 1m
     primary_timeframe: 15m
-    entry_timeframe: 5m
-    confluence_threshold: 7
-  XAU/USD:
-    enabled: true
-    platform: mt5
-    mode: live
-    timeframes:
-    - 1H
-    - 15m
-    - 5m
-    primary_timeframe: 15m
-    entry_timeframe: 5m
+    entry_timeframe: 1m
     confluence_threshold: 7
   XAG/USD:
     enabled: true
     platform: mt5
     mode: live
     timeframes:
-    - 1D
     - 4H
+    - 1H
     - 15m
-    primary_timeframe: 4H
+    primary_timeframe: 1H
     entry_timeframe: 15m
     confluence_threshold: 5
   EUR/USD:
