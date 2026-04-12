@@ -4,6 +4,17 @@ general:
   log_trades: true
   log_analysis: true
 symbols:
+  XAU/USD:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 15m
+    - 5m
+    - 1m
+    primary_timeframe: 5m
+    entry_timeframe: 1m
+    confluence_threshold: 7
   BTC/USD:
     enabled: true
     platform: mt5
@@ -13,28 +24,17 @@ symbols:
     - 15m
     - 1m
     primary_timeframe: 15m
-    entry_timeframe: 5m
-    confluence_threshold: 7
-  XAU/USD:
-    enabled: true
-    platform: mt5
-    mode: live
-    timeframes:
-    - 1H
-    - 15m
-    - 5m
-    primary_timeframe: 15m
-    entry_timeframe: 5m
+    entry_timeframe: 1m
     confluence_threshold: 7
   XAG/USD:
     enabled: true
     platform: mt5
     mode: live
     timeframes:
-    - 1D
     - 4H
+    - 1H
     - 15m
-    primary_timeframe: 4H
+    primary_timeframe: 1H
     entry_timeframe: 15m
     confluence_threshold: 5
   EUR/USD:
@@ -225,7 +225,7 @@ execution:
     realistic_slippage: true
     latency_ms: 50
   mt5:
-    magic_number: 123456
+    magic_number: 111000
     deviation_points: 10
     fill_policy: FOK
 learning:
@@ -329,4 +329,19 @@ dashboard:
   chart_bars: 500
 telegram_signals:
   enabled: false
-  
+smc:
+  # Maximum SL distance as a multiple of entry-TF ATR.
+  # Prevents structure-based SL from being unrealistically far.
+  # Default: 1.5 (was effectively unlimited before this patch).
+  max_sl_atr_multiplier: 1.5
+ 
+  # Maximum risk as a multiple of estimated daily range.
+  # If the SL distance exceeds this, risk is clamped.
+  # Default: 1.5
+  max_risk_daily_atr_mult: 1.5
+ict:
+  # Maximum SL distance as a multiple of entry-TF ATR.
+  # ICT's structure SL is already good; this just catches outliers.
+  # Default: 2.0 (slightly more generous than SMC because ICT's
+  # structure analysis is more precise).
+  max_sl_atr_multiplier: 2.0

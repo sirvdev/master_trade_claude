@@ -347,7 +347,7 @@ class TradingSystem:
                             })
                             if hasattr(self, 'notifier'):
                                 asyncio.ensure_future(self.notifier.send(
-                                    f"⚠️ Daily drawdown limit hit: {drawdown:.2f}% — trading paused."
+                                    f"⚠️ T1 Daily drawdown limit hit: {drawdown:.2f}% — trading paused."
                                 )) # assumed dd_pct mean drawdown percent
 
                         # Emergency shutdown (close positions) is separate from halting entries
@@ -993,7 +993,7 @@ class TradingSystem:
                 )
                 if hasattr(self, 'notifier'):
                     asyncio.ensure_future(self.notifier.send(
-                        f"⏳ <b>Limit Order Placed</b> — {symbol}\n"
+                        f"⏳ <b>Limit Order Placed T1</b> — {symbol}\n"
                         f"<b>{analysis['direction'].upper()}</b> "
                         f"@ <code>{limit_price:.5f}</code> [{entry_type}]\n"
                         f"SL: <code>{stop_loss:.5f}</code>  "
@@ -1042,6 +1042,9 @@ class TradingSystem:
           - Price past invalidation_price → cancel and mark invalidated
         """
         try:
+            #  NEW: Pre-close sweep to catch any orders that are pending but should be cancelled before we do any checks.
+            await self._pre_close_cancel_all_pending()
+
             pending = self.db.get_pending_limit_orders()
             if not pending:
                 return
@@ -1120,7 +1123,7 @@ class TradingSystem:
                         )
                         if hasattr(self, 'notifier'):
                             asyncio.ensure_future(self.notifier.send(
-                                f"✅ <b>Limit Order Filled</b> — {symbol}\n"
+                                f"✅ <b>Limit Order Filled T1</b> — {symbol}\n"
                                 f"<b>{direction.upper()}</b> "
                                 f"@ <code>{executed_price:.5f}</code>\n"
                                 f"Ticket: <code>{pos_ticket}</code>"
@@ -1187,7 +1190,7 @@ class TradingSystem:
                 )
                 if hasattr(self, 'notifier'):
                     asyncio.ensure_future(self.notifier.send(
-                        f"🗑 <b>Limit Order Cancelled</b> — {symbol}\n"
+                        f"🗑 <b>Limit Order Cancelled T1</b> — {symbol}\n"
                         f"Reason: <code>{reason}</code>\n"
                         f"{detail}\nTicket: <code>{ticket}</code>"
                     ))
@@ -1913,7 +1916,7 @@ class TradingSystem:
             dur_str = f"{fields['duration_minutes']:.0f}m" if fields['duration_minutes'] else "?"
             eq_str  = f" | Equity: ${equity_after_close:,.2f}" if equity_after_close else ""
             await self.notifier.send(
-                f"{emoji} {symbol} closed ({fields['exit_reason']})\n"
+                f"{emoji} {symbol} closed T1 ({fields['exit_reason']})\n"
                 f"Exit: {fields['exit_price']:.5f} | Net P&L: {fields['net_pnl']:.2f} "
                 f"| RR: {fields['realized_rr']:.2f} | Duration: {dur_str}{eq_str}"
             )
@@ -2279,7 +2282,7 @@ class TradingSystem:
 
         if hasattr(self, "notifier"):
             action = "Closing all positions." if close_on_shutdown else "Positions left open — will reconcile on restart."
-            asyncio.ensure_future(self.notifier.send(f"🚨 Emergency shutdown: {reason}. {action}"))
+            asyncio.ensure_future(self.notifier.send(f"🚨 T1 Emergency shutdown: {reason}. {action}"))
 
         if close_on_shutdown:
             # Fire async close from the sync context via the running event loop
@@ -2427,7 +2430,7 @@ class TradingSystem:
         if hasattr(self, "notifier"):
             emoji = "✅" if profit >= 0 else "❌"
             asyncio.ensure_future(self.notifier.send(
-                f"{emoji} Position closed: {position.get('symbol')} "
+                f"{emoji} T1 Position closed: {position.get('symbol')} "
                 f"| P&L: {profit:.2f} | Reason: {reason}"
             ))
         return True
@@ -2535,6 +2538,69 @@ class TradingSystem:
             self.current_equity = total_equity
             # logger.info(f"Total equity: ${total_equity:,.2f}")
             return total_equity
+    
+    async def _pre_close_cancel_all_pending(self):
+        """
+        Cancel ALL pending limit orders for any symbol whose market closes
+        within 5 minutes. This prevents orders from being stuck over the
+        weekend when the broker refuses cancel commands during off-hours.
+    
+        Called at the top of _check_pending_limit_orders() every monitor cycle.
+        Only acts when is_near_close() returns True — costs nothing otherwise.
+        """
+        try:
+            pending = self.db.get_pending_limit_orders()
+            if not pending:
+                return
+    
+            # Group by symbol and check which symbols are near close
+            symbols_near_close = set()
+            for order in pending:
+                symbol = order['symbol']
+                if symbol not in symbols_near_close:
+                    if self.market_hours.is_near_close(symbol, minutes=5):
+                        symbols_near_close.add(symbol)
+    
+            if not symbols_near_close:
+                return
+    
+            logger.info(
+                f"[PRE-CLOSE] Markets closing soon for: {symbols_near_close} "
+                f"— cancelling all pending orders"
+            )
+    
+            cancelled_count = 0
+            for order in pending:
+                symbol = order['symbol']
+                if symbol not in symbols_near_close:
+                    continue
+    
+                ticket = int(order['ticket'])
+                trade_id = order['trade_id']
+    
+                await self._cancel_limit_order(
+                    ticket, trade_id, symbol, 'pre_close',
+                    f"Market {symbol} closing within 5 minutes"
+                )
+                cancelled_count += 1
+    
+                # Small delay to avoid flooding the bridge
+                await asyncio.sleep(0.5)
+    
+            if cancelled_count > 0:
+                logger.info(
+                    f"[PRE-CLOSE] Cancelled {cancelled_count} pending orders "
+                    f"before market close"
+                )
+                if hasattr(self, 'notifier'):
+                    asyncio.ensure_future(self.notifier.send(
+                        f"🕐 <b>Pre-Close Sweep</b>\n"
+                        f"Cancelled {cancelled_count} pending limit orders\n"
+                        f"Symbols: {', '.join(symbols_near_close)}"
+                    ))
+    
+        except Exception as e:
+            logger.error(f"[PRE-CLOSE] Error in pre-close sweep: {e}", exc_info=True)
         
     def _get_current_exposure(self) -> dict:
         """Get current exposure summary."""

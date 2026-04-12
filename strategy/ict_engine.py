@@ -133,7 +133,7 @@ class ICTStrategyEngine:
 
             # ── ICT Killzone gate — only trade during institutional hours ─
             if not self._in_killzone():
-                analysis['entry_reason'] = 'ICT: Outside killzone — no trade'
+                analysis['entry_reason'] = 'ICT: Outside killzone - no trade'
                 logger.debug(f"[ICT] {symbol}: Outside killzone, skipping")
                 return analysis
 
@@ -156,59 +156,87 @@ class ICTStrategyEngine:
 
         return analysis
 
-    def calculate_entry_levels(self, analysis: Dict, multi_tf_data: Dict) -> Dict:
-        """Same interface as StrategyEngine.calculate_entry_levels()."""
+    def calculate_entry_levels(self, analysis, multi_tf_data):
+        """
+        Same interface as StrategyEngine.calculate_entry_levels().
+    
+        CHANGED (v2.800 patch):
+        - TP2/TP3 (R:R-based) are now capped to 2.5× estimated daily range.
+        - TP1 (liquidity pool target) is NOT capped — it's structure-based
+        and grounded in market reality.
+        - Risk distance itself is NOT clamped here because ICT's SL placement
+        is already reasonable. The SL cap in _calc_ict_sl handles outliers.
+        """
         entry_tf = analysis.get('entry_tf', '5m')
         if entry_tf not in multi_tf_data:
             avail = sorted(multi_tf_data.keys(), key=lambda t: self._tf_minutes(t))
             entry_tf = avail[0] if avail else next(iter(multi_tf_data), None)
         if not entry_tf or entry_tf not in multi_tf_data:
             return {}
-
+    
         df = multi_tf_data[entry_tf]
         current_price = float(df['close'].iloc[-1])
         atr = self.indicators.calculate_atr(df)['current']
         order_type = analysis.get('order_type', 'limit')
         limit_price = analysis.get('limit_price')
         entry_price = float(limit_price) if (order_type == 'limit' and limit_price) else current_price
-
+    
         stop_loss = self._calc_ict_sl(analysis, entry_price, atr, df)
         risk = abs(entry_price - stop_loss)
-
+    
         tp_config = self.config.get('risk_management', {}).get('take_profit', {})
         targets = tp_config.get('targets', [
             {'name': 'TP1', 'rr_ratio': 2.0, 'close_percent': 40},
             {'name': 'TP2', 'rr_ratio': 3.5, 'close_percent': 35},
             {'name': 'TP3', 'rr_ratio': 5.0, 'close_percent': 25},
         ])
-
+    
         direction = analysis.get('direction', 'long')
         tps = {}
-
-        # ICT prefers targeting liquidity pools for TP
+    
+        # ── Estimate daily range for TP capping ──────────────────────────────
+        primary_tf = analysis.get('primary_timeframe', '15m')
+        primary_df = multi_tf_data.get(primary_tf, df)
+        primary_atr = self.indicators.calculate_atr(primary_df)['current']
+        bars_per_day = max(1, 1440 / self._tf_minutes(primary_tf))
+        estimated_daily_range = primary_atr * (bars_per_day ** 0.5) * 0.6
+        max_tp_distance = estimated_daily_range * 2.5  # cap at 2.5× daily range
+    
+        # TP1: ICT prefers targeting liquidity pools (unchanged logic)
         struct = analysis.get('market_structure', {})
         if direction == 'long':
-            # Target buy-side liquidity (swing highs)
             liq_target = struct.get('last_swing_high')
             if liq_target and liq_target > entry_price:
-                tps['tp1'] = liq_target  # First target = opposing liquidity
+                tps['tp1'] = liq_target  # Uncapped — real structure target
             else:
                 tps['tp1'] = entry_price + risk * targets[0].get('rr_ratio', 2.0)
         else:
             liq_target = struct.get('last_swing_low')
             if liq_target and liq_target < entry_price:
-                tps['tp1'] = liq_target
+                tps['tp1'] = liq_target  # Uncapped — real structure target
             else:
                 tps['tp1'] = entry_price - risk * targets[0].get('rr_ratio', 2.0)
-
-        # TP2 and TP3 use R:R multiples
+    
+        # TP2 and TP3: R:R multiples — NOW CAPPED
         for i, t in enumerate(targets[1:3], 2):
             rr = t.get('rr_ratio', 3.0)
+            tp_distance = risk * rr
+    
+            # Cap TP distance to prevent multi-week targets
+            if tp_distance > max_tp_distance and max_tp_distance > 0:
+                old_rr = rr
+                rr = max_tp_distance / risk if risk > 0 else rr
+                tp_distance = max_tp_distance
+                logger.debug(
+                    f"[ICT] TP{i} capped: {old_rr:.1f}R → {rr:.1f}R "
+                    f"(max ${max_tp_distance:.2f})"
+                )
+    
             if direction == 'long':
-                tps[f'tp{i}'] = entry_price + risk * rr
+                tps[f'tp{i}'] = entry_price + tp_distance
             else:
-                tps[f'tp{i}'] = entry_price - risk * rr
-
+                tps[f'tp{i}'] = entry_price - tp_distance
+    
         return {
             'entry_price': current_price,
             'order_price': entry_price,
@@ -979,18 +1007,48 @@ class ICTStrategyEngine:
     # ── Stop Loss ──────────────────────────────────────────────────────────────
 
     def _calc_ict_sl(self, analysis, entry_price, atr, df) -> float:
-        """ICT SL: Beyond the liquidity that was swept, or beyond structure."""
+        """
+        ICT SL: Beyond the liquidity that was swept, or beyond structure.
+    
+        CHANGED (v2.800 patch):
+        - Added max_sl_distance cap at 2.0×ATR (configurable via
+        ict.max_sl_atr_multiplier). ICT's structure SL is already good
+        in most cases; this just prevents outliers.
+        """
         struct = analysis.get('market_structure', {})
         direction = analysis.get('direction', 'long')
         buffer = atr * 0.2
-
+    
+        max_sl_atr_mult = float(
+            self.ict_config.get('max_sl_atr_multiplier', 2.0)
+        )
+        max_sl_distance = atr * max_sl_atr_mult
+    
         if direction == 'long':
             sl = struct.get('last_swing_low')
             if sl:
-                return sl - buffer
-            return entry_price - 1.5 * atr
+                sl = sl - buffer
+            else:
+                sl = entry_price - 1.5 * atr
+    
+            if entry_price - sl > max_sl_distance:
+                logger.debug(
+                    f"[ICT] SL clamped: structure SL {sl:.5f} too far, "
+                    f"capping to {max_sl_atr_mult}×ATR from entry"
+                )
+                sl = entry_price - max_sl_distance
+            return sl
         else:
             sh = struct.get('last_swing_high')
             if sh:
-                return sh + buffer
-            return entry_price + 1.5 * atr
+                sl = sh + buffer
+            else:
+                sl = entry_price + 1.5 * atr
+    
+            if sl - entry_price > max_sl_distance:
+                logger.debug(
+                    f"[ICT] SL clamped: structure SL {sl:.5f} too far, "
+                    f"capping to {max_sl_atr_mult}×ATR from entry"
+                )
+                sl = entry_price + max_sl_distance
+            return sl

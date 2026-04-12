@@ -144,42 +144,87 @@ class SMCStrategyEngine:
 
         return analysis
 
-    def calculate_entry_levels(self, analysis: Dict, multi_tf_data: Dict) -> Dict:
-        """Same interface as StrategyEngine.calculate_entry_levels()."""
+    def calculate_entry_levels(self, analysis, multi_tf_data):
+        """
+        Same interface as StrategyEngine.calculate_entry_levels().
+    
+        CHANGED (v2.800 patch):
+        - After computing stop_loss and risk, clamp risk to max
+        1.5× primary-TF ATR estimate of daily range.
+        - TP2 cap: if TP2 exceeds estimated daily range, reduce R:R
+        so the trade can close within the day.
+        """
         entry_tf = analysis.get('entry_tf', '5m')
         if entry_tf not in multi_tf_data:
             avail = sorted(multi_tf_data.keys(), key=lambda t: self._tf_minutes(t))
             entry_tf = avail[0] if avail else next(iter(multi_tf_data), None)
         if not entry_tf or entry_tf not in multi_tf_data:
             return {}
-
+    
         df = multi_tf_data[entry_tf]
         current_price = float(df['close'].iloc[-1])
         atr = self.indicators.calculate_atr(df)['current']
         order_type = analysis.get('order_type', 'limit')
         limit_price = analysis.get('limit_price')
         entry_price = float(limit_price) if (order_type == 'limit' and limit_price) else current_price
-
+    
         stop_loss = self._calc_smc_sl(analysis, entry_price, atr, df)
         risk = abs(entry_price - stop_loss)
-
-        # SMC uses structure-based TPs, not fixed R:R
+    
+        # ── NEW: Estimate daily ATR from the primary timeframe ────────────
+        # Use the 1H ATR × 4 as a rough daily range estimate, or fall back
+        # to entry_tf ATR × bar-count-per-day.
+        primary_tf = analysis.get('primary_timeframe', '15m')
+        primary_df = multi_tf_data.get(primary_tf, df)
+        primary_atr = self.indicators.calculate_atr(primary_df)['current']
+        bars_per_day = max(1, 1440 / self._tf_minutes(primary_tf))
+        # Daily range ≈ ATR × sqrt(bars_per_day) × 0.6 (overlap factor)
+        estimated_daily_range = primary_atr * (bars_per_day ** 0.5) * 0.6
+    
+        # Clamp risk to max 1.5× estimated daily range
+        max_risk_mult = float(self.smc_config.get('max_risk_daily_atr_mult', 1.5))
+        max_risk = estimated_daily_range * max_risk_mult
+        if risk > max_risk and max_risk > 0:
+            logger.info(
+                f"[SMC] Risk ${risk:.2f} exceeds {max_risk_mult}× daily range "
+                f"${estimated_daily_range:.2f} — clamping to ${max_risk:.2f}"
+            )
+            risk = max_risk
+            direction = analysis.get('direction', 'long')
+            if direction == 'long':
+                stop_loss = entry_price - risk
+            else:
+                stop_loss = entry_price + risk
+    
+        # ── Compute TPs ──────────────────────────────────────────────────────
         tp_config = self.config.get('risk_management', {}).get('take_profit', {})
         targets = tp_config.get('targets', [
             {'name': 'TP1', 'rr_ratio': 2.0, 'close_percent': 40},
             {'name': 'TP2', 'rr_ratio': 3.5, 'close_percent': 35},
             {'name': 'TP3', 'rr_ratio': 5.0, 'close_percent': 25},
         ])
-
+    
         direction = analysis.get('direction', 'long')
         tps = {}
         for i, t in enumerate(targets[:3], 1):
             rr = t.get('rr_ratio', 2.0)
+    
+            # ── NEW: Cap TP distance to 2× estimated daily range ─────────
+            tp_distance = risk * rr
+            max_tp = estimated_daily_range * 2.0
+            if tp_distance > max_tp and max_tp > 0:
+                rr = max_tp / risk if risk > 0 else rr
+                tp_distance = max_tp
+                logger.debug(
+                    f"[SMC] TP{i} capped: {t.get('rr_ratio')}R → {rr:.1f}R "
+                    f"(max ${max_tp:.2f})"
+                )
+    
             if direction == 'long':
-                tps[f'tp{i}'] = entry_price + risk * rr
+                tps[f'tp{i}'] = entry_price + tp_distance
             else:
-                tps[f'tp{i}'] = entry_price - risk * rr
-
+                tps[f'tp{i}'] = entry_price - tp_distance
+    
         return {
             'entry_price': current_price,
             'order_price': entry_price,
@@ -832,20 +877,55 @@ class SMCStrategyEngine:
         SMC stop loss: placed beyond the relevant structure point.
         Long: below the last swing low (or below the OB)
         Short: above the last swing high (or above the OB)
+    
+        CHANGED (v2.800 patch):
+        - Fallback ATR multiplier reduced from 2.0 → 1.5 to tighten
+        stops when no structure is found.
+        - Buffer reduced from 0.3×ATR → 0.2×ATR (same as ICT).
+        - Added absolute distance cap: SL cannot be further than
+        max_sl_atr_mult × ATR from entry, even when structure is far away.
+        This prevents the cascade: wide SL → wide risk → impossibly wide TP.
         """
         struct = analysis.get('market_structure', {})
         direction = analysis.get('direction', 'long')
-        buffer = atr * 0.3  # Small buffer beyond structure
-
+        buffer = atr * 0.2   # was 0.3 — tighter buffer
+    
+        # ── Maximum SL distance cap ──────────────────────────────────────────
+        # Never let SL be more than 1.5× ATR from entry.
+        # This is the key fix: when structure is far away (e.g. swing low
+        # is $50 below entry on gold), the old code would set SL there,
+        # creating a $50 risk → $200 TP target. Now capped.
+        max_sl_atr_mult = float(
+            self.smc_config.get('max_sl_atr_multiplier', 1.5)
+        )
+        max_sl_distance = atr * max_sl_atr_mult
+    
         if direction == 'long':
             swing_low = struct.get('last_swing_low')
             if swing_low:
-                return swing_low - buffer
+                sl = swing_low - buffer
             else:
-                return entry_price - 2.0 * atr  # Fallback
+                sl = entry_price - 1.5 * atr  # was 2.0
+    
+            # Clamp: don't let SL be further than max_sl_distance from entry
+            if entry_price - sl > max_sl_distance:
+                sl = entry_price - max_sl_distance
+                logger.debug(
+                    f"[SMC] SL clamped to {sl:.5f} (max {max_sl_atr_mult}×ATR "
+                    f"= {max_sl_distance:.2f} from entry {entry_price:.5f})"
+                )
+            return sl
         else:
             swing_high = struct.get('last_swing_high')
             if swing_high:
-                return swing_high + buffer
+                sl = swing_high + buffer
             else:
-                return entry_price + 2.0 * atr
+                sl = entry_price + 1.5 * atr  # was 2.0
+    
+            if sl - entry_price > max_sl_distance:
+                sl = entry_price + max_sl_distance
+                logger.debug(
+                    f"[SMC] SL clamped to {sl:.5f} (max {max_sl_atr_mult}×ATR "
+                    f"= {max_sl_distance:.2f} from entry {entry_price:.5f})"
+                )
+            return sl

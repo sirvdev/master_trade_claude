@@ -167,6 +167,46 @@ class MarketHoursChecker:
 
         return best if best is not None else 24 * 3600
 
+    def seconds_until_close(self, symbol: str, now: datetime = None) -> int:
+        """
+        Return seconds until the current session closes for this symbol.
+        Returns 0 if the market is currently closed (no active session).
+        Returns 86400+ if the symbol trades 24/7 (crypto).
+    
+        Used by the pre-close pending order sweep to cancel stale orders
+        before the broker stops accepting cancel commands.
+        """
+        if now is None:
+            now = datetime.utcnow()
+    
+        if not self.is_open(symbol, now):
+            return 0  # Already closed
+    
+        sessions = self._get_cached_sessions(symbol)
+        if not sessions:
+            return 86400  # No session data → assume always open (crypto)
+    
+        python_weekday = now.weekday()
+        current_sec = now.hour * 3600 + now.minute * 60 + now.second
+    
+        # Find the session we're currently in
+        for s in sessions:
+            if s["day"] == python_weekday:
+                if s["from_sec"] <= current_sec <= s["to_sec"]:
+                    return s["to_sec"] - current_sec
+    
+        # Fallback: shouldn't reach here if is_open returned True
+        return 0
+    
+    
+    def is_near_close(self, symbol: str, minutes: int = 5, now: datetime = None) -> bool:
+        """
+        Convenience: returns True if the market closes within `minutes`.
+        Used for the pre-close pending order sweep.
+        """
+        secs = self.seconds_until_close(symbol, now)
+        return 0 < secs <= (minutes * 60)
+
     def next_open_str(self, symbol: str, now: datetime = None) -> str:
         """Human-readable string of when the next session opens (UTC)."""
         if now is None:
