@@ -200,7 +200,7 @@ class SMCStrategyEngine:
         tp_config = self.config.get('risk_management', {}).get('take_profit', {})
         targets = tp_config.get('targets', [
             {'name': 'TP1', 'rr_ratio': 2.0, 'close_percent': 40},
-            {'name': 'TP2', 'rr_ratio': 3.5, 'close_percent': 35},
+            {'name': 'TP2', 'rr_ratio': 4.0, 'close_percent': 35},
             {'name': 'TP3', 'rr_ratio': 5.0, 'close_percent': 25},
         ])
     
@@ -888,7 +888,7 @@ class SMCStrategyEngine:
         """
         struct = analysis.get('market_structure', {})
         direction = analysis.get('direction', 'long')
-        buffer = atr * 0.2   # was 0.3 — tighter buffer
+        buffer = atr * 0.3   # was 0.3 — tighter buffer
     
         # ── Maximum SL distance cap ──────────────────────────────────────────
         # Never let SL be more than 1.5× ATR from entry.
@@ -905,7 +905,7 @@ class SMCStrategyEngine:
             if swing_low:
                 sl = swing_low - buffer
             else:
-                sl = entry_price - 1.5 * atr  # was 2.0
+                sl = entry_price - 2.0 * atr  # was 2.0
     
             # Clamp: don't let SL be further than max_sl_distance from entry
             if entry_price - sl > max_sl_distance:
@@ -920,7 +920,7 @@ class SMCStrategyEngine:
             if swing_high:
                 sl = swing_high + buffer
             else:
-                sl = entry_price + 1.5 * atr  # was 2.0
+                sl = entry_price + 2.0 * atr  # was 2.0
     
             if sl - entry_price > max_sl_distance:
                 sl = entry_price + max_sl_distance
