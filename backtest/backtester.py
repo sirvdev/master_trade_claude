@@ -114,6 +114,7 @@ class Backtester:
 
         self.lookback_bars  = bt_cfg.get('lookback_bars', 500)
         self.entry_tf       = tf_cfg.get('entry_timeframe', '15m')
+        self.primary_tf     = tf_cfg.get('primary_timeframe', self.entry_tf)
         self.min_tf         = tf_cfg.get('minimum_timeframe', '1m')
         self.slippage_pct   = sim_cfg.get('slippage_percent', 0.05)
         self.commission_pct = sim_cfg.get('commission_percent', 0.1)
@@ -141,74 +142,68 @@ class Backtester:
         strategy_engine,
         money_manager,
         stop_manager,
-        symbol:          str,
-        start_date:      datetime,
-        end_date:        datetime,
-        initial_balance: float = 10_000,
-    ) -> Dict:
+        symbol: str,
+        start_date: datetime,
+        end_date: datetime,
+        initial_balance: float = 100_000,
+        ):
         """
         Full backtest driven by MT5 historical data.
-
-        Parameters
-        ----------
-        start_date : First bar of the TEST period (lookback is added automatically).
-        end_date   : Last bar of the test period.
+        
+        FIXED: Each TF gets its own lookback window instead of one shared
+        window based on the highest TF.
         """
         print()
         print("=" * 70)
         print(f"  BACKTEST  |  {symbol}  |  "
-              f"{start_date.strftime('%Y-%m-%d')} -> {end_date.strftime('%Y-%m-%d')}")
+            f"{start_date.strftime('%Y-%m-%d')} -> {end_date.strftime('%Y-%m-%d')}")
         print(f"  Lookback: {self.lookback_bars} bars  |  "
-              f"Entry TF: {self.entry_tf}  |  Min TF: {self.min_tf}")
+            f"Walk TF: {self.primary_tf}  |  Entry TF: {self.entry_tf}  |  "
+            f"Min TF: {self.min_tf}")
         print("=" * 70)
-
-        # Resolve platform from symbol config (XAU/USD or XAUUSD both work)
+    
+        # Resolve platform and symbol config
         sym_key = next(
             (k for k in self._symbols_config
-             if k.replace('/', '') == symbol or k == symbol),
+            if k.replace('/', '') == symbol or k == symbol),
             None
         )
         sym_cfg = self._symbols_config.get(sym_key, {}) if sym_key else {}
         self._platform = sym_cfg.get('platform', 'mt5')
-
-        # Timeframes: use the symbol's configured list so we analyse exactly
-        # what's configured (e.g. [1H, 15m, 1m] for XAU/USD)
+    
+        # Build TF list from symbol config
         sym_tfs = sym_cfg.get('timeframes', [])
-        # Normalise to lowercase (config uses 1H, code uses 1h)
         tf_normalise = {'1H': '1h', '4H': '4h', '1D': '1d',
                         '15m': '15m', '5m': '5m', '1m': '1m', '30m': '30m'}
         sym_tfs_norm = [tf_normalise.get(t, t.lower()) for t in sym_tfs]
-
+    
         # Always include entry and min TFs
         all_tf = list(dict.fromkeys(
             sym_tfs_norm + [self.entry_tf, self.min_tf]
         ))
-
-        # Extend fetch window to cover lookback before test start
-        highest_tf_secs  = max(tf_to_seconds(tf) for tf in all_tf)
-        lookback_seconds = self.lookback_bars * highest_tf_secs
-        fetch_from       = start_date - timedelta(seconds=lookback_seconds)
-
+    
+        # ── Separate analysis TFs from the 1m SL/TP checking TF ──────────
+        # Analysis TFs need lookback BEFORE the test period (for indicators)
+        # The 1m TF only needs the test period itself (for SL/TP granularity)
+        analysis_tfs = [tf for tf in all_tf if tf != self.min_tf]
+        
         print(f"\n  Fetching data from MT5...")
-        print(f"  Pre-history from : {fetch_from.strftime('%Y-%m-%d %H:%M')}")
-        print(f"  Test period to   : {end_date.strftime('%Y-%m-%d %H:%M')}\n")
-
-        # Bulk-fetch all timeframes
-        raw_data = await self._fetch_all_timeframes(symbol, all_tf, fetch_from, end_date)
-
-        # Validate we have enough data
-        self._validate_data(raw_data, all_tf)
-
+        print(f"  Analysis TFs: {analysis_tfs} (each with {self.lookback_bars}-bar lookback)")
+        print(f"  Min TF: {self.min_tf} (test period only, for SL/TP checks)")
+        print(f"  Test period: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}\n")
+    
+        # Fetch with per-TF lookback windows
+        raw_data = await self._fetch_all_timeframes_v2(
+            symbol, analysis_tfs, self.min_tf, start_date, end_date
+        )
+    
+        # Validate
+        self._validate_data_v2(raw_data, all_tf, start_date, end_date)
+    
         # Run simulation
         return await self._simulate(
-            strategy_engine,
-            money_manager,
-            stop_manager,
-            raw_data,
-            symbol,
-            start_date,
-            end_date,
-            initial_balance,
+            strategy_engine, money_manager, stop_manager,
+            raw_data, symbol, start_date, end_date, initial_balance,
         )
 
     # ── Data fetching ──────────────────────────────────────────────────────────
@@ -234,8 +229,8 @@ class Backtester:
                 df = await bridge.fetch_historical_range(
                     symbol    = symbol,
                     timeframe = tf,
-                    from_date = from_date,
-                    to_date   = to_date,
+                    from_dt = from_date,
+                    to_dt   = to_date,
                 )
                 raw[tf] = df
                 print(f" {len(df):,} bars OK")
@@ -299,7 +294,10 @@ class Backtester:
         self.trades       = []
         self.open_trades  = {}
 
-        entry_df = raw_data[self.entry_tf]
+        walk_tf = self.primary_tf
+        if walk_tf not in raw_data:
+            walk_tf = self.entry_tf
+        entry_df = raw_data[walk_tf]
         min_df   = raw_data[self.min_tf]
 
         # Bars within the actual test period only
@@ -320,7 +318,7 @@ class Backtester:
             )
 
         total_iters   = len(test_bars)
-        entry_tf_secs = tf_to_seconds(self.entry_tf)
+        entry_tf_secs = tf_to_seconds(walk_tf)
         min_tf_secs   = tf_to_seconds(self.min_tf)
         bars_per_iter = entry_tf_secs // min_tf_secs   # e.g. 15m/1m = 15
 
