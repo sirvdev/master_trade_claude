@@ -281,7 +281,7 @@ async def run_single_test(
     engine_class,
 ) -> Dict:
     """Run one backtest with the given config. Returns results dict."""
-    from backtest.backtester import Backtester
+    from backtest.backtester_v2 import BacktesterV2 as Backtester
     from risk_management.money_manager import MoneyManager
     from risk_management.stop_manager import StopManager
 
@@ -291,7 +291,7 @@ async def run_single_test(
     stop_manager = StopManager(config)
 
     try:
-        results = await backtester.run_from_mt5(
+        results = await backtester.run(
             strategy_engine=strategy_engine,
             money_manager=money_manager,
             stop_manager=stop_manager,

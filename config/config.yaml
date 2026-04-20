@@ -9,12 +9,12 @@ symbols:
     platform: mt5
     mode: live
     timeframes:
+    - 1H
     - 15m
     - 5m
-    - 1m
-    primary_timeframe: 5m
-    entry_timeframe: 1m
-    confluence_threshold: 7
+    primary_timeframe: 15m
+    entry_timeframe: 5m
+    confluence_threshold: 6
   BTC/USD:
     enabled: true
     platform: mt5
@@ -22,12 +22,12 @@ symbols:
     timeframes:
     - 1H
     - 15m
-    - 1m
-    primary_timeframe: 15m
+    - 5m
+    primary_timeframe: 1H
     entry_timeframe: 1m
-    confluence_threshold: 7
+    confluence_threshold: 6
   XAG/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -38,7 +38,7 @@ symbols:
     entry_timeframe: 15m
     confluence_threshold: 5
   EUR/USD:
-    enabled: true
+    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -225,7 +225,7 @@ execution:
     realistic_slippage: true
     latency_ms: 50
   mt5:
-    magic_number: 111000
+    magic_number: 222000
     deviation_points: 10
     fill_policy: FOK
 learning:
@@ -274,19 +274,21 @@ learning:
     save_rollback: true
     max_versions: 10
 backtest:
+  lookback_bars: 250
+  simulation:
+    slippage_percent: 0.05
+    commission_percent: 0.1
+    latency_bars: 1
+  ea_simulation:
+    partial_close_steps: 3      # Matches EA PartialCloseSteps
+    runner_percent: 10.0        # Matches EA RunnerPercent
+    breakeven_min_rr: 1.0       # Matches EA BreakevenMinRR
+    trail_atr_multiplier: 2.0   # Matches EA TrailATRMultiplier
+    trail_atr_period: 14        # Matches EA TrailATRPeriod
   data_source: mt5
   date_range:
     start: 2026-02-08
     end: 2026-02-13
-  lookback_bars: 500
-  timeframes:
-    entry_timeframe: 15m
-    minimum_timeframe: 1m
-  simulation:
-    realistic_slippage: true
-    slippage_percent: 0.05
-    commission_percent: 0.1
-    latency_bars: 1
   output:
     save_trades: true
     save_equity_curve: true
@@ -321,7 +323,7 @@ notifications:
   dashboard:
     refresh_interval_seconds: 30
 dashboard:
-  port: 8500
+  port: 8502
   enable_manual_override: true
   enable_config_edit: true
   enable_learning_trigger: true
@@ -333,12 +335,12 @@ smc:
   # Maximum SL distance as a multiple of entry-TF ATR.
   # Prevents structure-based SL from being unrealistically far.
   # Default: 1.5 (was effectively unlimited before this patch).
-  max_sl_atr_multiplier: 1.5
+  max_sl_atr_multiplier: 2.0
  
   # Maximum risk as a multiple of estimated daily range.
   # If the SL distance exceeds this, risk is clamped.
   # Default: 1.5
-  max_risk_daily_atr_mult: 1.5
+  max_risk_daily_atr_mult: 2.0
 ict:
   # Maximum SL distance as a multiple of entry-TF ATR.
   # ICT's structure SL is already good; this just catches outliers.

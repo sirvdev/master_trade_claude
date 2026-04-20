@@ -21,11 +21,14 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Maximum bars per MT5 request (EA's MaxBarsPerRequest)
+MAX_BARS_PER_REQUEST = 10000
 
 # ── Timeframe helpers ─────────────────────────────────────────────────────────
 
 TF_SECONDS: Dict[str, int] = {
     '1m':  60,
+    '3m':  180,
     '5m':  300,
     '15m': 900,
     '30m': 1800,
@@ -112,7 +115,7 @@ class Backtester:
         sim_cfg = bt_cfg.get('simulation', {})
         tf_cfg  = bt_cfg.get('timeframes', {})
 
-        self.lookback_bars  = bt_cfg.get('lookback_bars', 500)
+        self.lookback_bars  = bt_cfg.get('lookback_bars', 250)
         self.entry_tf       = tf_cfg.get('entry_timeframe', '15m')
         self.primary_tf     = tf_cfg.get('primary_timeframe', self.entry_tf)
         self.min_tf         = tf_cfg.get('minimum_timeframe', '1m')
@@ -172,10 +175,10 @@ class Backtester:
         self._platform = sym_cfg.get('platform', 'mt5')
     
         # Build TF list from symbol config
-        sym_tfs = sym_cfg.get('timeframes', [])
-        tf_normalise = {'1H': '1h', '4H': '4h', '1D': '1d',
-                        '15m': '15m', '5m': '5m', '1m': '1m', '30m': '30m'}
-        sym_tfs_norm = [tf_normalise.get(t, t.lower()) for t in sym_tfs]
+        sym_tfs_norm = sym_cfg.get('timeframes', [])
+        # tf_normalise = {'1H': '1h', '4H': '4h', '1D': '1d',
+        #                 '15m': '15m', '5m': '5m', '1m': '1m', '30m': '30m'}
+        # sym_tfs_norm = [tf_normalise.get(t, t.lower()) for t in sym_tfs]
     
         # Always include entry and min TFs
         all_tf = list(dict.fromkeys(
@@ -198,7 +201,7 @@ class Backtester:
         )
     
         # Validate
-        self._validate_data_v2(raw_data, all_tf, start_date, end_date)
+        # self._validate_data_v2(raw_data, all_tf, start_date, end_date)
     
         # Run simulation
         return await self._simulate(
@@ -208,72 +211,229 @@ class Backtester:
 
     # ── Data fetching ──────────────────────────────────────────────────────────
 
-    async def _fetch_all_timeframes(
+    async def _fetch_all_timeframes_v2(
         self,
-        symbol:     str,
-        timeframes: List[str],
-        from_date:  datetime,
-        to_date:    datetime,
+        symbol: str,
+        analysis_tfs: List[str],
+        min_tf: str,
+        start_date: datetime,
+        end_date: datetime,
     ) -> Dict[str, pd.DataFrame]:
-        """Fetch each TF sequentially (MT5 file bridge is single-threaded)."""
+        """
+        Fetch each TF with its OWN lookback window.
+        
+        Analysis TFs: fetch from (start_date - lookback_bars × tf_seconds) to end_date
+        Min TF (1m):  fetch from start_date to end_date only (no lookback needed)
+        
+        If any single fetch would exceed MAX_BARS_PER_REQUEST, split into chunks.
+        """
         from execution.mt5_file_bridge import MT5FileBridge
-
+    
         bridge = MT5FileBridge(config={}, demo_mode=False)
         await bridge.connect()
-
+    
         raw: Dict[str, pd.DataFrame] = {}
-
-        for tf in timeframes:
-            print(f"  Fetching {tf}...", end='', flush=True)
+    
+        # ── Fetch analysis TFs (4H, 1H, 15m, 5m, etc.) ──────────────────
+        for tf in analysis_tfs:
+            tf_secs = tf_to_seconds(tf)
+            
+            # Each TF gets its own lookback: lookback_bars × tf_seconds before start
+            lookback_secs = self.lookback_bars * tf_secs
+            tf_fetch_from = start_date - timedelta(seconds=lookback_secs)
+            
+            # Estimate total bars needed
+            total_period_secs = (end_date - tf_fetch_from).total_seconds()
+            estimated_bars = int(total_period_secs / tf_secs)
+            
+            print(f"  Fetching {tf:>4s}: "
+                f"from {tf_fetch_from.strftime('%Y-%m-%d')} "
+                f"(~{estimated_bars:,} bars)...", end='', flush=True)
+            
             try:
-                df = await bridge.fetch_historical_range(
-                    symbol    = symbol,
-                    timeframe = tf,
-                    from_dt = from_date,
-                    to_dt   = to_date,
-                )
+                if estimated_bars <= MAX_BARS_PER_REQUEST:
+                    # Single fetch is enough
+                    df = await bridge.fetch_historical_range(
+                        symbol=symbol, timeframe=tf,
+                        from_dt=tf_fetch_from, to_dt=end_date,
+                    )
+                else:
+                    # Need chunked fetch
+                    df = await self._chunked_fetch(
+                        bridge, symbol, tf, tf_fetch_from, end_date, tf_secs
+                    )
+                
                 raw[tf] = df
-                print(f" {len(df):,} bars OK")
+                
+                if len(df) > 0:
+                    print(f" {len(df):>6,} bars "
+                        f"({df.index[0].strftime('%Y-%m-%d')} → "
+                        f"{df.index[-1].strftime('%Y-%m-%d')}) OK")
+                else:
+                    print(f" 0 bars — WARNING: no data returned")
+                    
             except Exception as e:
                 print(f" FAILED: {e}")
                 raise
-
+    
+        # ── Fetch min TF (1m) — test period ONLY ─────────────────────────
+        # 1m is only used for granular SL/TP checking within each bar
+        # No lookback needed — indicators are computed on analysis TFs
+        min_tf_secs = tf_to_seconds(min_tf)
+        test_period_secs = (end_date - start_date).total_seconds()
+        estimated_1m_bars = int(test_period_secs / min_tf_secs)
+        
+        print(f"  Fetching {min_tf:>4s}: "
+            f"from {start_date.strftime('%Y-%m-%d')} "
+            f"(test period only, ~{estimated_1m_bars:,} bars)...", end='', flush=True)
+        
+        try:
+            if estimated_1m_bars <= MAX_BARS_PER_REQUEST:
+                df = await bridge.fetch_historical_range(
+                    symbol=symbol, timeframe=min_tf,
+                    from_dt=start_date, to_dt=end_date,
+                )
+            else:
+                df = await self._chunked_fetch(
+                    bridge, symbol, min_tf, start_date, end_date, min_tf_secs
+                )
+            
+            raw[min_tf] = df
+            
+            if len(df) > 0:
+                print(f" {len(df):>6,} bars "
+                    f"({df.index[0].strftime('%Y-%m-%d')} → "
+                    f"{df.index[-1].strftime('%Y-%m-%d')}) OK")
+            else:
+                print(f" 0 bars — WARNING")
+                
+        except Exception as e:
+            print(f" FAILED: {e}")
+            raise
+    
         await bridge.disconnect()
         return raw
 
+    async def _chunked_fetch(
+        self,
+        bridge,
+        symbol: str,
+        tf: str,
+        from_date: datetime,
+        to_date: datetime,
+        tf_secs: int,
+    ) -> pd.DataFrame:
+        """
+        Fetch data in chunks of MAX_BARS_PER_REQUEST bars, then concatenate.
+        Needed when the total period exceeds 5,000 bars at this timeframe.
+        """
+        chunk_duration = timedelta(seconds=MAX_BARS_PER_REQUEST * tf_secs * 0.9)
+        # 0.9 factor leaves room for overlap to avoid gaps
+        
+        all_chunks = []
+        chunk_start = from_date
+        chunk_num = 0
+        
+        while chunk_start < to_date:
+            chunk_end = min(chunk_start + chunk_duration, to_date)
+            chunk_num += 1
+            
+            try:
+                df = await bridge.fetch_historical_range(
+                    symbol=symbol, timeframe=tf,
+                    from_dt=chunk_start, to_dt=chunk_end,
+                )
+                if len(df) > 0:
+                    all_chunks.append(df)
+            except Exception as e:
+                logger.warning(f"Chunk {chunk_num} fetch failed for {tf}: {e}")
+            
+            # Move start to end of this chunk (slight overlap to avoid gaps)
+            chunk_start = chunk_end - timedelta(seconds=tf_secs * 10)
+        
+        if not all_chunks:
+            return pd.DataFrame()
+        
+        # Concatenate and remove duplicates
+        combined = pd.concat(all_chunks)
+        combined = combined[~combined.index.duplicated(keep='first')]
+        combined = combined.sort_index()
+        
+        return combined
+
     # ── Validation ─────────────────────────────────────────────────────────────
 
-    def _validate_data(self, raw_data: Dict[str, pd.DataFrame], timeframes: List[str]):
-        print("\n  Data summary:")
+    
+    def _validate_data_v2(
+        self,
+        raw_data: Dict[str, pd.DataFrame],
+        timeframes: List[str],
+        start_date: datetime,
+        end_date: datetime,
+    ):
+        """
+        Validate that each TF has data covering the test period.
+        Much better than the old validation which just checked bar count.
+        """
+        print("\n  Data validation:")
+        
+        start_ts = pd.Timestamp(start_date, tz='UTC')
+        end_ts = pd.Timestamp(end_date, tz='UTC')
+        
+        all_ok = True
+        
         for tf in timeframes:
             df = raw_data.get(tf)
             if df is None or df.empty:
-                raise ValueError(f"No data returned for {tf}")
+                print(f"    {tf:>4s}: ❌ NO DATA")
+                all_ok = False
+                continue
             
-            # Lenient check: we need SOME lookback, but not necessarily the full amount
-            # The real requirement is: can we start the backtest with a reasonable window?
-            # A practical minimum is 50 bars (enough for most indicators)
-            min_practical = min(50, self.lookback_bars // 2)
+            first = df.index[0]
+            last = df.index[-1]
             
-            if len(df) < min_practical:
-                raise ValueError(
-                    f"{tf}: only {len(df)} bars available, "
-                    f"need at least {min_practical} bars minimum. "
-                    f"Try an earlier start_date."
-                )
+            # Check: does the data reach into the test period?
+            if last < start_ts:
+                print(f"    {tf:>4s}: ❌ Data ends at {last.strftime('%Y-%m-%d')} "
+                    f"— BEFORE test period starts ({start_date.strftime('%Y-%m-%d')})")
+                all_ok = False
+                continue
             
-            # Warn if less than requested lookback (but don't fail)
-            if len(df) < self.lookback_bars:
-                logger.warning(
-                    f"{tf}: only {len(df)} bars available "
-                    f"(requested {self.lookback_bars}), will use what's available"
-                )
-            
-            print(f"    {tf:>4s}: {len(df):>6,} bars  "
-                  f"({df.index[0].strftime('%Y-%m-%d')} -> "
-                  f"{df.index[-1].strftime('%Y-%m-%d')})")
+            # Check: for analysis TFs, do we have lookback before test start?
+            if tf != self.min_tf:
+                bars_before_test = len(df[df.index < start_ts])
+                min_needed = min(50, self.lookback_bars // 2)
+                if bars_before_test < min_needed:
+                    print(f"    {tf:>4s}: ⚠️  Only {bars_before_test} lookback bars "
+                        f"(need {min_needed}+)")
+                else:
+                    # Count bars in test period
+                    test_bars = len(df[(df.index >= start_ts) & (df.index <= end_ts)])
+                    print(f"    {tf:>4s}: ✅ {bars_before_test} lookback + "
+                        f"{test_bars} test bars = {len(df)} total")
+            else:
+                # For min_tf (1m), check coverage of test period
+                test_bars = len(df[(df.index >= start_ts) & (df.index <= end_ts)])
+                tf_secs = tf_to_seconds(tf)
+                expected_bars = int((end_date - start_date).total_seconds() / tf_secs)
+                coverage = test_bars / max(expected_bars, 1) * 100
+                
+                if coverage < 50:
+                    print(f"    {tf:>4s}: ❌ Only {test_bars} test bars "
+                        f"({coverage:.0f}% coverage, expected ~{expected_bars})")
+                    all_ok = False
+                else:
+                    print(f"    {tf:>4s}: ✅ {test_bars} test bars "
+                        f"({coverage:.0f}% of expected {expected_bars})")
+        
         print()
-
+        
+        if not all_ok:
+            raise ValueError(
+                "Data validation failed — some timeframes don't cover the test period. "
+                "See details above."
+            )
+    
     # ── Core simulation ────────────────────────────────────────────────────────
 
     async def _simulate(
