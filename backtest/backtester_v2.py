@@ -47,7 +47,7 @@ TF_SECONDS = {
     '1d': 86400, '1D': 86400,
 }
 
-MAX_BARS_PER_REQUEST = 10000
+MAX_BARS_PER_REQUEST = 13000
 
 
 def tf_to_seconds(tf: str) -> int:
@@ -59,8 +59,56 @@ def tf_to_seconds(tf: str) -> int:
 
 def tf_normalize(tf: str) -> str:
     """Normalize TF strings: '1H' and '1h' → '1h' etc."""
-    mapping = {'1H': '1H', '4H': '4H', '1D': '1D'}
+    mapping = {'1H': '1h', '4H': '4h', '1D': '1d'}
     return mapping.get(tf, tf.lower() if len(tf) <= 3 else tf)
+
+
+# ── Market hours per symbol class ──────────────────────────────────────────────
+# Trading hours per day (in seconds) and weekly structure.
+# Used to convert "N bars of trading time" into calendar days for data fetching.
+#
+# Gold (XAUUSD/XAGUSD):
+#   - Trades ~23 hrs/day (closes ~21:00-22:00 UTC daily, varies by broker)
+#   - Mon-Fri, opens Sunday ~22:00 UTC
+#   - 5 trading days/week
+#
+# Forex (EURUSD, GBPUSD, etc.):
+#   - Trades ~21 hrs/day (brief daily rollover close)
+#   - Mon-Fri, opens Sunday ~22:00 UTC
+#   - 5 trading days/week
+#
+# Crypto (BTC/USD):
+#   - Trades ~23-24 hrs/day (some brokers have 1hr maintenance)
+#   - 7 days/week
+#   - Weekend maintenance windows vary by broker
+
+_MARKET_HOURS = {
+    # symbol_prefix: (trading_seconds_per_day, trading_days_per_week)
+    'XAU': (82800, 5),    # 23 hrs/day, Mon-Fri
+    'XAG': (82800, 5),    # 23 hrs/day, Mon-Fri
+    'EUR': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'GBP': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'USD': (75600, 5),    # 21 hrs/day, Mon-Fri (for pairs like USDJPY)
+    'AUD': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'NZD': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'CAD': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'CHF': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'JPY': (75600, 5),    # 21 hrs/day, Mon-Fri
+    'BTC': (82800, 7),    # 23 hrs/day, 7 days (1hr broker maintenance)
+    'ETH': (82800, 7),    # 23 hrs/day, 7 days
+    'NAS': (23400, 5),    # 6.5 hrs/day, Mon-Fri (US market hours)
+    'US1': (23400, 5),    # US100 etc.
+    'US3': (23400, 5),    # US30 etc.
+}
+
+
+def _get_market_schedule(symbol: str):
+    """Get (trading_secs_per_day, trading_days_per_week) for a symbol."""
+    norm = symbol.replace('/', '').upper()
+    for prefix, schedule in _MARKET_HOURS.items():
+        if norm.startswith(prefix):
+            return schedule
+    return (75600, 5)  # Default: forex-like (21hrs, Mon-Fri)
 
 
 # ── Position tracking (mirrors EA's PositionTrack struct) ──────────────────────
@@ -180,16 +228,20 @@ class BacktesterV2:
         sym_cfg = self._symbols_config.get(sym_key, {}) if sym_key else {}
 
         # ── Determine timeframe roles (EXACTLY as live does) ─────────
+        # IMPORTANT: Keep original case from config — MT5 bridge uses
+        # '1H'/'4H'/'1D' not lowercase. tf_normalize() was converting
+        # them to lowercase which the bridge couldn't map.
         tfs = sym_cfg.get('timeframes', ['4H', '15m', '5m'])
-        primary_tf = tf_normalize(sym_cfg.get('primary_timeframe', tfs[1] if len(tfs) > 1 else '15m'))
-        entry_tf = tf_normalize(sym_cfg.get('entry_timeframe', tfs[-1] if tfs else '5m'))
-        structure_tf = tf_normalize(tfs[0]) if tfs else '4h'
+        primary_tf = sym_cfg.get('primary_timeframe', tfs[1] if len(tfs) > 1 else '15m')
+        entry_tf = sym_cfg.get('entry_timeframe', tfs[-1] if tfs else '5m')
+        structure_tf = tfs[0] if tfs else '4H'
 
-        # All TFs we need data for (analysis + 1m for granular exits)
-        analysis_tfs = list(dict.fromkeys([
-            tf_normalize(t) for t in tfs
-        ]))
-        # Always include 1m for SL/TP granularity
+        # Analysis TFs = the symbol's configured timeframes (for indicators)
+        # These get passed to strategy_engine.analyze_market()
+        analysis_tfs = list(dict.fromkeys(tfs))
+
+        # Min TF = 1m for granular SL/TP/partial close simulation
+        # NOT passed to strategy engine — only used for exit management
         min_tf = '1m'
 
         print()
@@ -212,7 +264,7 @@ class BacktesterV2:
         results = self._simulate(
             strategy_engine, money_manager, stop_manager,
             raw_data, symbol, sym_cfg, primary_tf, min_tf,
-            start_date, end_date, initial_balance,
+            start_date, end_date, initial_balance, analysis_tfs,
         )
 
         return results
@@ -220,6 +272,59 @@ class BacktesterV2:
     # ══════════════════════════════════════════════════════════════════════
     # DATA FETCHING (per-TF lookback windows)
     # ══════════════════════════════════════════════════════════════════════
+
+    def _calc_lookback_date(self, symbol, start_date, lookback_trading_secs):
+        """
+        Calculate the fetch_from date by converting trading-time lookback
+        into calendar days, accounting for:
+        - Daily market close hours (gold ~1hr/day, forex ~3hrs/day)
+        - Weekends (5-day vs 7-day markets)
+        - Safety buffer for broker holidays
+
+        Example for XAUUSD with 250 bars of 5m:
+          lookback_trading_secs = 250 × 300 = 75,000 trading seconds
+          Gold trades 23 hrs/day (82,800 secs), 5 days/week
+          Trading days needed = ceil(75,000 / 82,800) = 1 day
+          Calendar days = ceil(1 × 7/5) + 2 buffer = 4 calendar days
+          fetch_from = start_date - 4 days
+        """
+        trading_secs_per_day, trading_days_per_week = _get_market_schedule(symbol)
+
+        # How many full trading days does the lookback span?
+        trading_days_needed = math.ceil(
+            lookback_trading_secs / max(trading_secs_per_day, 1)
+        )
+
+        # Ensure at least 1 full trading day of lookback
+        trading_days_needed = max(trading_days_needed, 1)
+
+        # Convert trading days → calendar days
+        if trading_days_per_week >= 7:
+            # Crypto: trades every day (with possible brief maintenance)
+            calendar_days = trading_days_needed + 1  # +1 for maintenance gaps
+        else:
+            # Forex/metals: 5 trading days per 7 calendar days
+            full_weeks = trading_days_needed // trading_days_per_week
+            remaining_days = trading_days_needed % trading_days_per_week
+            calendar_days = (full_weeks * 7) + remaining_days
+
+            # Add weekend bridge: if the lookback might land on a weekend,
+            # add 2 extra days to ensure we reach Friday's data
+            calendar_days += 2
+
+        # Safety buffer for broker holidays (e.g., Easter, Christmas)
+        calendar_days += 1
+
+        fetch_from = start_date - timedelta(days=calendar_days)
+
+        logger.debug(
+            f"[LOOKBACK] {symbol}: {lookback_trading_secs}s trading time "
+            f"= {trading_days_needed} trading days "
+            f"= {calendar_days} calendar days "
+            f"→ fetch from {fetch_from.strftime('%Y-%m-%d')}"
+        )
+
+        return fetch_from
 
     async def _fetch_data(self, symbol, analysis_tfs, min_tf, primary_tf,
                           start_date, end_date):
@@ -234,8 +339,13 @@ class BacktesterV2:
         # Analysis TFs — each with its own lookback
         for tf in analysis_tfs:
             tf_secs = tf_to_seconds(tf)
-            lookback_secs = self.lookback_bars * tf_secs
-            fetch_from = start_date - timedelta(seconds=lookback_secs)
+            lookback_trading_secs = self.lookback_bars * tf_secs
+
+            # Calculate how many CALENDAR days of lookback we need,
+            # accounting for market-closed hours and weekends.
+            fetch_from = self._calc_lookback_date(
+                symbol, start_date, lookback_trading_secs
+            )
             est_bars = int((end_date - fetch_from).total_seconds() / tf_secs)
 
             print(f"  {tf:>4s}: from {fetch_from.strftime('%Y-%m-%d')} "
@@ -330,7 +440,7 @@ class BacktesterV2:
 
     def _simulate(self, strategy_engine, money_manager, stop_manager,
                   raw_data, symbol, sym_cfg, primary_tf, min_tf,
-                  start_date, end_date, initial_balance):
+                  start_date, end_date, initial_balance, analysis_tfs):
 
         self.balance = initial_balance
         self.equity_curve = [initial_balance]
@@ -359,18 +469,31 @@ class BacktesterV2:
         for idx, (bar_ts, bar) in enumerate(test_bars.iterrows()):
 
             # ── STEP 1: Manage open positions on 1m bars within this period ──
-            # This happens BEFORE analysis (like EA running continuously)
-            period_start = bar_ts - timedelta(seconds=primary_secs)
+            # This happens BEFORE analysis (like EA running continuously).
+            #
+            # Use the PREVIOUS primary bar's timestamp as the window start,
+            # NOT arithmetic subtraction. This correctly handles market close
+            # gaps — e.g., gold's daily 1-hour close won't produce phantom
+            # 1m bars, and we won't miss pre-close bars either.
+            if idx > 0:
+                prev_bar_ts = test_bars.index[idx - 1]
+            else:
+                prev_bar_ts = bar_ts - timedelta(seconds=primary_secs)
+
             one_min_bars = min_df[
-                (min_df.index > period_start) & (min_df.index <= bar_ts)
+                (min_df.index > prev_bar_ts) & (min_df.index <= bar_ts)
             ]
             self._manage_positions_granular(one_min_bars, raw_data, symbol)
 
             # ── STEP 2: At bar close, run strategy analysis ──────────────
-            # Build lookback data for ALL timeframes up to this bar
-            # (only CLOSED bars — no lookahead)
+            # Build lookback data for ANALYSIS timeframes only (not 1m).
+            # 1m is only for SL/TP granular checking — the strategy engine
+            # never sees it in live (live fetches only the symbol's configured TFs).
             tf_snapshot = {}
-            for tf, df in raw_data.items():
+            for tf in analysis_tfs:
+                df = raw_data.get(tf)
+                if df is None:
+                    continue
                 available = df[df.index <= bar_ts]
                 n = min(len(available), self.lookback_bars)
                 if n > 0:
@@ -563,7 +686,7 @@ class BacktesterV2:
 
     def _get_atr_for_trailing(self, raw_data, current_ts, period=14):
         """Compute ATR from 1H bars for runner trailing."""
-        for tf in ['1H', '1H', '4H', '4H']:
+        for tf in ['1h', '1H', '4h', '4H']:
             if tf in raw_data:
                 df = raw_data[tf]
                 available = df[df.index <= current_ts]
