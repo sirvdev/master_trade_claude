@@ -114,13 +114,10 @@ class StrategyEngine:
 
     def calculate_entry_levels(self, analysis, multi_tf_data):
         """
-        PATCHED: Uses PRIMARY timeframe ATR for SL calculation, not entry TF.
-        Entry TF is still used for limit price precision.
-    
-        The old code used entry_tf ATR (1m on gold = $1.50 ATR → $2.25 SL).
-        Now uses primary_tf ATR (15m on gold ≈ $5-8 ATR → $7.50-12 SL).
-        Combined with the conservative method (min of ATR and structure stop),
-        this produces realistic stops that can survive normal market noise.
+        FIXED: Uses PRIMARY timeframe ATR for SL calculation instead of entry TF.
+        
+        The old code used entry_tf ATR (1m gold = $1.50 → $2.25 SL).
+        Now uses primary_tf ATR (15m gold ≈ $5-8 → $7.50-12 SL).
         """
         entry_tf = analysis.get('entry_tf', '5m')
         primary_tf = analysis.get('primary_timeframe', '15m')
@@ -134,15 +131,9 @@ class StrategyEngine:
         df = multi_tf_data[entry_tf]
         current_price = float(df['close'].iloc[-1])
     
-        # ── CHANGE: Use primary TF ATR for SL, not entry TF ATR ──────────────
-        # Entry TF ATR is too small for SL on short timeframes (1m, 5m).
-        # Primary TF ATR reflects the actual price movement the trade needs
-        # to survive through.
+        # ── Use primary TF ATR for SL ────────────────────────────────────
         primary_df = multi_tf_data.get(primary_tf, df)
         atr = self.indicators.calculate_atr(primary_df)['current']
-    
-        # Also get entry TF ATR for limit price offset (still useful)
-        entry_atr = self.indicators.calculate_atr(df)['current']
     
         order_type = analysis.get('order_type', 'market')
         limit_price = analysis.get('limit_price')
@@ -435,13 +426,8 @@ class StrategyEngine:
 
     def _pullback_sr(self, htf, ptf, ltf, htf_df, ptf_df, ltf_df, bias):
         """
-        PATCHED: Uses actual swing points from price_structure for S/R,
-        with EMA50 as fallback only when no swing points are available.
-    
-        Old code: used EMA50 proximity as "S/R" → not real support/resistance.
-        New code: checks if price has pulled back to last_swing_low (for longs)
-        or last_swing_high (for shorts). These are actual structural levels
-        where price previously reversed.
+        FIXED: Uses actual swing points from price_structure for S/R.
+        Falls back to EMA50 only when no swing data exists.
         """
         d = self._e()
         if bias not in ('bullish', 'bearish'):
@@ -451,7 +437,7 @@ class StrategyEngine:
         cp = ptf['ohlc']['close']
         atr = pi['atr']['value']
     
-        # ── Try real structure S/R first ─────────────────────────────────────
+        # ── Try real structure S/R first ─────────────────────────────────
         ps = pi.get('price_structure', {})
         swing_low = ps.get('last_swing_low')
         swing_high = ps.get('last_swing_high')
@@ -460,19 +446,17 @@ class StrategyEngine:
         dr = None
     
         if bias == 'bullish' and swing_low:
-            # Long: price pulled back near the last swing low (support)
             distance = abs(cp - swing_low)
             if distance <= 0.5 * atr and cp > swing_low:
                 sr_level = swing_low
                 dr = 'long'
         elif bias == 'bearish' and swing_high:
-            # Short: price pulled back near the last swing high (resistance)
             distance = abs(cp - swing_high)
             if distance <= 0.5 * atr and cp < swing_high:
                 sr_level = swing_high
                 dr = 'short'
     
-        # ── Fallback to EMA50 if no swing points ─────────────────────────────
+        # ── Fallback to EMA50 ────────────────────────────────────────────
         if sr_level is None:
             e50 = pi['ema'].get(50, 0)
             if e50 <= 0:
@@ -486,32 +470,27 @@ class StrategyEngine:
                 return d
             sr_level = e50
     
-        # ── Build confluence signals ─────────────────────────────────────────
+        # ── Build confluence signals ─────────────────────────────────────
         sigs = ['pullback_to_sr']
         rsi = pi['rsi']['value']
         if dr == 'long' and (pi['rsi']['oversold'] or 30 < rsi < 45):
             sigs.append('rsi_oversold_recovery')
         elif dr == 'short' and (pi['rsi']['overbought'] or 55 < rsi < 70):
             sigs.append('rsi_overbought_rejection')
-    
         if pi['supertrend']['trend'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('supertrend_aligned')
-    
         if pi['adx'].get('trend_strength') == 'strong':
             sigs.append('adx_strong')
-    
         for cpat, side in [('bullish_engulfing', 'long'), ('hammer', 'long'),
                         ('bearish_engulfing', 'short'), ('shooting_star', 'short')]:
             if dr == side and pi['candle_patterns'].get(cpat):
                 sigs.append('candle_pattern')
                 break
-    
-        e20, e50, e200 = pi['ema'].get(20, 0), pi['ema'].get(50, 0), pi['ema'].get(200, 0)
-        if dr == 'long' and e20 > e50 > e200 > 0:
+        e20, e50v, e200 = pi['ema'].get(20, 0), pi['ema'].get(50, 0), pi['ema'].get(200, 0)
+        if dr == 'long' and e20 > e50v > e200 > 0:
             sigs.append('ema_stack_full')
-        elif dr == 'short' and e20 < e50 and e200 > 0 and e50 < e200:
+        elif dr == 'short' and e20 < e50v and e200 > 0 and e50v < e200:
             sigs.append('ema_stack_full')
-    
         if htf['trend']['direction'] == ('bullish' if dr == 'long' else 'bearish'):
             sigs.append('price_structure_aligned')
     
@@ -741,18 +720,31 @@ class StrategyEngine:
         filters = self.strategy_config.get('filters', {})
         snaps = analysis['timeframe_snapshots']
     
+        # ── Get confluence score for counter-trend override check ─────────
+        score = analysis.get('confluence_score', 0)
+        symbol = analysis.get('symbol', '')
+        threshold = self._get_threshold(symbol)
+        strong_override = score >= (threshold + 2)
+    
         # ── Existing: HTF bias filter ────────────────────────────────────────
         if filters.get('respect_higher_tf_bias', True) and structure_tf in snaps:
             htf_trend = snaps[structure_tf]['trend']['direction']
-            if analysis['direction'] == 'long' and htf_trend == 'bearish':
-                if not filters.get('allow_override', False):
+            against_trend = (
+                (analysis['direction'] == 'long' and htf_trend == 'bearish') or
+                (analysis['direction'] == 'short' and htf_trend == 'bullish')
+            )
+            if against_trend and not filters.get('allow_override', False):
+                if strong_override:
+                    logger.info(
+                        f"[{symbol}] Counter-trend allowed: score {score:.0f} >= "
+                        f"threshold+2 ({threshold + 2})"
+                    )
+                else:
                     analysis['entry_signal'] = False
-                    analysis['entry_reason'] = 'Filtered: against HTF bearish'
-                    return analysis
-            elif analysis['direction'] == 'short' and htf_trend == 'bullish':
-                if not filters.get('allow_override', False):
-                    analysis['entry_signal'] = False
-                    analysis['entry_reason'] = 'Filtered: against HTF bullish'
+                    analysis['entry_reason'] = (
+                        f'Filtered: against HTF {htf_trend} '
+                        f'(score {score:.0f} < override {threshold + 2})'
+                    )
                     return analysis
     
         # ── Existing: ATR threshold filter ───────────────────────────────────

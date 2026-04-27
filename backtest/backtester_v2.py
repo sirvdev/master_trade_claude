@@ -33,11 +33,52 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
+from unittest.mock import patch, MagicMock
+from contextlib import contextmanager
 
 import pandas as pd
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+# ── Simulated time for backtest ────────────────────────────────────────────────
+# In live trading, datetime.utcnow() returns wall-clock time, which matches
+# the bar close time. In backtest, all bars are processed instantly, so
+# utcnow() returns whatever time the user runs the script — breaking every
+# session/killzone check in every engine.
+#
+# Solution: temporarily replace `datetime` in the engine module with a mock
+# that returns the simulated bar time for utcnow()/now(), while preserving
+# all other datetime functionality (fromisoformat, strptime, etc.).
+
+@contextmanager
+def simulated_time(engine, bar_time):
+    """
+    Context manager that makes datetime.utcnow() return the simulated bar_time
+    inside the strategy engine module. All other datetime methods work normally.
+    
+    Usage:
+        with simulated_time(strategy_engine, bar_ts):
+            analysis = strategy_engine.analyze_market(...)
+    """
+    engine_module = type(engine).__module__
+    
+    # Build a mock datetime class that forwards everything to real datetime
+    # except utcnow() and now() which return the simulated time
+    mock_dt = MagicMock(wraps=datetime)
+    mock_dt.utcnow.return_value = bar_time
+    mock_dt.now.return_value = bar_time
+    # Preserve class methods that engines use
+    mock_dt.fromisoformat = datetime.fromisoformat
+    mock_dt.fromtimestamp = datetime.fromtimestamp
+    mock_dt.strptime = datetime.strptime
+    mock_dt.combine = datetime.combine
+    # Preserve constructors (datetime(...) calls)
+    mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+    
+    with patch(f'{engine_module}.datetime', mock_dt):
+        yield
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -502,10 +543,16 @@ class BacktesterV2:
             # Check: can we take new trades?
             if len(self.open_positions) < self.max_concurrent:
                 try:
-                    # Call analyze_market with symbol_config — SAME as live
-                    analysis = strategy_engine.analyze_market(
-                        symbol, tf_snapshot, symbol_config=sym_cfg
-                    )
+                    # Call analyze_market with symbol_config — SAME as live.
+                    # Wrap in simulated_time so datetime.utcnow() returns the
+                    # bar close time, not wall-clock time. This makes
+                    # killzone/session checks work correctly in backtest.
+                    bar_time = bar_ts.to_pydatetime().replace(tzinfo=None)
+                    
+                    with simulated_time(strategy_engine, bar_time):
+                        analysis = strategy_engine.analyze_market(
+                            symbol, tf_snapshot, symbol_config=sym_cfg
+                        )
 
                     if analysis.get('entry_signal'):
                         levels = strategy_engine.calculate_entry_levels(
