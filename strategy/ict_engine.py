@@ -21,6 +21,7 @@ Integration:
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 from indicators.indicators import TechnicalIndicators
@@ -51,18 +52,47 @@ _ICT_WEIGHTS: Dict[str, int] = {
     'volume_spike':            1,
 }
 
-# ICT Killzones (UTC) — more precise than generic SMC
+# ICT Killzones, expressed in NEW YORK local hours because that is the clock
+# ICT is defined on. _ny_hour() converts at runtime, so US DST changes cannot
+# put the windows out of position.
+#
+# FIXED 2026-08-30 audit: these values were previously compared against
+# datetime.utcnow().hour. That put the engine 4-5 hours out: it traded
+# 02:00-05:00 UTC (22:00-01:00 New York, no killzone under any convention)
+# and never traded 11:00-14:00 UTC, the real NY AM killzone.
 _ICT_KILLZONES = {
-    'london':    (2, 5),     # 02:00–05:00 UTC (London open)
-    'ny_am':     (7, 10),    # 07:00–10:00 UTC (NY morning)
-    'ny_lunch':  (11, 13),   # 11:00–13:00 UTC (NY lunch — avoid)
-    'ny_pm':     (13, 15),   # 13:00–15:00 UTC (NY afternoon)
+    'london':    (2, 5),     # 02:00-05:00 New York
+    'ny_am':     (7, 10),    # 07:00-10:00 New York
+    'ny_lunch':  (12, 13),   # 12:00-13:00 New York (avoid)
+    'ny_pm':     (13, 16),   # 13:00-16:00 New York
 }
 
-# Asian session for range reference
-_ASIAN_SESSION = (0, 6)  # 00:00–06:00 UTC
+_NY_TZ = ZoneInfo('America/New_York')
 
-_VOLATILE_SYMBOLS = {'XAUUSD','XAU/USD','BTCUSD','BTC/USD','NAS100USD','NAS100','US100'}
+
+def _ny_hour() -> int:
+    """Current hour on ICT's reference clock (New York), DST-aware."""
+    return datetime.now(timezone.utc).astimezone(_NY_TZ).hour
+
+# Asian session for range reference, matched against df.index.hour.
+#
+# CAVEAT 2026-08-30 audit (not fixed here, needs an EA change): the EA emits
+# raw MQL5 rates[i].time, which is broker-SERVER time, and
+# mt5_file_bridge.fetch_historical labels it utc=True. So df.index is server
+# time while the killzone checks above are true UTC/New York. Verify the
+# broker offset before trusting this window.
+_ASIAN_SESSION = (0, 6)
+
+# Compared by PREFIX against the symbol with separators stripped, so broker
+# suffixes match too (Exness' micro suffix turns XAU/USDm into XAUUSDM).
+# FIXED 2026-08-30 audit: the old exact-match set never matched a single live
+# symbol, so every instrument silently fell through to confluence_threshold_calm.
+_VOLATILE_SYMBOLS = {'XAUUSD', 'BTCUSD', 'NAS100USD', 'NAS100', 'US100'}
+
+
+def _is_volatile(symbol: str) -> bool:
+    s = symbol.replace('/', '').replace('-', '').replace('_', '').upper()
+    return any(s.startswith(v) for v in _VOLATILE_SYMBOLS)
 
 
 class ICTStrategyEngine:
@@ -108,7 +138,11 @@ class ICTStrategyEngine:
             entry_tf = avail[-1] if avail else '5m'
 
         analysis = {
-            'symbol': symbol, 'timestamp': datetime.now().replace(tzinfo=None),
+            'symbol': symbol, # FIXED 2026-08-30 audit: datetime.now() is the host's LOCAL clock, which
+            # on this machine is 7 hours behind UTC, while every trade,
+            # order and log record in the system is UTC. The analysis
+            # timestamp was the odd one out.
+            'timestamp': datetime.now(timezone.utc).replace(tzinfo=None),
             'primary_timeframe': primary_tf, 'structure_tf': structure_tf,
             'entry_tf': entry_tf, 'timeframe_snapshots': {},
             'market_structure': {}, 'indicators_state': {},
@@ -260,6 +294,9 @@ class ICTStrategyEngine:
 
         snap = {
             'ohlc': {k: float(df[k].iloc[-1]) for k in ['open','high','low','close','volume']},
+            # I3 2026-08-30 audit: rolling volume baseline so 'volume_spike'
+            # can test for an actual spike instead of for volume existing.
+            'volume_ma': float(df['volume'].tail(20).mean()),
             'indicators': {
                 'ema': {p: float(v.iloc[-1]) for p, v in ind['ema'].items()},
                 'rsi': {'value': float(ind['rsi']['value'].iloc[-1]),
@@ -527,6 +564,17 @@ class ICTStrategyEngine:
 
         cp = float(df['close'].iloc[-1])
 
+        # FIXED 2026-08-30 audit: fib_618/705/786 above are measured DOWN
+        # from the impulse high, which is only right for a long
+        # retracement. The short sweet spot must be measured UP from the
+        # impulse low; using the long value put the 70.5% entry at the
+        # 29.5% level, i.e. a sell limit below market, which the broker
+        # rejects. Live evidence: 13 OTE orders placed, all 13 long.
+        if direction == 'long':
+            ote_sweet_spot = fib_705
+        else:
+            ote_sweet_spot = impulse_low + range_size * 0.705
+
         if direction == 'long':
             ote_top = fib_618
             ote_bottom = fib_786
@@ -539,6 +587,7 @@ class ICTStrategyEngine:
         return {
             'active': True,
             'direction': direction,
+            'ote_sweet_spot': ote_sweet_spot,
             'ote_top': ote_top,
             'ote_bottom': ote_bottom,
             'fib_618': fib_618,
@@ -572,9 +621,10 @@ class ICTStrategyEngine:
         # Check recent bars (last 5) during London/NY open
         try:
             recent = df.iloc[-5:]
-            hour = datetime.utcnow().hour
+            hour = _ny_hour()
 
-            if not (2 <= hour <= 10):  # Only during London/NY open
+            # London killzone (02-05 NY) through NY AM killzone (07-10 NY)
+            if not (2 <= hour <= 10):
                 return {'detected': False}
 
             recent_low = float(recent['low'].min())
@@ -650,7 +700,7 @@ class ICTStrategyEngine:
 
     def _in_killzone(self) -> bool:
         """ICT only trades during institutional killzones."""
-        hour = datetime.utcnow().hour
+        hour = _ny_hour()
         for kz_name, (start, end) in _ICT_KILLZONES.items():
             if kz_name == 'ny_lunch':
                 continue  # Skip lunch hour — ICT avoids this
@@ -659,7 +709,7 @@ class ICTStrategyEngine:
         return False
 
     def _get_active_killzone(self) -> Optional[str]:
-        hour = datetime.utcnow().hour
+        hour = _ny_hour()
         for kz_name, (start, end) in _ICT_KILLZONES.items():
             if start <= hour < end:
                 return kz_name
@@ -762,15 +812,30 @@ class ICTStrategyEngine:
         # Look for an FVG or OB within the OTE zone for precision entry
         fvgs = ptf.get('fvgs', [])
         obs = ptf.get('order_blocks', [])
-        limit_price = ote['fib_705']  # Default: 70.5% = ICT sweet spot
+        limit_price = ote.get('ote_sweet_spot', ote['fib_705'])
+
+        # For a short the zone is stored with ote_bottom ABOVE ote_top
+        # (both measured up from the impulse low), so bound the FVG test
+        # with min/max instead of assuming bottom < top. The old form was
+        # unsatisfiable for shorts.
+        zone_lo = min(ote['ote_bottom'], ote['ote_top'])
+        zone_hi = max(ote['ote_bottom'], ote['ote_top'])
 
         target_type = 'bullish' if direction == 'long' else 'bearish'
         for fvg in fvgs:
             if fvg['type'] == target_type:
-                if ote['ote_bottom'] <= fvg['ce'] <= ote['ote_top']:
+                if zone_lo <= fvg['ce'] <= zone_hi:
                     limit_price = fvg['ce']
                     signals.append('htf_pd_array_aligned')
                     break
+
+        # A buy limit must sit at or below the market and a sell limit at
+        # or above it, or the broker rejects the order.
+        cp = ltf['ohlc']['close']
+        if direction == 'long':
+            limit_price = min(limit_price, cp)
+        else:
+            limit_price = max(limit_price, cp)
 
         self._add_ict_confluence(signals, htf_bias, ptf, ltf)
 
@@ -923,7 +988,13 @@ class ICTStrategyEngine:
     def _add_ict_confluence(self, signals, htf_bias, ptf, ltf):
         ind = ptf['indicators']
 
-        # Killzone
+        # Killzone.
+        # I3 NOTE 2026-08-30 audit: this +2 is constant by construction --
+        # analyze_market() already gates on _in_killzone(), so every candidate
+        # that reaches scoring is inside a killzone. It is left as-is on
+        # purpose: removing the weight is not a bug fix, it is a threshold
+        # recalibration (equivalent to raising every threshold by 2) and that
+        # is a decision for the operator, not the audit.
         kz = self._get_active_killzone()
         if kz and kz != 'ny_lunch':
             signals.append('killzone_active')
@@ -959,9 +1030,13 @@ class ICTStrategyEngine:
             if any(c['direction'] == target_dir for c in inst):
                 signals.append('institutional_candle')
 
-        # Volume spike (if available)
-        vol = ltf['ohlc'].get('volume', 0)
-        if vol > 0:
+        # Volume spike.
+        # I3 FIXED 2026-08-30 audit: this tested `vol > 0`, which is true on
+        # every bar, so the +1 was awarded unconditionally. It now requires
+        # volume above 1.5x the 20-bar mean.
+        vol = ltf['ohlc'].get('volume', 0) or 0
+        vol_ma = ltf.get('volume_ma', 0) or 0
+        if vol_ma > 0 and vol > 1.5 * vol_ma:
             signals.append('volume_spike')
 
     # ── Scoring & Filtering ────────────────────────────────────────────────────
@@ -973,8 +1048,7 @@ class ICTStrategyEngine:
         sc = self.config.get('symbols', {}).get(symbol, {})
         if 'confluence_threshold' in sc:
             return int(sc['confluence_threshold'])
-        ms = symbol.replace('/', '').upper()
-        if ms in _VOLATILE_SYMBOLS:
+        if _is_volatile(symbol):
             return int(self.ict_config.get('confluence_required',
                        self.strategy_config.get('confluence_required', 7)))
         return int(self.ict_config.get('confluence_threshold_calm',
@@ -995,9 +1069,10 @@ class ICTStrategyEngine:
             analysis['entry_reason'] = f'ICT Filter: ADX too low ({adx_val:.1f})'
             return analysis
 
-        # NY Lunch filter — ICT avoids 11:00–13:00 UTC
-        hour = datetime.utcnow().hour
-        if 11 <= hour < 13:
+        # NY Lunch filter, on ICT's New York clock.
+        lunch_start, lunch_end = _ICT_KILLZONES['ny_lunch']
+        hour = _ny_hour()
+        if lunch_start <= hour < lunch_end:
             analysis['entry_signal'] = False
             analysis['entry_reason'] = 'ICT Filter: NY Lunch — no trade'
             return analysis
@@ -1026,9 +1101,14 @@ class ICTStrategyEngine:
     
         if direction == 'long':
             sl = struct.get('last_swing_low')
-            if sl:
-                sl = sl - buffer
-            else:
+            sl = (sl - buffer) if sl else None
+            # FIXED 2026-08-30 audit: the structure point comes from the
+            # STRUCTURE timeframe while the entry is a limit placed away
+            # from current price, so the swing can land on the wrong side
+            # of the entry. That produced stops above the entry on a long
+            # (and below it on a short), which the broker rejects. Fall
+            # back to the ATR stop instead of sending an invalid order.
+            if sl is None or sl >= entry_price:
                 sl = entry_price - 1.5 * atr
     
             if entry_price - sl > max_sl_distance:
@@ -1040,9 +1120,9 @@ class ICTStrategyEngine:
             return sl
         else:
             sh = struct.get('last_swing_high')
-            if sh:
-                sl = sh + buffer
-            else:
+            sl = (sh + buffer) if sh else None
+            # Mirror of the long-side guard above.
+            if sl is None or sl <= entry_price:
                 sl = entry_price + 1.5 * atr
     
             if sl - entry_price > max_sl_distance:

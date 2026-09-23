@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Both the execution bridge and the market data bridge share the same physical
 # command/response files. Without a shared lock they corrupt each other.
 _MT5_GLOBAL_LOCK: Optional[asyncio.Lock] = None
-_MT5_PREFIX = "main"
+_MT5_PREFIX = "ict"
 
 
 def _get_mt5_global_lock() -> asyncio.Lock:
@@ -110,7 +110,7 @@ class MT5FileBridge:
     def __init__(self, config: Dict, demo_mode: bool = True):
         self.config       = config
         self.demo_mode    = (config.get('mode') == 'demo')
-        self.magic_number = config.get('magic_number', 654321)
+        self.magic_number = config.get('magic_number', 111000)
 
         self.common_path  = self._find_mt5_common_path()
         self.session_id   = f"{_MT5_PREFIX}_{str(uuid.uuid4())[:8]}"
@@ -148,7 +148,7 @@ class MT5FileBridge:
         # Clean up any orphaned response files from a previous session.
         # These are left behind when Python times out before the EA finishes.
         # They will never be read again and accumulate on disk indefinitely.
-        orphans = list(self.common_path.glob("python_response_*.txt"))
+        orphans = list(self.common_path.glob(f"python_response_{_MT5_PREFIX}_*.txt"))
         if orphans:
             for f in orphans:
                 try:
@@ -383,7 +383,16 @@ class MT5FileBridge:
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True)
         df = df.set_index('timestamp')
         df = df.astype(float)
-        logger.info(f"Fetched {len(df)} candles for {symbol} from MT5")
+        # FIXED 2026-08-31: a 1-bar price probe logged the same INFO line as
+        # a 250-bar analysis fetch, so the log filled with "Fetched 1
+        # candles" every 30 seconds and real events were buried. Probes go
+        # to DEBUG; real fetches stay at INFO.
+        if len(df) <= 5:
+            logger.debug(
+                f"Price probe: {len(df)} candle(s) for {symbol} ({timeframe})"
+            )
+        else:
+            logger.info(f"Fetched {len(df)} candles for {symbol} from MT5")
         return df
 
     async def fetch_historical_range(
@@ -707,6 +716,26 @@ class MT5FileBridge:
         else:
             logger.warning(f"get_balance failed: {response.get('error')}")
             return {'success': False, 'balance': 0.0, 'equity': 0.0}
+
+    async def get_symbol_info(self, symbol: str) -> Dict:
+        """Broker's own specification for a symbol.
+
+        ADDED 2026-08-30 audit.
+
+        AVAILABILITY: implemented in the SIGNAL bridge (PythonFileBridge
+        v2.505) and NOT in v2.700, which is the EA these four strategy
+        instances run. On v2.700 this returns
+        {"status":"error","error":"Unknown action: get_symbol_info"}, which
+        main.py._get_symbol_spec() probes for once and then stops asking.
+        Kept so sizing picks up live broker values automatically if the EA
+        is upgraded; until then risk_management.mt5_contract_sizes and the
+        MoneyManager table are the authority, and both hold values measured
+        from 441 real fills.
+        """
+        return await self._send_command(
+            {'action': 'get_symbol_info', 'symbol': symbol},
+            timeout=15.0,
+        )
 
     async def get_symbol_sessions(self, symbol: str) -> Dict:
         return await self._send_command(

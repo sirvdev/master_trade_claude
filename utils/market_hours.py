@@ -61,8 +61,8 @@ _PYTHON_TO_MT5 = {v: k for k, v in _MT5_TO_PYTHON.items()}
 
 
 def _mt5_symbol(symbol: str) -> str:
-    """Normalise symbol to MT5 format: 'XAU/USD' → 'XAUUSD'."""
-    return symbol.replace("/", "").upper()
+    """Normalize symbol for MT5 lookups while preserving its original casing."""
+    return symbol.replace("/", "").strip()
 
 
 class MarketHoursChecker:
@@ -199,6 +199,46 @@ class MarketHoursChecker:
         return 0
     
     
+    def is_24_7(self, symbol: str) -> bool:
+        """True when this instrument trades every day, all day (crypto).
+
+        ADDED 2026-08-30 audit. Derived from the broker's own session table
+        rather than a hardcoded symbol list, so a newly added instrument is
+        classified correctly without a code change. A symbol whose sessions do
+        not cover all seven days is subject to a weekend close.
+
+        Absent session data returns True, matching the existing convention
+        elsewhere in this class (no data -> assume always open). That is the
+        safe direction here: it means the weekend sweep declines to act rather
+        than closing positions on a guess.
+        """
+        sessions = self._get_cached_sessions(symbol)
+        if not sessions:
+            return True
+        covered = {}
+        for s in sessions:
+            covered[s["day"]] = covered.get(s["day"], 0) + (s["to_sec"] - s["from_sec"])
+        return len(covered) >= 7 and all(v >= 86340 for v in covered.values())
+
+    def next_close_is_weekend(self, symbol: str, now: datetime = None,
+                              min_gap_hours: float = 8.0) -> bool:
+        """True when the session closing next is followed by a long shutdown.
+
+        ADDED 2026-08-30 audit. Distinguishes the weekend close from the daily
+        break without hardcoding either: it asks when the market reopens after
+        the close that is coming, and calls anything longer than min_gap_hours a
+        weekend. On this broker the daily break is about 1 hour and the weekend
+        gap is about 49, so the two are not close together.
+        """
+        if now is None:
+            now = datetime.utcnow()
+        secs = self.seconds_until_close(symbol, now)
+        if secs <= 0:
+            return False
+        after_close = now + timedelta(seconds=secs + 1)
+        gap = self.seconds_until_open(symbol, after_close)
+        return gap >= min_gap_hours * 3600
+
     def is_near_close(self, symbol: str, minutes: int = 5, now: datetime = None) -> bool:
         """
         Convenience: returns True if the market closes within `minutes`.
@@ -414,6 +454,26 @@ class MarketHoursChecker:
                 f"from broker (tz_offset={server_tz_offset_sec//3600:+d}h). "
                 f"{self.session_summary(symbol)}"
             )
+
+            # ADDED 2026-08-30 audit: a non-zero offset is the tripwire.
+            # server_tz_offset_sec = TimeCurrent() - TimeGMT() has been reported
+            # as +0h, -1h, -7h and -8h on different dates in trading_system.log.
+            # Every window above is shifted by whatever it says, and when it was
+            # wrong the pre-close sweep cancelled 45 live pending orders at
+            # 00, 01, 02, 03, 06, 22 and 23 UTC -- hours at which none of these
+            # instruments closes. Verified zero and correct on 2026-08-30, so
+            # anything non-zero here means it has drifted again.
+            if server_tz_offset_sec != 0:
+                logger.warning(
+                    f"[MarketHours] {symbol}: broker reports a NON-ZERO server "
+                    f"clock offset ({server_tz_offset_sec/3600:+.2f}h). Every "
+                    f"session window above has been shifted by it, and "
+                    f"is_open / is_near_close / the weekend sweep all depend on "
+                    f"them. Run verify_server_offset.py; if it disagrees with "
+                    f"the real schedule set "
+                    f"risk_management.weekend_close.enabled: false until it is "
+                    f"fixed."
+                )
 
         except Exception as e:
             logger.warning(
