@@ -25,6 +25,8 @@ from telegram.error import TelegramError
 from telegram.constants import ParseMode
 
 logger = logging.getLogger(__name__)
+# PREFIX removed 2026-08-31: it hardcoded a launcher name and
+# nothing read it. The per-instance label is self.label.
 
 
 class TelegramNotifier:
@@ -34,10 +36,29 @@ class TelegramNotifier:
     configured TELEGRAM_CHAT_ID.
     """
 
-    def __init__(self):
+    def __init__(self, instance_label: str = None):
+        """
+        FIXED 2026-08-31: every message this class sends carried a hardcoded
+        launcher name. ICT's copy said "T1" and NLM's said "T1" too, so two
+        different instances were sending identically labelled alerts, while
+        classic and SMC dropped the label entirely from TRADE CLOSED, DRAWDOWN
+        and SYSTEM messages. The 2026-08-30 pass only fixed the inline
+        notifier.send() strings in main.py, which is why limit-order alerts were
+        labelled correctly and market-order alerts were not: those go through
+        notify_trade_entry / notify_trade_close / notify_drawdown_limit /
+        notify_system_event, which live here.
+
+        main.py passes its resolved instance_label; the directory-name fallback
+        keeps a standalone TelegramNotifier() correct too.
+        """
         self.token   = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         self._bot: Optional[Bot] = None
+        self.label = (
+            instance_label
+            or os.path.basename(os.getcwd()).replace('master_trade_', '').upper()
+            or 'UNKNOWN'
+        )
 
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN is not set in environment variables.")
@@ -52,7 +73,16 @@ class TelegramNotifier:
     # ── Core send ──────────────────────────────────────────────────────────────
 
     async def send(self, message: str) -> bool:
-        """Send a raw message. Returns True on success."""
+        """Send a raw message. Returns True on success.
+
+        B10 FIXED 2026-08-30 audit: callers build these strings with <b> tags
+        and interpolate raw values into them. Any '<', '>' or '&' in a symbol,
+        an exit_reason or an exception string makes Telegram reject the whole
+        message with "Can't parse entities"; this used to log and return False,
+        so the alert was simply lost. Escaping here would break the intentional
+        markup, so a parse failure now retries once as plain text. The message
+        gets through either way.
+        """
         try:
             await self._get_bot().send_message(
                 chat_id    = self.chat_id,
@@ -61,6 +91,20 @@ class TelegramNotifier:
             )
             return True
         except TelegramError as e:
+            if 'parse' in str(e).lower() or 'entit' in str(e).lower():
+                logger.warning(
+                    f"[TELEGRAM] HTML rejected ({e}); resending as plain text"
+                )
+                try:
+                    await self._get_bot().send_message(
+                        chat_id    = self.chat_id,
+                        text       = message,
+                        parse_mode = None,
+                    )
+                    return True
+                except TelegramError as e2:
+                    logger.error(f"[TELEGRAM] Plain-text retry also failed: {e2}")
+                    return False
             logger.error(f"[TELEGRAM] Failed to send message: {e}")
             return False
 
@@ -86,7 +130,7 @@ class TelegramNotifier:
         risk_pips = abs(entry_price - stop_loss)
 
         msg = (
-            f"<b>🚀 TRADE OPENED MAIN</b>\n"
+            f"<b>🚀 TRADE OPENED {self.label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{arrow}  <b>{symbol}</b>\n\n"
             f"<b>📊 Entry Details</b>\n"
@@ -144,7 +188,7 @@ class TelegramNotifier:
             duration_str = f"\n  Duration: <code>{h}h {m}m</code>"
 
         msg = (
-            f"<b>{result_emoji}  TRADE CLOSED</b>\n"
+            f"<b>{result_emoji}  TRADE CLOSED {self.label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{arrow}  <b>{symbol}</b>  ({direction.upper()})\n\n"
             f"<b>💰 Result</b>\n"
@@ -170,7 +214,7 @@ class TelegramNotifier:
         equity:       float,
     ) -> bool:
         msg = (
-            f"<b>🚨 DRAWDOWN LIMIT HIT</b>\n"
+            f"<b>🚨 DRAWDOWN LIMIT HIT {self.label}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"  Drawdown: <code>{drawdown_pct:.2f}%</code>  (limit: {limit_pct:.1f}%)\n"
             f"  Equity:   <code>${equity:,.2f}</code>\n"
@@ -189,7 +233,7 @@ class TelegramNotifier:
         }
         icon = icons.get(event.lower(), "📌")
         msg = (
-            f"<b>{icon} SYSTEM: {event.upper()}</b>\n"
+            f"<b>{icon} {self.label} SYSTEM: {event.upper()}</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"{detail}\n"
             f"  Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"

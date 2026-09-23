@@ -1,33 +1,38 @@
 general:
   mode: live
+  # ADDED 2026-08-30 audit: every Telegram notification is prefixed with
+  # this. It used to be a hardcoded launcher component name, so alerts read
+  # 'T1'/'T2'/'T3'/'Main' and said nothing about which strategy sent them.
+  instance_label: NLM
+  # This key is now true rather than decorative: as of the 2026-08-30 audit
+  # every clock the Python side reads is UTC. datetime.now() (the host's
+  # local clock, 7 hours behind here) was being used for the analysis
+  # timestamp in all four engines, and in classic for choosing the session
+  # ATR multiplier. Bar-index timestamps from the EA are a separate open
+  # question -- see ../verify_server_offset.py.
   timezone: UTC
   log_trades: true
   log_analysis: true
 symbols:
-  XAU/USD:
+  XAU/USDm:
+    # C3 2026-09-23: the 9-vs-12 pin that stood here is gone. Both values
+    # were inert: every NLM signal logged from 30 Aug to 23 Sep (109 of 109)
+    # scored 28-33, because the path to scoring guarantees 26. The gate now
+    # reads nlm.min_conviction (range 3-13); set a per-symbol value with
+    #   nlm:
+    #     min_conviction: <n>
     enabled: true
     platform: mt5
     mode: live
     timeframes:
-    - 1H
+    - 4H
     - 15m
     - 5m
     primary_timeframe: 15m
     entry_timeframe: 5m
     confluence_threshold: 6
-  BTC/USD:
+  US30m:
     enabled: true
-    platform: mt5
-    mode: live
-    timeframes:
-    - 1H
-    - 15m
-    - 5m
-    primary_timeframe: 1H
-    entry_timeframe: 1m
-    confluence_threshold: 6
-  XAG/USD:
-    enabled: false
     platform: mt5
     mode: live
     timeframes:
@@ -37,8 +42,30 @@ symbols:
     primary_timeframe: 1H
     entry_timeframe: 15m
     confluence_threshold: 5
-  EUR/USD:
-    enabled: false
+  US500m:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
+  XAG/USDm:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
+  EUR/USDm:
+    enabled: true
     platform: mt5
     mode: live
     timeframes:
@@ -111,22 +138,23 @@ indicators:
     lhlh_for_downtrend: true
     structure_break_confirmation: true
 strategy:
-  # Entry types — evaluated in order, first passing type wins.
-  # Each type has its own order placement logic (market vs limit).
-  entry_types:
-    - breakout_retest        # Market order — retest already confirmed at bar close
-    - ema_stack_pullback     # Limit order  — enter at EMA20 level
-    - pullback_to_sr         # Limit order  — enter at S/R zone
-    - bb_squeeze_breakout    # Market order — volatility expansion
-    - macd_zero_cross        # Market order — momentum shift confirmed
-    - momentum_breakout      # Market order — always immediate
-    - rsi_divergence         # Limit order  — reversal at structure
-    # - crossover_entry         # Limit order  — e.g. EMA20 crossing EMA50
-    # - candle_pattern_entry    # Limit order  — e.g. bullish engulfing at support
-    # - price_action_entry       # Limit order  — e.g. HHHL structure break retest
-    # - bandbreak_entry           # Limit order  — price breaking above upper BB or below lower BB
-    # - vwap_reversion_entry       # Limit order  — price rejecting from VWAP after touching it
-    # - obv_divergence_entry       # Limit order  — OBV divergence at structure
+  # DEAD 2026-08-30 audit: classic-engine setup list. nlm_engine.py never reads it.
+  # # Entry types — evaluated in order, first passing type wins.
+  # # Each type has its own order placement logic (market vs limit).
+  # entry_types:
+  #   - breakout_retest        # Market order — retest already confirmed at bar close
+  #   - ema_stack_pullback     # Limit order  — enter at EMA20 level
+  #   - pullback_to_sr         # Limit order  — enter at S/R zone
+  #   - bb_squeeze_breakout    # Market order — volatility expansion
+  #   - macd_zero_cross        # Market order — momentum shift confirmed
+  #   - momentum_breakout      # Market order — always immediate
+  #   - rsi_divergence         # Limit order  — reversal at structure
+  #   # - crossover_entry         # Limit order  — e.g. EMA20 crossing EMA50
+  #   # - candle_pattern_entry    # Limit order  — e.g. bullish engulfing at support
+  #   # - price_action_entry       # Limit order  — e.g. HHHL structure break retest
+  #   # - bandbreak_entry           # Limit order  — price breaking above upper BB or below lower BB
+  #   # - vwap_reversion_entry       # Limit order  — price rejecting from VWAP after touching it
+  #   # - obv_divergence_entry       # Limit order  — OBV divergence at structure
  
   # Score threshold for volatile symbols (XAUUSD, BTC, NAS100).
   # Override per-symbol with confluence_threshold in the symbol block.
@@ -135,16 +163,17 @@ strategy:
   # Score threshold for calmer instruments (EURUSD, GBPUSD, XAGUSD).
   confluence_threshold_calm: 5
  
-  # Breakout retest specific params
-  breakout_retest:
-    lookback_bars: 5                  # How many prior bars to scan for the broken level
-    max_distance_atr: 0.5             # Max distance from level in ATR multiples
-    require_rejection: true           # Close must be back above (long) / below (short) level
+  # DEAD 2026-08-30 audit: classic-engine params. Not read by nlm_engine.py.
+  # # Breakout retest specific params
+  # breakout_retest:
+  #   lookback_bars: 5                  # How many prior bars to scan for the broken level
+  #   max_distance_atr: 0.5             # Max distance from level in ATR multiples
+  #   require_rejection: true           # Close must be back above (long) / below (short) level
  
   # Session-aware ATR multiplier for stop sizing.
   # Prevents Asian-range stops from being blown in London/NY.
   session_atr_multipliers:
-    asian:   1.5    # UTC 00:00–07:00  — quiet, tight range
+    asian:   2.0    # UTC 00:00–07:00  — quiet, tight range
     london:  2.5    # UTC 07:00–12:00  — high volatility
     ny:      2.5    # UTC 12:00–20:00  — high volatility
     overlap: 2.0    # UTC 20:00–24:00  — winding down
@@ -157,6 +186,9 @@ strategy:
     pullback_to_sr_bars:               5   # S/R is sticky
     rsi_divergence_bars:               3   # Divergence window is medium
     bb_squeeze_breakout_bars:          1   # Must break out immediately
+    nlm_order_block_bars:              3   # NLM OB entry — zone is sticky
+    nlm_fvg_bars:                      2   # NLM FVG — fills or fails fast
+    nlm_breaker_bars:                  2   # NLM breaker — lower conviction
     price_invalidation_atr_multiplier: 1.0 # Cancel if price moves 1×ATR past entry level
     min_cancel_floor_seconds:         60   # Never cancel within 60s of placement
  
@@ -187,13 +219,74 @@ strategy:
           end: '08:30'
           days: [1, 2, 3]
 risk_management:
-  max_risk_percent_per_trade: 0.2
-  max_position_size_lots: 2.0
+  # Contract sizes, MEASURED not assumed. Derived from 441 real broker fills as
+  # profit / (lots x price_move) across all four instances, Jul 30 - Aug 29:
+  #   XAUUSDm 100.0000 (n=196)   XAGUSDm 5000.0000 (n=53)
+  #   EURUSDm 100000.0000 (n=60) BTCUSDm 1.0000 (n=47)
+  #   ETHUSDm 1.0000 (n=82)      US30m 1.0053 (n=1)  US500m 1.0022 (n=2)
+  # CORRECTED 2026-08-30: these are AUTHORITATIVE for this instance, not a
+  # fallback. get_symbol_info exists in the signal bridge (v2.505) but not in
+  # PythonFileBridge v2.700, which is the EA the four strategy instances run,
+  # so nothing can ask the broker at runtime here. main.py probes once, is told
+  # "Unknown action", and stops asking. Keep this table in step with MT5 by hand
+  # (right-click symbol -> Specification -> "Contract size"). If the strategy EA
+  # is ever given get_symbol_info, the live values take over automatically and
+  # this becomes the fallback it was meant to be.
+  mt5_contract_sizes:
+    XAUUSDm: 100
+    XAGUSDm: 5000
+    EURUSDm: 100000
+    BTCUSDm: 1
+    ETHUSDm: 1
+    US30m: 1
+    US500m: 1
+
+  # Per-symbol lot ceilings. A single max_position_size_lots cannot be right
+  # across instruments whose notional per lot differs by five orders of
+  # magnitude: at 6.0 lots the same cap meant $14.6k of ETH and $2.76m of gold,
+  # so it never touched gold and clipped 100% of ETH trades down to 15-19% of
+  # their intended risk. Symbols absent here keep the global cap unchanged.
+  max_position_size_lots_per_symbol:
+    # NLM only: intended lots at $600 risk run 3-48 (US30m) and 25-526
+    # (US500m) depending on stop distance. Set near the 90th percentile
+    # so a normal signal gets its full risk and a pathologically tight
+    # stop is still capped. Every cap that bites is logged with the
+    # dollar shortfall.
+    US30m: 35
+    US500m: 120
+
+  # Symbol-agnostic notional backstop, in multiples of equity, per position.
+  # Fixed-fractional sizing puts no ceiling on exposure: a US500m signal with a
+  # 1.14-point stop wants 525 lots (40x equity) at the same $600 of risk. The
+  # 30x default cannot change any historical trade -- the widest position any
+  # instance actually took was 26.0x (XAUUSDm) -- so it is a backstop, not a
+  # policy. Tighten it once you have decided what maximum exposure you want.
+  max_notional_exposure_equity_multiple: 30.0
+
+  # Weekend flattening for instruments that close for the weekend.
+  # ADDED 2026-08-30 audit: the pre-close sweep only cancelled pending orders,
+  # so open positions rode through the weekend. XAUUSDm 0.71 lots opened an hour
+  # before the Friday 21:00 close stopped out on the Sunday gap for -599.45, and
+  # EURUSDm 4.85 lots for -596.55. Which instruments this applies to is decided
+  # from the broker's session table, not a symbol list, so crypto is left alone
+  # automatically. min_gap_hours is what separates the weekend from the ~1 hour
+  # daily break; do not lower it below about 4.
+  weekend_close:
+    enabled: true
+    minutes_before_close: 30
+    min_gap_hours: 8
+  max_risk_percent_per_trade: 0.6   # tripled 2026-07-27 (was 0.2)
+  max_position_size_lots: 6.0       # tripled 2026-07-27 (was 2.0)
   use_dynamic_sizing: true
   stop_loss:
     method: conservative
     atr_multiplier: 1.5
     structure_buffer_pips: 2
+  # G4 2026-08-30 audit: close_percent and dynamic_extension are NOT used.
+  # main.py transmits only take_profit_2 to the broker and the EA builds its
+  # own ladder to it, so only rr_ratio has any effect. Left in place because
+  # dashboard/app.py edits this block; do not tune close_percent expecting a
+  # result.
   take_profit:
     targets:
     - name: TP1
@@ -216,6 +309,39 @@ risk_management:
       enabled: true
       trigger_drawdown_percent: 4.7
       close_positions_on_shutdown: false # true = close all positions on any shutdown event, false = only shutdown trading activity, keep existing positions open and reconcile on restart
+nlm:
+  # Any key below can be overridden for one symbol with a `nlm:` block inside
+  # that symbol's entry under `symbols:` (N3, 2026-09-23).
+  #
+  # C3 2026-09-23: confluence_required (12) and confluence_threshold_calm (9)
+  # are retired. The score they gated could not fall below 26. The gate now
+  # reads a conviction score over the signals that can actually be absent:
+  #   Nexus OB / FVG / premium-discount 2 each, CHoCH premium 2,
+  #   OB entry 3+1, FVG entry 2+1, breaker entry 1, session bonus 1.
+  # Range 3-13. Left at 0 (gate open, which is what it has always been in
+  # practice) until there are enough closed trades under the fixed engine to
+  # choose a cut: 25 closed trades is too few to separate anything.
+  min_conviction: 0
+  max_sl_atr_multiplier: 2.5     # SL distance cap
+  min_htf_adx: 18                # anti-chop filter
+  min_atr_threshold: 0.08        # dead-market guard (4H ATR % of price; never binds on current symbols)
+  # N3 2026-09-23: equal-high/low tolerance in ATRs of the frame being mapped.
+  # Was max(0.05% of price, 0.1 ATR), which measured 0.08 ATR on silver and
+  # 0.72 ATR on EURUSD. 0.27 is gold's measured median, so gold is unchanged.
+  eq_tolerance_atr: 0.27
+  # C4 2026-09-23: a structure break older than this many bars of its own
+  # frame is not a shift, and it must also come after the sweep.
+  max_mss_age_bars: 15
+  # N1 2026-09-23: Phase 1 chop guard range, in daily bars including today.
+  d1_range_days: 5
+# Per-symbol pip size used by the NLM SL buffer (4 pips beyond sweep wick).
+# Engine has built-in defaults for XAU/XAG/BTC/EURUSD/GBPUSD/USDJPY;
+# add entries here to override or cover other symbols.
+pip_sizes:
+  XAU/USD: 0.10
+  XAG/USD: 0.01
+  BTC/USD: 10.0
+  EUR/USD: 0.0001
 execution:
   slippage_tolerance_percent: 0.1
   max_order_retry: 3
@@ -229,7 +355,11 @@ execution:
     deviation_points: 10
     fill_policy: FOK
 learning:
-  enabled: true
+  # G3 2026-08-30 audit: the grid search tunes CLASSIC-engine parameters
+  # (atr_multiplier, rsi_*, confluence_required) which this engine does
+  # not read, so it burned CPU for nothing. Note confluence_required:
+  # [2, 3] would be dangerous if auto_apply were ever switched on.
+  enabled: false
   auto_apply: false
   optimization:
     method: grid_search
@@ -280,7 +410,22 @@ backtest:
     commission_percent: 0.1
     latency_bars: 1
   ea_simulation:
-    partial_close_steps: 3      # Matches EA PartialCloseSteps
+    # B1 FIXED 2026-08-30 audit: the live EA takes 5 partials plus a runner
+    # close. Every position that reached TP in the Jul 30 - Aug 29 window
+    # closed in exactly 6 deals (SMC 4/4, ICT 9/10), never fewer. The
+    # backtester was simulating a 3-step ladder against a 5-step live
+    # system. This aligns the count; the rest of B1 (one backtester that
+    # is EA-faithful end to end) is still open.
+    #
+    # CONFIRMED against the EA source: PythonFileBridge v2.700 declares
+    #   input int    PartialCloseSteps  = 5
+    #   input double RunnerPercent      = 10.0
+    #   input double TrailATRMultiplier = 2.0
+    #   input int    TrailATRPeriod     = 14
+    #   input double BreakevenMinRR     = 1.0
+    # which is exactly this block. Change them together or the backtester
+    # drifts from the live system again.
+    partial_close_steps: 5      # Matches EA PartialCloseSteps
     runner_percent: 10.0        # Matches EA RunnerPercent
     breakeven_min_rr: 1.0       # Matches EA BreakevenMinRR
     trail_atr_multiplier: 2.0   # Matches EA TrailATRMultiplier
@@ -329,8 +474,6 @@ dashboard:
   enable_learning_trigger: true
   show_charts: true
   chart_bars: 500
-telegram_signals:
-  enabled: false
 smc:
   # Maximum SL distance as a multiple of entry-TF ATR.
   # Prevents structure-based SL from being unrealistically far.
@@ -346,4 +489,4 @@ ict:
   # ICT's structure SL is already good; this just catches outliers.
   # Default: 2.0 (slightly more generous than SMC because ICT's
   # structure analysis is more precise).
-  max_sl_atr_multiplier: 2.0
+  max_sl_atr_multiplier: 2.0

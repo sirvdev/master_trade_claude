@@ -238,11 +238,33 @@ class BacktesterV2:
         self._symbols_config = config.get('symbols', {})
         self._full_config = config
 
+        # Limit-order expiry config (mirrors main._limit_expiry_times)
+        self._limit_expiry_cfg = (
+            config.get('strategy', {}).get('limit_order_expiry', {})
+        )
+
         # Runtime state
         self.open_positions: Dict[str, SimPosition] = {}
         self.closed_positions: List[SimPosition] = []
+        self.pending_orders: List[Dict] = []
+        self.limit_stats = {'placed': 0, 'filled': 0,
+                            'expired': 0, 'invalidated': 0}
         self.balance: float = 0.0
         self.equity_curve: List[float] = []
+
+    def _limit_expiry_bars(self, entry_type: str) -> int:
+        """Expiry in primary-TF bars per entry type — same map as main.py."""
+        exp = self._limit_expiry_cfg
+        bars_map = {
+            'ema_stack_pullback':  exp.get('ema_stack_pullback_bars',  2),
+            'pullback_to_sr':      exp.get('pullback_to_sr_bars',      5),
+            'rsi_divergence':      exp.get('rsi_divergence_bars',      3),
+            'bb_squeeze_breakout': exp.get('bb_squeeze_breakout_bars', 1),
+            'nlm_order_block':     exp.get('nlm_order_block_bars',     3),
+            'nlm_fvg':             exp.get('nlm_fvg_bars',             2),
+            'nlm_breaker':         exp.get('nlm_breaker_bars',         2),
+        }
+        return int(bars_map.get(entry_type, 3))
 
     # ══════════════════════════════════════════════════════════════════════
     # PUBLIC API
@@ -487,6 +509,9 @@ class BacktesterV2:
         self.equity_curve = [initial_balance]
         self.open_positions = {}
         self.closed_positions = []
+        self.pending_orders = []
+        self.limit_stats = {'placed': 0, 'filled': 0,
+                            'expired': 0, 'invalidated': 0}
 
         # Get the primary TF bars within the test period
         primary_df = raw_data[primary_tf]
@@ -541,7 +566,14 @@ class BacktesterV2:
                     tf_snapshot[tf] = available.iloc[-n:]
 
             # Check: can we take new trades?
-            if len(self.open_positions) < self.max_concurrent:
+            # Mirrors live _symbol_bar_close_loop: skip analysis when this
+            # symbol already has an open position (live holds max 1/symbol).
+            norm_sym = symbol.replace('/', '')
+            symbol_busy = any(
+                p.symbol.replace('/', '') == norm_sym
+                for p in self.open_positions.values()
+            )
+            if not symbol_busy and len(self.open_positions) < self.max_concurrent:
                 try:
                     # Call analyze_market with symbol_config — SAME as live.
                     # Wrap in simulated_time so datetime.utcnow() returns the
@@ -562,7 +594,10 @@ class BacktesterV2:
                         if levels and levels.get('stop_loss'):
                             sizing = money_manager.validate_trade(
                                 account_equity=self.balance,
-                                entry_price=levels['entry_price'],
+                                # Live sizes off order_price (= limit price for
+                                # limit orders), not the current market price.
+                                entry_price=levels.get('order_price',
+                                                       levels['entry_price']),
                                 stop_loss=levels['stop_loss'],
                                 symbol=symbol,
                                 direction=analysis['direction'],
@@ -571,24 +606,66 @@ class BacktesterV2:
                             )
 
                             if sizing.get('approved'):
-                                # Entry with 1-bar latency
-                                entry_idx = idx + self.latency_bars
-                                if entry_idx < total:
-                                    entry_bar = test_bars.iloc[entry_idx]
-                                    entry_ts = test_bars.index[entry_idx]
+                                order_type = levels.get('order_type', 'market')
+                                limit_price = levels.get('limit_price')
 
-                                    pos = self._open_position(
-                                        trade_id=f"bt_{trade_counter}",
-                                        symbol=symbol,
-                                        direction=analysis['direction'],
-                                        entry_time=entry_ts.to_pydatetime(),
-                                        entry_bar=entry_bar,
-                                        levels=levels,
-                                        position_size=sizing['position_size'],
+                                if order_type == 'limit' and limit_price:
+                                    # ── LIMIT ORDER: rests until touched ──
+                                    # Mirrors live: expiry = next bar close +
+                                    # N bars; cancel if price runs 1×ATR past
+                                    # the entry level (invalidation).
+                                    # One pending order per symbol at a time.
+                                    already_pending = any(
+                                        o['symbol'] == symbol
+                                        for o in self.pending_orders
                                     )
-                                    if pos:
-                                        self.open_positions[pos.trade_id] = pos
+                                    if not already_pending:
+                                        entry_type = analysis.get('entry_type', 'unknown')
+                                        expiry_bars = self._limit_expiry_bars(entry_type)
+                                        expiry_ts = bar_ts + timedelta(
+                                            seconds=(expiry_bars + 1) * primary_secs
+                                        )
+                                        atr = float(levels.get('atr', 0.0) or 0.0)
+                                        inv_mult = float(
+                                            self._limit_expiry_cfg.get(
+                                                'price_invalidation_atr_multiplier', 1.0)
+                                        )
+                                        if analysis['direction'] == 'long':
+                                            inv_price = float(limit_price) - inv_mult * atr
+                                        else:
+                                            inv_price = float(limit_price) + inv_mult * atr
+
+                                        self.pending_orders.append({
+                                            'trade_id': f"bt_{trade_counter}",
+                                            'symbol': symbol,
+                                            'direction': analysis['direction'],
+                                            'limit_price': float(limit_price),
+                                            'expiry_ts': expiry_ts,
+                                            'invalidation_price': inv_price if atr > 0 else None,
+                                            'levels': levels,
+                                            'position_size': sizing['position_size'],
+                                        })
+                                        self.limit_stats['placed'] += 1
                                         trade_counter += 1
+                                else:
+                                    # ── MARKET ORDER: entry with 1-bar latency ──
+                                    entry_idx = idx + self.latency_bars
+                                    if entry_idx < total:
+                                        entry_bar = test_bars.iloc[entry_idx]
+                                        entry_ts = test_bars.index[entry_idx]
+
+                                        pos = self._open_position(
+                                            trade_id=f"bt_{trade_counter}",
+                                            symbol=symbol,
+                                            direction=analysis['direction'],
+                                            entry_time=entry_ts.to_pydatetime(),
+                                            entry_bar=entry_bar,
+                                            levels=levels,
+                                            position_size=sizing['position_size'],
+                                        )
+                                        if pos:
+                                            self.open_positions[pos.trade_id] = pos
+                                            trade_counter += 1
 
                 except Exception as e:
                     logger.debug(f"Analysis error at {bar_ts}: {e}")
@@ -607,6 +684,11 @@ class BacktesterV2:
                     f"closed:{len(self.closed_positions)}")
 
         progress.finish()
+
+        # Unfilled pending limit orders at end of test → expired
+        if self.pending_orders:
+            self.limit_stats['expired'] += len(self.pending_orders)
+            self.pending_orders = []
 
         # Close remaining positions at last price
         last_price = float(test_bars.iloc[-1]['close'])
@@ -632,6 +714,52 @@ class BacktesterV2:
             bar_high = float(bar['high'])
             bar_low = float(bar['low'])
             bar_close = float(bar['close'])
+
+            # ── 0. PENDING LIMIT ORDERS (expiry → invalidation → fill) ────
+            for order in list(self.pending_orders):
+                # Expiry
+                if ts >= order['expiry_ts']:
+                    self.pending_orders.remove(order)
+                    self.limit_stats['expired'] += 1
+                    logger.info(f"  LIMIT EXPIRED {order['trade_id']} "
+                                f"@ {order['limit_price']:.2f}")
+                    continue
+
+                # Price invalidation (ran too far past the entry level)
+                inv = order.get('invalidation_price')
+                if inv is not None:
+                    if order['direction'] == 'long' and bar_close < inv:
+                        self.pending_orders.remove(order)
+                        self.limit_stats['invalidated'] += 1
+                        continue
+                    if order['direction'] == 'short' and bar_close > inv:
+                        self.pending_orders.remove(order)
+                        self.limit_stats['invalidated'] += 1
+                        continue
+
+                # Fill on touch (buy limit below market / sell limit above)
+                touched = (
+                    bar_low <= order['limit_price']
+                    if order['direction'] == 'long'
+                    else bar_high >= order['limit_price']
+                )
+                if touched:
+                    if len(self.open_positions) < self.max_concurrent:
+                        pos = self._open_position(
+                            trade_id=order['trade_id'],
+                            symbol=order['symbol'],
+                            direction=order['direction'],
+                            entry_time=ts.to_pydatetime(),
+                            entry_bar=bar,
+                            levels={**order['levels'],
+                                    'order_price': order['limit_price']},
+                            position_size=order['position_size'],
+                            is_limit=True,
+                        )
+                        if pos:
+                            self.open_positions[pos.trade_id] = pos
+                            self.limit_stats['filled'] += 1
+                    self.pending_orders.remove(order)
 
             for pos in list(self.open_positions.values()):
                 # Update MFE/MAE
@@ -757,23 +885,29 @@ class BacktesterV2:
     # ══════════════════════════════════════════════════════════════════════
 
     def _open_position(self, trade_id, symbol, direction, entry_time,
-                       entry_bar, levels, position_size) -> Optional[SimPosition]:
+                       entry_bar, levels, position_size,
+                       is_limit: bool = False) -> Optional[SimPosition]:
         """Open a new position, setting up EA milestone tracking."""
 
         target_price = levels.get('order_price', levels['entry_price'])
         sl = levels['stop_loss']
         tp2 = levels.get('take_profit_2', levels.get('take_profit_1', 0))
 
-        # Simulate slippage
-        slip = abs(target_price * self.slippage_pct / 100)
-        if direction == 'long':
-            fill_price = target_price + slip
+        if is_limit:
+            # Limit orders fill at the limit price (no adverse slippage) —
+            # the bar has already touched it.
+            fill_price = target_price
         else:
-            fill_price = target_price - slip
+            # Market order: simulate slippage
+            slip = abs(target_price * self.slippage_pct / 100)
+            if direction == 'long':
+                fill_price = target_price + slip
+            else:
+                fill_price = target_price - slip
 
-        # Clamp to bar range
-        fill_price = max(float(entry_bar['low']),
-                         min(float(entry_bar['high']), fill_price))
+            # Clamp to bar range
+            fill_price = max(float(entry_bar['low']),
+                             min(float(entry_bar['high']), fill_price))
 
         # Entry commission
         self.balance -= fill_price * position_size * (self.commission_pct / 100)
@@ -970,6 +1104,11 @@ class BacktesterV2:
         print("=" * 70)
         print("  RESULTS")
         print("=" * 70)
+        ls = self.limit_stats
+        if ls.get('placed', 0) > 0:
+            print(f"  Limit Orders        : {ls['placed']} placed  "
+                  f"{ls['filled']} filled  {ls['expired']} expired  "
+                  f"{ls['invalidated']} invalidated")
         print(f"  Total Trades        : {r['total_trades']}")
         if r['total_trades'] > 0:
             print(f"  Win Rate            : {r['win_rate']:.2%}  "
@@ -1032,7 +1171,7 @@ if __name__ == '__main__':
     PROJECT_ROOT = Path(__file__).parent.parent
     sys.path.insert(0, str(PROJECT_ROOT))
 
-    from strategy.engine import StrategyEngine
+    from strategy.nlm_engine import NLMStrategyEngine as StrategyEngine
     from risk_management.money_manager import MoneyManager
     from risk_management.stop_manager import StopManager
 
@@ -1042,19 +1181,13 @@ if __name__ == '__main__':
     parser.add_argument('--end', required=True, help='YYYY-MM-DD')
     parser.add_argument('--balance', type=float, default=100000)
     parser.add_argument('--config', default=str(PROJECT_ROOT / 'config' / 'config.yaml'))
-    parser.add_argument('--engine', default='original',
-                        choices=['original', 'ict', 'smc'])
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    if args.engine == 'ict':
-        from strategy.ict_engine import ICTStrategyEngine as EngineClass
-    elif args.engine == 'smc':
-        from strategy.smc_engine import SMCStrategyEngine as EngineClass
-    else:
-        EngineClass = StrategyEngine
+    # Dedicated project — single engine (NLM)
+    EngineClass = StrategyEngine
 
     start_date = datetime.strptime(args.start, '%Y-%m-%d')
     end_date = datetime.strptime(args.end, '%Y-%m-%d')
