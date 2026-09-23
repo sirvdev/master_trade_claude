@@ -46,9 +46,27 @@ _FALLBACK_SESSIONS: Dict[str, List[dict]] = {
         {"day": 4, "from":     0, "to": 86399},
         {"day": 5, "from":     0, "to": 79200},
     ],
+    "XAUUSDm": [
+        {"day": 0, "from": 79200, "to": 86399},
+        {"day": 1, "from":     0, "to": 86399},
+        {"day": 2, "from":     0, "to": 86399},
+        {"day": 3, "from":     0, "to": 86399},
+        {"day": 4, "from":     0, "to": 86399},
+        {"day": 5, "from":     0, "to": 79200},
+    ],
+    "XAGUSDm": [
+        {"day": 0, "from": 79200, "to": 86399},
+        {"day": 1, "from":     0, "to": 86399},
+        {"day": 2, "from":     0, "to": 86399},
+        {"day": 3, "from":     0, "to": 86399},
+        {"day": 4, "from":     0, "to": 86399},
+        {"day": 5, "from":     0, "to": 79200},
+    ],
     # Crypto: 24/7
     "BTCUSD":  [{"day": d, "from": 0, "to": 86399} for d in range(7)],
     "ETHUSD":  [{"day": d, "from": 0, "to": 86399} for d in range(7)],
+    "BTCUSDm": [{"day": d, "from": 0, "to": 86399} for d in range(7)],
+    "ETHUSDm": [{"day": d, "from": 0, "to": 86399} for d in range(7)],
     "BTCUSDT": [{"day": d, "from": 0, "to": 86399} for d in range(7)],
     "ETHUSDT": [{"day": d, "from": 0, "to": 86399} for d in range(7)],
 }
@@ -61,8 +79,29 @@ _PYTHON_TO_MT5 = {v: k for k, v in _MT5_TO_PYTHON.items()}
 
 
 def _mt5_symbol(symbol: str) -> str:
-    """Normalise symbol to MT5 format: 'XAU/USD' → 'XAUUSD'."""
-    return symbol.replace("/", "").upper()
+    """Normalise symbol to MT5 format while preserving broker suffixes.
+
+    Examples:
+        'XAU/USD' -> 'XAUUSD'
+        'BTC/USDm' -> 'BTCUSDm'
+        'BTCUSDm' -> 'BTCUSDm'
+        'EURUSD' -> 'EURUSD'
+    """
+    if not symbol:
+        return ""
+
+    cleaned = symbol.strip().replace(" ", "")
+    cleaned = cleaned.replace("/", "")
+
+    if not cleaned:
+        return ""
+
+    if cleaned.endswith(("m", "M")) and len(cleaned) > 1:
+        base = cleaned[:-1]
+        suffix = cleaned[-1]
+        return f"{base.upper()}{suffix.lower()}"
+
+    return cleaned.upper()
 
 
 class MarketHoursChecker:
@@ -199,6 +238,46 @@ class MarketHoursChecker:
         return 0
     
     
+    def is_24_7(self, symbol: str) -> bool:
+        """True when this instrument trades every day, all day (crypto).
+
+        ADDED 2026-08-30 audit. Derived from the broker's own session table
+        rather than a hardcoded symbol list, so a newly added instrument is
+        classified correctly without a code change. A symbol whose sessions do
+        not cover all seven days is subject to a weekend close.
+
+        Absent session data returns True, matching the existing convention
+        elsewhere in this class (no data -> assume always open). That is the
+        safe direction here: it means the weekend sweep declines to act rather
+        than closing positions on a guess.
+        """
+        sessions = self._get_cached_sessions(symbol)
+        if not sessions:
+            return True
+        covered = {}
+        for s in sessions:
+            covered[s["day"]] = covered.get(s["day"], 0) + (s["to_sec"] - s["from_sec"])
+        return len(covered) >= 7 and all(v >= 86340 for v in covered.values())
+
+    def next_close_is_weekend(self, symbol: str, now: datetime = None,
+                              min_gap_hours: float = 8.0) -> bool:
+        """True when the session closing next is followed by a long shutdown.
+
+        ADDED 2026-08-30 audit. Distinguishes the weekend close from the daily
+        break without hardcoding either: it asks when the market reopens after
+        the close that is coming, and calls anything longer than min_gap_hours a
+        weekend. On this broker the daily break is about 1 hour and the weekend
+        gap is about 49, so the two are not close together.
+        """
+        if now is None:
+            now = datetime.utcnow()
+        secs = self.seconds_until_close(symbol, now)
+        if secs <= 0:
+            return False
+        after_close = now + timedelta(seconds=secs + 1)
+        gap = self.seconds_until_open(symbol, after_close)
+        return gap >= min_gap_hours * 3600
+
     def is_near_close(self, symbol: str, minutes: int = 5, now: datetime = None) -> bool:
         """
         Convenience: returns True if the market closes within `minutes`.
@@ -415,6 +494,26 @@ class MarketHoursChecker:
                 f"{self.session_summary(symbol)}"
             )
 
+            # ADDED 2026-08-30 audit: a non-zero offset is the tripwire.
+            # server_tz_offset_sec = TimeCurrent() - TimeGMT() has been reported
+            # as +0h, -1h, -7h and -8h on different dates in trading_system.log.
+            # Every window above is shifted by whatever it says, and when it was
+            # wrong the pre-close sweep cancelled 45 live pending orders at
+            # 00, 01, 02, 03, 06, 22 and 23 UTC -- hours at which none of these
+            # instruments closes. Verified zero and correct on 2026-08-30, so
+            # anything non-zero here means it has drifted again.
+            if server_tz_offset_sec != 0:
+                logger.warning(
+                    f"[MarketHours] {symbol}: broker reports a NON-ZERO server "
+                    f"clock offset ({server_tz_offset_sec/3600:+.2f}h). Every "
+                    f"session window above has been shifted by it, and "
+                    f"is_open / is_near_close / the weekend sweep all depend on "
+                    f"them. Run verify_server_offset.py; if it disagrees with "
+                    f"the real schedule set "
+                    f"risk_management.weekend_close.enabled: false until it is "
+                    f"fixed."
+                )
+
         except Exception as e:
             logger.warning(
                 f"[MarketHours] Could not fetch sessions for {symbol} from broker: {e}. "
@@ -425,7 +524,22 @@ class MarketHoursChecker:
 
     def _load_fallback(self, symbol: str, mt5_sym: str) -> None:
         """Load hardcoded fallback sessions and convert to Python weekday format."""
-        raw = _FALLBACK_SESSIONS.get(mt5_sym)
+        candidates = [mt5_sym]
+        if mt5_sym.endswith(("m", "M")) and len(mt5_sym) > 1:
+            base = mt5_sym[:-1]
+            candidates.append(base)
+            candidates.append(base.upper())
+            candidates.append(base.lower())
+        else:
+            candidates.append(mt5_sym.upper())
+            candidates.append(mt5_sym.lower())
+
+        raw = None
+        for key in candidates:
+            raw = _FALLBACK_SESSIONS.get(key)
+            if raw:
+                break
+
         if not raw:
             logger.warning(
                 f"[MarketHours] No fallback schedule for {symbol}. "

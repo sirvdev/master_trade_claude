@@ -5,6 +5,7 @@ Integrates with database and provides JSON-structured logs.
 
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from typing import Any, Dict, Optional
 from pathlib import Path
@@ -33,8 +34,17 @@ class AuditLogger:
         # ── Only add handlers if not already present (prevent accumulation) ────
         if not self.logger.handlers:
             # JSON file handler
-            log_file = self.log_dir / f"audit_{datetime.utcnow().strftime('%Y%m%d')}.jsonl"
-            handler = logging.FileHandler(log_file)
+            # B9 FIXED 2026-08-30 audit: the date was baked into the filename
+            # once, inside this `if not self.logger.handlers` block. These
+            # processes are launched once and left running, so every record for
+            # the life of the process landed in the first day's file.
+            # TimedRotatingFileHandler rolls at UTC midnight instead.
+            log_file = self.log_dir / "audit.jsonl"
+            handler = TimedRotatingFileHandler(
+                log_file, when='midnight', utc=True, backupCount=90,
+                encoding='utf-8',
+            )
+            handler.suffix = "%Y%m%d"
             handler.setFormatter(logging.Formatter('%(message)s'))
             self.logger.addHandler(handler)
             
@@ -266,6 +276,35 @@ class AuditLogger:
         })
         self._write_json_log(entry)
         
+    def log_trade_event(self, trade_id: str, event_type: str,
+                        details: Optional[Dict[str, Any]] = None):
+        """
+        Log a generic trade lifecycle event (e.g. 'order_placed').
+
+        Previously called from main.py but never implemented — the calls were
+        silently swallowed by try/except, so these events were never recorded.
+        Stored in system_events and mirrored to the JSON audit log.
+        """
+        details = details or {}
+        cursor = self.db.conn.cursor()
+        cursor.execute("""
+            INSERT INTO system_events (event_type, component, message, details)
+            VALUES (?, ?, ?, ?)
+        """, (
+            event_type,
+            'trade',
+            f"trade_id={trade_id}",
+            json.dumps({'trade_id': trade_id, **details}, default=str)
+        ))
+        self.db.conn.commit()
+
+        entry = self._create_log_entry('trade_event', {
+            'trade_id': trade_id,
+            'trade_event_type': event_type,
+            **details
+        })
+        self._write_json_log(entry)
+
     def log_error(self, component: str, error: Exception, context: Optional[Dict] = None):
         """
         Log system error.

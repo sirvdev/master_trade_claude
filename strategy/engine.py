@@ -11,7 +11,7 @@ under each symbol block. Fixed by passing symbol_config into analyze_market().
 """
 
 import logging
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Dict, List, Optional
 import pandas as pd
 from indicators.indicators import TechnicalIndicators
@@ -22,8 +22,11 @@ _SIGNAL_WEIGHTS: Dict[str, int] = {
     'supertrend_aligned': 3, 'ema_stack_full': 3, 'price_structure_aligned': 3,
     'rsi_divergence_confirmed': 3, 'breakout_held': 3,
     'macd_zero_cross': 2, 'rsi_confirmation': 2, 'bb_squeeze_active': 2,
-    'ema_proximity_bounce': 2, 'pullback_to_ema50': 2, 'pullback_to_sr': 2, 'adx_strong': 2,
-    'candle_pattern': 1, 'volume_confirmation': 1, 'rsi_oversold_recovery': 1,
+    'ema_proximity_bounce': 2, 'pullback_to_sr': 2, 'adx_strong': 2,
+    'candle_pattern': 1, 'rsi_oversold_recovery': 1,
+    # C3 2026-08-30 audit: 'pullback_to_ema50' (2) and 'volume_confirmation' (1)
+    # were removed. No code path ever emitted them, so the table advertised
+    # signals the engine cannot produce. Re-add them WITH an emitter, not before.
     'rsi_overbought_rejection': 1, 'macd_bullish_cross': 1, 'macd_bearish_cross': 1,
     'bollinger_squeeze': 1, 'strong_trend': 1,
 }
@@ -69,7 +72,11 @@ class StrategyEngine:
                     f"primary={primary_tf} entry={entry_tf}")
 
         analysis = {
-            'symbol': symbol, 'timestamp': datetime.now().replace(tzinfo=None),
+            'symbol': symbol, # FIXED 2026-08-30 audit: datetime.now() is the host's LOCAL clock, which
+            # on this machine is 7 hours behind UTC, while every trade,
+            # order and log record in the system is UTC. The analysis
+            # timestamp was the odd one out.
+            'timestamp': datetime.now(timezone.utc).replace(tzinfo=None),
             'primary_timeframe': primary_tf, 'structure_tf': structure_tf,
             'entry_tf': entry_tf, 'timeframe_snapshots': {},
             'market_structure': {}, 'indicators_state': {},
@@ -348,21 +355,30 @@ class StrategyEngine:
         cfg = self.strategy_config.get('breakout_retest', {})
         lb, md = int(cfg.get('lookback_bars',5)), float(cfg.get('max_distance_atr',0.5))
         cc = float(ptf_df['close'].iloc[-1])
-        prior = ptf_df.iloc[-(lb+2):-1]
-        if len(prior) < 3: return d
+        # C1 FIXED 2026-08-30 audit: the broken level and the bars that break
+        # it must come from different windows. `lv` used to be the max high of
+        # `prior` itself, and a bar's close can never exceed the max high of
+        # the window containing it (close <= high <= max(high)), so
+        # `closes_above` was all-False and this entry type could never fire in
+        # either direction. The level now comes from an older window and the
+        # break is tested on the bars after it.
+        level_win = ptf_df.iloc[-(2*lb+2):-(lb+1)]   # older bars define the level
+        prior     = ptf_df.iloc[-(lb+1):-1]          # newer bars must break it
+        if len(level_win) < 3 or len(prior) < 2:
+            return d
 
         if bias == 'bullish':
-            dr, lv = 'long', float(prior['high'].max())
-            closes_above = [float(r['close']) > lv for _, r in prior.iterrows()]
-            consecutive = any(closes_above[i] and closes_above[i+1] 
-                            for i in range(len(closes_above)-1))
+            dr, lv = 'long', float(level_win['high'].max())
+            closes_beyond = [float(r['close']) > lv for _, r in prior.iterrows()]
+            consecutive = any(closes_beyond[i] and closes_beyond[i+1]
+                            for i in range(len(closes_beyond)-1))
             if not (consecutive and abs(cc-lv) <= md*atr and cc >= lv):
                 return d
         else:
-            dr, lv = 'short', float(prior['low'].min())
-            closes_above = [float(r['close']) < lv for _, r in prior.iterrows()]
-            consecutive = any(closes_above[i] and closes_above[i+1] 
-                            for i in range(len(closes_above)-1))
+            dr, lv = 'short', float(level_win['low'].min())
+            closes_beyond = [float(r['close']) < lv for _, r in prior.iterrows()]
+            consecutive = any(closes_beyond[i] and closes_beyond[i+1]
+                            for i in range(len(closes_beyond)-1))
             if not (consecutive and abs(cc-lv) <= md*atr and cc <= lv):
                 return d
 
@@ -618,6 +634,20 @@ class StrategyEngine:
         })
         return d
 
+    def _find_swing_highs(self, series, order=5):
+        """Mirror of _find_swing_lows.
+
+        C2 ADDED 2026-08-30 audit: _rsi_div's bearish branch called this
+        method and it did not exist. The AttributeError was swallowed by the
+        blanket `except` in _check(), which returned 'no signal', so bearish
+        RSI divergence has never fired and nothing in the logs said so.
+        """
+        highs = []
+        for i in range(order, len(series) - order):
+            if series.iloc[i] == series.iloc[i-order:i+order+1].max():
+                highs.append((i, series.iloc[i]))
+        return highs
+
     def _find_swing_lows(self, series, order=5):
             lows = []
             for i in range(order, len(series) - order):
@@ -798,6 +828,16 @@ class StrategyEngine:
                 )
                 return analysis
     
+        # C4 FIXED 2026-08-30 audit: _news_blackout() was defined and never
+        # called, so strategy.filters.news_blackout had no effect at all. It
+        # is now checked here. The method itself is gated on its own `enabled`
+        # flag (false in config today), so wiring it changes nothing until it
+        # is switched on.
+        if self._news_blackout():
+            analysis['entry_signal'] = False
+            analysis['entry_reason'] = 'Filtered: news blackout window'
+            return analysis
+
         # ── Existing: Trend strength filter ──────────────────────────────────
         if structure_tf in snaps:
             trend_strength = snaps[structure_tf]['trend'].get('strength', 1.0)
@@ -810,7 +850,12 @@ class StrategyEngine:
 
     def _news_blackout(self):
         cfg  = self.strategy_config.get('filters',{}).get('news_blackout',{})
-        now  = datetime.now().replace(tzinfo=None)
+        # C4 2026-08-30 audit: honour the block's own enable flag, and compare
+        # against UTC. The window times in config are UTC; datetime.now() is
+        # the host's local clock, which on this machine is 7 hours behind.
+        if not cfg.get('enabled', False):
+            return False
+        now  = datetime.utcnow().replace(tzinfo=None)
         ct   = now.time()
         cd   = now.weekday()+1
         for w in cfg.get('windows',[]):
@@ -835,7 +880,13 @@ class StrategyEngine:
             struct_sl = ps.get('last_swing_high', entry_price+2*atr)
 
         sc   = self.strategy_config.get('session_atr_multipliers',{})
-        h    = datetime.now().replace(tzinfo=None).hour
+        # FIXED 2026-08-30 audit: this picked the session ATR multiplier from
+        # the host's LOCAL hour (UTC-7 here), so the session boundaries in
+        # config -- asian 00-07, london 07-12, ny 12-20 UTC -- were being
+        # matched against a clock 7 hours out. Classic's stop width has been
+        # set by the wrong session on every trade. Note this block IS live in
+        # classic (unlike smc/ict, where StopManager is never called).
+        h    = datetime.now(timezone.utc).replace(tzinfo=None).hour
         mult = (float(sc.get('asian',1.5))   if 0<=h<7   else
                 float(sc.get('london',2.5))  if 7<=h<12  else
                 float(sc.get('ny',2.5))      if 12<=h<20 else

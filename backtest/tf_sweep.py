@@ -321,15 +321,8 @@ async def sweep_symbol(
 ) -> List[Tuple[str, Dict]]:
     """Run all TF configs for one symbol, return list of (config_name, results)."""
 
-    # Import the right engine
-    if engine_name == 'original':
-        from strategy.engine import StrategyEngine as EngineClass
-    elif engine_name == 'ict':
-        from strategy.ict_engine import ICTStrategyEngine as EngineClass
-    elif engine_name == 'smc':
-        from strategy.smc_engine import SMCStrategyEngine as EngineClass
-    else:
-        from strategy.engine import StrategyEngine as EngineClass
+    # Dedicated project — single engine (Classic)
+    from strategy.engine import StrategyEngine as EngineClass
 
     norm_symbol = symbol.replace('/', '')
     tf_configs = SYMBOL_CONFIGS.get(symbol) or SYMBOL_CONFIGS.get(norm_symbol)
@@ -424,9 +417,8 @@ async def main():
                         help='End date YYYY-MM-DD')
     parser.add_argument('--balance', type=float, default=100000,
                         help='Initial balance (default: 100000)')
-    parser.add_argument('--engine', default='original',
-                        choices=['original', 'ict', 'smc'],
-                        help='Which strategy engine to test (default: original)')
+    parser.add_argument('--engine', default='original', choices=['original'],
+                        help='Strategy engine (dedicated project: Classic only)')
     parser.add_argument('--config', default=str(PROJECT_ROOT / 'config' / 'config.yaml'),
                         help='Path to base config file')
     args = parser.parse_args()

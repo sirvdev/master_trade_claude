@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
 
 from indicators.indicators import TechnicalIndicators
+from utils.market_hours import _mt5_symbol
 
 
 @pytest.fixture
@@ -54,6 +55,14 @@ def test_indicator_initialization():
     indicators = TechnicalIndicators(config)
     assert indicators.config is not None
     assert indicators.config['ema']['periods'] == [20, 50]
+
+
+def test_mt5_symbol_normalization_preserves_usdm_suffix():
+    """USDm-style broker symbols should keep the broker suffix intact."""
+    assert _mt5_symbol("BTC/USDm") == "BTCUSDm"
+    assert _mt5_symbol("BTCUSDm") == "BTCUSDm"
+    assert _mt5_symbol("XAU/USD") == "XAUUSD"
+    assert _mt5_symbol("EURUSD") == "EURUSD"
 
 
 def test_ema_calculation(sample_data):
