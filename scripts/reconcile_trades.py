@@ -73,6 +73,7 @@ async def reconcile():
     truly_unfilled = 0
     no_data = 0
     skipped_open = 0
+    orphans_fixed = 0
 
     for ticket, rows in sorted(db_by_ticket.items()):
         # Pick the "best" row for this ticket — prefer closed > pending_limit > cancelled
@@ -174,6 +175,17 @@ async def reconcile():
             # This trade was never properly closed in the DB — fix it
             needs_update = True
             action = f"STATUS FIX {status} → closed"
+        elif status in ('open', 'partial'):
+            # B4 FIXED 2026-08-30 audit: there was no branch for these, and no
+            # else. A row reaching here with status='open' has already passed
+            # the "still open at the broker" skip above, so the broker no longer
+            # holds it: it closed while the system was down, which is the exact
+            # case this script exists to repair. needs_update stayed False, no
+            # write happened, nothing was printed and no counter moved, yet the
+            # run still reported RECONCILIATION COMPLETE with a P&L gap that was
+            # wrong by precisely these trades.
+            needs_update = True
+            action = f"ORPHAN FIX {status} → closed (broker no longer holds it)"
         elif status == 'closed':
             pnl_diff = abs(new_pnl - old_pnl)
             exit_diff = abs(new_exit - float(trade['exit_price'] or 0))
@@ -206,6 +218,8 @@ async def reconcile():
                 update_data['commission'] = round(total_commission, 2)
 
             db.update_trade(trade_id, update_data)
+            if status in ('open', 'partial'):
+                orphans_fixed += 1
 
             # Also fix pending_limit_orders table
             try:
@@ -244,7 +258,13 @@ async def reconcile():
     cursor.execute("SELECT COUNT(*) FROM trades WHERE status='closed'")
     final_count = int(cursor.fetchone()[0] or 0)
 
-    broker_pnl = -1685.14
+    # B5 FIXED 2026-08-30 audit: this was hardcoded to -1685.14, a figure
+    # captured on one specific day, and it drove both the Gap line and the
+    # "Reconciled" verdict on every subsequent run -- so the script's headline
+    # output was meaningless from the second run onward and would read as a
+    # growing failure as real trades accumulated. Pass the real number with
+    # --broker-pnl (read it off the MT5 account history for the same window).
+    broker_pnl = ARGS.broker_pnl
 
     print(f"\n{'='*70}")
     print(f"  RECONCILIATION COMPLETE")
@@ -255,6 +275,7 @@ async def reconcile():
     print(f"  Truly unfilled (no deals):                {truly_unfilled}")
     print(f"  No data / errors:                         {no_data}")
     print(f"  Skipped (still open):                     {skipped_open}")
+    print(f"  Orphans repaired (open→closed):           {orphans_fixed}")
     print()
     print(f"  Final DB status breakdown:")
     for s in final_stats:
@@ -262,6 +283,10 @@ async def reconcile():
     print()
     print(f"  DB closed trades: {final_count}")
     print(f"  DB total P&L:     ${final_pnl:+,.2f}")
+    if broker_pnl is None:
+        print(f"  Broker P&L:       not supplied (pass --broker-pnl to compare)")
+        print(f"{'='*70}\n")
+        return
     print(f"  Broker P&L:       ${broker_pnl:+,.2f}")
     print(f"  Gap:              ${(final_pnl - broker_pnl):+,.2f}")
 
@@ -279,4 +304,16 @@ async def reconcile():
 
 
 if __name__ == '__main__':
+    import argparse
+    _p = argparse.ArgumentParser(
+        description='Reconcile the local trade DB against MT5 deal history'
+    )
+    _p.add_argument(
+        '--broker-pnl', type=float, default=None,
+        help='Total realised P&L from the MT5 account history for the same '
+             'window, used only for the closing Gap comparison. Omit it and '
+             'the comparison is skipped rather than measured against a stale '
+             'constant.'
+    )
+    ARGS = _p.parse_args()
     asyncio.run(reconcile())

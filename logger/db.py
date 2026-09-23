@@ -21,7 +21,13 @@ ALLOWED_TRADE_COLUMNS = {
     'realized_rr', 'duration_minutes', 'commission', 'slippage', 'ticket',
     'stop_loss', 'original_stop_loss', 'take_profit_1', 'take_profit_2',
     'take_profit_3', 'max_favorable_excursion', 'max_adverse_excursion',
-    'equity_after_close'
+    'equity_after_close',
+    # B8 2026-08-30 audit: a limit order's row is written at PLACEMENT, so
+    # entry_time held the placement moment and entry_price the requested limit,
+    # never the fill. Neither was writable, so duration_minutes and realized_rr
+    # were wrong for every limit-filled trade (about 40% of all orders fill,
+    # and 60% of orders are limits).
+    'entry_time', 'entry_price',
 }
 
 
@@ -275,6 +281,18 @@ class DatabaseManager:
                 )
                 logger.info("Migration: added 'equity_after_close' column to trades")
 
+            # ── Migration 4: pnl_backfill_attempts ────────────────────────────────
+            # B6 2026-08-30 audit: bounds the P&L backfill queue so a row that can
+            # never resolve stops being re-queued on every restart.
+            if 'pnl_backfill_attempts' not in existing:
+                cursor.execute(
+                    "ALTER TABLE trades ADD COLUMN pnl_backfill_attempts "
+                    "INTEGER DEFAULT 0"
+                )
+                logger.info(
+                    "Migration: added 'pnl_backfill_attempts' column to trades"
+                )
+
             # ── Migration 4: pending_limit_orders table ───────────────────────
             # Safe — CREATE TABLE IF NOT EXISTS handles fresh DBs.
             # Re-running on an existing DB that already has the table is a no-op.
@@ -423,20 +441,31 @@ class DatabaseManager:
                 or f"trade_{datetime.utcnow().strftime('%Y%m%d_%H%M%S_%f')}"
             )
 
+            # B7 2026-08-30 audit: `ticket` used to be absent here and written
+            # by a second transaction from main.py. A crash between the two
+            # commits left a row with ticket IS NULL, and the next startup then
+            # marked it closed ('missing_ticket_on_restart') while the position
+            # was still live at the broker with nothing managing it. One row,
+            # one commit. The follow-up update_trade(ticket=...) in main.py is
+            # now a harmless no-op rewrite of the same value.
+            #
+            # B8: entry_time is taken from trade_data when supplied instead of
+            # being stamped unconditionally, so a caller can record the real
+            # fill time.
             cursor.execute("""
                 INSERT INTO trades (
                     trade_id, analysis_id, symbol, platform, direction,
                     entry_time, entry_price, stop_loss, original_stop_loss,
                     take_profit_1, take_profit_2, take_profit_3,
-                    position_size, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    position_size, status, ticket
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 trade_id,
                 trade_data.get('analysis_id'),
                 trade_data.get('symbol'),
                 trade_data.get('platform'),
                 trade_data.get('direction'),
-                datetime.utcnow(),
+                trade_data.get('entry_time') or datetime.utcnow(),
                 trade_data.get('entry_price'),
                 trade_data.get('stop_loss'),
                 trade_data.get('original_stop_loss') or trade_data.get('stop_loss'),
@@ -445,6 +474,7 @@ class DatabaseManager:
                 trade_data.get('take_profit_3'),
                 trade_data.get('position_size'),
                 trade_data.get('status', 'open'),
+                int(trade_data['ticket']) if trade_data.get('ticket') else None,
             ))
 
             self.conn.commit()
@@ -615,17 +645,40 @@ class DatabaseManager:
                 SELECT * FROM trades
                 WHERE  status IN ('closed', 'pending_exit')
                 AND  ticket IS NOT NULL
+                -- B6 FIXED 2026-08-30 audit: this used to match `pnl = 0` and
+                -- `deal_history_unavailable` unconditionally, so a genuinely
+                -- breakeven trade, a row written with the emergency-shutdown
+                -- zeros, and a trade the system had already given up on could
+                -- never stop matching. _startup_pnl_backfill re-queued every
+                -- match on every restart with lookback = age_hours + 24, firing
+                -- progressively longer EA deal-history scans (up to 180s each)
+                -- for rows that will never resolve.
+                AND  exit_reason IS NOT 'emergency_shutdown'
+                AND  COALESCE(pnl_backfill_attempts, 0) < 3
                 AND  (
                         pnl IS NULL
-                    OR pnl = 0
+                    -- a real breakeven has an exit price; a placeholder does not
+                    OR (pnl = 0 AND (exit_price IS NULL OR exit_price = 0))
                     OR exit_price IS NULL
                     OR exit_price = 0
-                    OR exit_reason IN ('deal_history_unavailable', 'pending_deal_lookup')
+                    OR exit_reason = 'pending_deal_lookup'
                     OR status = 'pending_exit'
                 )
                 ORDER  BY entry_time DESC
             """)
-            return [dict(row) for row in cursor.fetchall()]
+            rows = [dict(row) for row in cursor.fetchall()]
+
+        # B6: count the attempt so a row that never resolves drops out after 3.
+        if rows:
+            with self._db_lock:
+                cur = self.conn.cursor()
+                cur.executemany(
+                    "UPDATE trades SET pnl_backfill_attempts = "
+                    "COALESCE(pnl_backfill_attempts, 0) + 1 WHERE trade_id = ?",
+                    [(r['trade_id'],) for r in rows],
+                )
+                self.conn.commit()
+        return rows
 
     def get_open_trades(self) -> List[Dict]:
         """Get all currently open trades."""
@@ -716,6 +769,11 @@ class DatabaseManager:
         """
         with self._db_lock:
             cursor = self.conn.cursor()
+            # B11 FIXED 2026-08-30 audit: INSERT OR IGNORE silently dropped an
+            # order whose ticket already existed, and this function returns None
+            # either way. main.py then believed the order was tracked while
+            # get_pending_limit_orders() would never return it, so nothing ever
+            # expired, invalidated or cancelled it at the broker.
             cursor.execute("""
                 INSERT OR IGNORE INTO pending_limit_orders
                     (trade_id, ticket, symbol, direction, entry_type,
@@ -735,6 +793,14 @@ class DatabaseManager:
                 float(data['invalidation_price']) if data.get('invalidation_price') else None,
                 float(data['atr_at_placement']) if data.get('atr_at_placement') else None,
             ))
+            if cursor.rowcount == 0:
+                logger.error(
+                    f"pending_limit_orders: ticket {data['ticket']} "
+                    f"({data.get('symbol')}) was NOT inserted - a row with that "
+                    f"ticket already exists. This order will never be expired or "
+                    f"cancelled by the pending-order loop. Investigate before it "
+                    f"fills."
+                )
             self.conn.commit()
  
     def get_pending_limit_orders(self) -> List[Dict[str, Any]]:
@@ -767,11 +833,20 @@ class DatabaseManager:
         """
         with self._db_lock:
             cursor = self.conn.cursor()
-            cursor.execute("""
-                UPDATE pending_limit_orders
-                SET    status = ?, cancelled_reason = ?
-                WHERE  ticket = ?
-            """, (status, reason, int(ticket)))
+            # B11 FIXED 2026-08-30 audit: this wrote cancelled_reason
+            # unconditionally, so main.py's update(ticket, 'filled') with no
+            # reason erased any reason already recorded on the row.
+            if reason is None:
+                cursor.execute(
+                    "UPDATE pending_limit_orders SET status = ? WHERE ticket = ?",
+                    (status, int(ticket)),
+                )
+            else:
+                cursor.execute(
+                    "UPDATE pending_limit_orders SET status = ?, "
+                    "cancelled_reason = ? WHERE ticket = ?",
+                    (status, reason, int(ticket)),
+                )
             self.conn.commit()
 
 

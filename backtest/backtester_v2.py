@@ -1032,7 +1032,7 @@ if __name__ == '__main__':
     PROJECT_ROOT = Path(__file__).parent.parent
     sys.path.insert(0, str(PROJECT_ROOT))
 
-    from strategy.engine import StrategyEngine
+    from strategy.smc_engine import SMCStrategyEngine as StrategyEngine
     from risk_management.money_manager import MoneyManager
     from risk_management.stop_manager import StopManager
 
@@ -1042,19 +1042,13 @@ if __name__ == '__main__':
     parser.add_argument('--end', required=True, help='YYYY-MM-DD')
     parser.add_argument('--balance', type=float, default=100000)
     parser.add_argument('--config', default=str(PROJECT_ROOT / 'config' / 'config.yaml'))
-    parser.add_argument('--engine', default='original',
-                        choices=['original', 'ict', 'smc'])
     args = parser.parse_args()
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    if args.engine == 'ict':
-        from strategy.ict_engine import ICTStrategyEngine as EngineClass
-    elif args.engine == 'smc':
-        from strategy.smc_engine import SMCStrategyEngine as EngineClass
-    else:
-        EngineClass = StrategyEngine
+    # Dedicated project — single engine (SMC)
+    EngineClass = StrategyEngine
 
     start_date = datetime.strptime(args.start, '%Y-%m-%d')
     end_date = datetime.strptime(args.end, '%Y-%m-%d')

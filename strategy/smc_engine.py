@@ -15,7 +15,7 @@ Integration:
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -53,7 +53,16 @@ _KILLZONES = {
     'asian_open':   (0, 3),     # 00:00–03:00 UTC
 }
 
-_VOLATILE_SYMBOLS = {'XAUUSD','XAU/USD','BTCUSD','BTC/USD','NAS100USD','NAS100','US100'}
+# Compared by PREFIX against the symbol with separators stripped, so broker
+# suffixes match too (Exness' micro suffix turns XAU/USDm into XAUUSDM).
+# FIXED 2026-08-30 audit: the old exact-match set never matched a single live
+# symbol, so every instrument silently fell through to confluence_threshold_calm.
+_VOLATILE_SYMBOLS = {'XAUUSD', 'BTCUSD', 'NAS100USD', 'NAS100', 'US100'}
+
+
+def _is_volatile(symbol: str) -> bool:
+    s = symbol.replace('/', '').replace('-', '').replace('_', '').upper()
+    return any(s.startswith(v) for v in _VOLATILE_SYMBOLS)
 
 
 class SMCStrategyEngine:
@@ -98,7 +107,11 @@ class SMCStrategyEngine:
             entry_tf = avail[-1] if avail else '5m'
 
         analysis = {
-            'symbol': symbol, 'timestamp': datetime.now().replace(tzinfo=None),
+            'symbol': symbol, # FIXED 2026-08-30 audit: datetime.now() is the host's LOCAL clock, which
+            # on this machine is 7 hours behind UTC, while every trade,
+            # order and log record in the system is UTC. The analysis
+            # timestamp was the odd one out.
+            'timestamp': datetime.now(timezone.utc).replace(tzinfo=None),
             'primary_timeframe': primary_tf, 'structure_tf': structure_tf,
             'entry_tf': entry_tf, 'timeframe_snapshots': {},
             'market_structure': {}, 'indicators_state': {},
@@ -406,7 +419,18 @@ class SMCStrategyEngine:
                         'bottom': float(c[j]),    # OB bottom = close of bearish candle
                         'candle_index': j,
                         'strength': move_up / atr,
-                        'mitigated': float(df['low'].iloc[j:].min()) < float(c[j]),
+                        # FIXED 2026-08-30 audit: the slice used to include
+                        # bar j itself, whose low is by definition at or
+                        # below its own close, so EVERY bullish order block
+                        # was born mitigated and _check_order_block_entry
+                        # could never fire (0 of 200 live orders). Now
+                        # measured from the bar AFTER the OB, against the
+                        # zone midpoint, which is also where the entry
+                        # limit is placed.
+                        'mitigated': bool(
+                            float(df['low'].iloc[j+1:].min())
+                            <= (float(o[j]) + float(c[j])) / 2.0
+                        ) if j + 1 < n else False,
                     })
                     break
 
@@ -424,7 +448,11 @@ class SMCStrategyEngine:
                         'bottom': float(o[j]),
                         'candle_index': j,
                         'strength': move_down / atr,
-                        'mitigated': float(df['high'].iloc[j:].max()) > float(c[j]),
+                        # Same fix as the bullish branch above.
+                        'mitigated': bool(
+                            float(df['high'].iloc[j+1:].max())
+                            >= (float(o[j]) + float(c[j])) / 2.0
+                        ) if j + 1 < n else False,
                     })
                     break
 
@@ -597,7 +625,9 @@ class SMCStrategyEngine:
             'confidence_score': min(1.0, score / max(threshold * 1.5, 10)),
             'confluence_score': score,
             'confluence_signals': result['signals'],
-            'order_type': 'limit',
+            # S5: honour the winning setup's own order type instead of
+            # forcing every setup to 'limit'.
+            'order_type': result.get('order_type', 'limit'),
             'limit_price': result.get('limit_price'),
         })
         return out
@@ -730,11 +760,17 @@ class SMCStrategyEngine:
         self._add_confluence_signals(signals, htf_bias, ptf_snap, ltf_snap)
 
         cp = ltf_snap['ohlc']['close']
+        # S5 FIXED 2026-08-30 audit: this setup's own comment said 'market
+        # entry after sweep', but _evaluate_smc_entry hardcoded order_type to
+        # 'limit' for every setup, so a sweep reversal was sent as a limit at
+        # the last close: it either missed the move or filled into
+        # continuation. The setup now declares its own order type.
         return {
             'signal': True,
             'direction': direction,
             'signals': signals,
-            'limit_price': cp,  # Market entry after sweep
+            'limit_price': None,
+            'order_type': 'market',
             'reason': f'SMC Liquidity sweep {direction}',
         }
 
@@ -789,7 +825,15 @@ class SMCStrategyEngine:
         """Add standard confluence checks to signal list."""
         ind = ptf_snap['indicators']
 
-        # HTF alignment
+        # HTF alignment.
+        # S1 NOTE 2026-08-30 audit: this +3 is unconditional. It is not false
+        # -- every setup gates on htf_bias before scoring, so the signal is
+        # true by construction -- it is simply non-discriminating, which makes
+        # the confluence threshold 3 points looser than it reads. Removing it
+        # is equivalent to raising every threshold by 3 and would cut trade
+        # count sharply, so it is left to the operator. To make it carry
+        # information instead, gate it on the primary-TF structure agreeing:
+        #     if ptf_snap.get('structure', {}).get('bias') == htf_bias:
         signals.append('htf_structure_aligned')
 
         # EMA alignment
@@ -830,8 +874,7 @@ class SMCStrategyEngine:
         sc = self.config.get('symbols', {}).get(symbol, {})
         if 'confluence_threshold' in sc:
             return int(sc['confluence_threshold'])
-        ms = symbol.replace('/', '').upper()
-        if ms in _VOLATILE_SYMBOLS:
+        if _is_volatile(symbol):
             return int(self.smc_config.get('confluence_required',
                        self.strategy_config.get('confluence_required', 7)))
         return int(self.smc_config.get('confluence_threshold_calm',
@@ -902,10 +945,15 @@ class SMCStrategyEngine:
     
         if direction == 'long':
             swing_low = struct.get('last_swing_low')
-            if swing_low:
-                sl = swing_low - buffer
-            else:
-                sl = entry_price - 2.0 * atr  # was 2.0
+            sl = (swing_low - buffer) if swing_low else None
+            # FIXED 2026-08-30 audit: the structure point comes from the
+            # STRUCTURE timeframe while the entry is a limit placed away
+            # from current price, so the swing can land on the wrong side
+            # of the entry. That produced stops above the entry on a long
+            # (and below it on a short), which the broker rejects. Fall
+            # back to the ATR stop instead of sending an invalid order.
+            if sl is None or sl >= entry_price:
+                sl = entry_price - 2.0 * atr
     
             # Clamp: don't let SL be further than max_sl_distance from entry
             if entry_price - sl > max_sl_distance:
@@ -917,10 +965,10 @@ class SMCStrategyEngine:
             return sl
         else:
             swing_high = struct.get('last_swing_high')
-            if swing_high:
-                sl = swing_high + buffer
-            else:
-                sl = entry_price + 2.0 * atr  # was 2.0
+            sl = (swing_high + buffer) if swing_high else None
+            # Mirror of the long-side guard above.
+            if sl is None or sl <= entry_price:
+                sl = entry_price + 2.0 * atr
     
             if sl - entry_price > max_sl_distance:
                 sl = entry_price + max_sl_distance

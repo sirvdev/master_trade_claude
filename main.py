@@ -20,15 +20,12 @@ from logger.db import DatabaseManager
 from logger.audit_logger import AuditLogger
 from data_feed.market_client import MultiMarketClient
 from indicators.indicators import TechnicalIndicators
-# from strategy.engine import StrategyEngine
-from strategy.ict_engine import ICTStrategyEngine as StrategyEngine
-# from strategy.smc_engine import SMCStrategyEngine as StrategyEngine
+from strategy.smc_engine import SMCStrategyEngine as StrategyEngine
 from risk_management.money_manager import MoneyManager
 from risk_management.stop_manager import StopManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
 from learning.learner import StrategyLearner
 from utils.market_hours import MarketHoursChecker
-from telegram_signal.channel_signal_bot import ChannelSignalBot, _limit_order_alert_watcher
 
 # Setup logging
 Path('logs').mkdir(exist_ok=True)
@@ -69,11 +66,31 @@ def _limit_expiry_times(placed_at, primary_tf, entry_type, strategy_config):
     import time as _t
     tf_secs = _tf_to_seconds(primary_tf)
     exp_cfg = strategy_config.get("limit_order_expiry", {})
+    # FIXED 2026-08-30 audit: this map only listed the CLASSIC engine's entry
+    # types. No SMC or ICT entry type matched, so every limit order silently
+    # fell through to the default of 3 bars and the whole limit_order_expiry
+    # config block was inert for these two instances.
+    #
+    # The SMC/ICT defaults below are deliberately 3, which is the value that
+    # was already in force. They are now addressable from config so they can
+    # be tuned on evidence rather than by accident.
     bars_map = {
+        # classic engine
         "ema_stack_pullback":  exp_cfg.get("ema_stack_pullback_bars",  2),
         "pullback_to_sr":      exp_cfg.get("pullback_to_sr_bars",      5),
         "rsi_divergence":      exp_cfg.get("rsi_divergence_bars",      3),
         "bb_squeeze_breakout": exp_cfg.get("bb_squeeze_breakout_bars", 1),
+        # SMC engine
+        "order_block":         exp_cfg.get("order_block_bars",         3),
+        "fvg_fill":            exp_cfg.get("fvg_fill_bars",            3),
+        "liquidity_sweep":     exp_cfg.get("liquidity_sweep_bars",     3),
+        "bos_pullback":        exp_cfg.get("bos_pullback_bars",        3),
+        # ICT engine
+        "ict_ote":             exp_cfg.get("ict_ote_bars",             3),
+        "ict_breaker":         exp_cfg.get("ict_breaker_bars",         3),
+        "ict_mss":             exp_cfg.get("ict_mss_bars",             3),
+        "ict_asian_breakout":  exp_cfg.get("ict_asian_breakout_bars",  3),
+        "ict_judas_swing":     exp_cfg.get("ict_judas_swing_bars",     3),
     }
     expiry_bars = int(bars_map.get(entry_type, 3))
     floor_secs  = int(exp_cfg.get("min_cancel_floor_seconds", 60))
@@ -175,6 +192,17 @@ class TradingSystem:
             
         # Override with environment variables
         self._apply_env_overrides()
+
+        # Instance label used in every Telegram notification.
+        # FIXED 2026-08-30 audit: notifications carried the launcher's component
+        # names (T1/T2/T3/Main), which say nothing about which strategy sent
+        # them. It now comes from general.instance_label, falling back to the
+        # project directory name so a fresh clone still labels itself.
+        self.instance_label = (
+            (self.config.get('general', {}) or {}).get('instance_label')
+            or os.path.basename(os.getcwd()).replace('master_trade_', '').upper()
+            or 'UNKNOWN'
+        )
         
         # Initialize components
         self._init_database()
@@ -182,7 +210,7 @@ class TradingSystem:
         self._init_strategy_components()
         self._init_execution_clients()
         self._init_learning_engine()
-        self._init_notifier_and_signal_bot()
+        self._init_notifier()
         
         # State
         self.running = False
@@ -264,7 +292,11 @@ class TradingSystem:
             'account': os.getenv('MT5_ACCOUNT'),
             'password': os.getenv('MT5_PASSWORD'),
             'server': os.getenv('MT5_SERVER'),
-            'magic_number': 123456
+            'magic_number': int(
+                self.config.get('execution', {})
+                           .get('mt5', {})
+                           .get('magic_number', 123456)
+            )
         }
         self.mt5_client = MT5Bridge(mt5_config, demo_mode=demo_mode)
 
@@ -283,30 +315,17 @@ class TradingSystem:
             self.learner = None
             logger.info("Learning engine disabled")
     
-    def _init_notifier_and_signal_bot(self):
-        """Initialize Telegram notifier and channel signal bot."""
+    def _init_notifier(self):
+        """Initialize Telegram notifier."""
         from notification.telegram_notifier import TelegramNotifier
         try:
-            self.notifier = TelegramNotifier()
+            self.notifier = TelegramNotifier(
+                instance_label=getattr(self, 'instance_label', None)
+            )
             logger.info("Telegram notifier initialized")
         except Exception as e:
             logger.warning(f"Telegram notifier not available (check .env): {e}")
             self.notifier = None
-
-        db_path = self.config.get('database', {}).get('path', 'data/trading.db')
-        try:
-            if self.config.get('telegram_signals', {}).get('enabled', True):
-                self.signal_bot = ChannelSignalBot(
-                    mt5_bridge = self.mt5_client,   # MT5Bridge IS the bridge directly
-                    notifier   = self.notifier,
-                    db_path    = db_path,
-                )
-                logger.info("Channel signal bot initialized")
-            else:
-                logger.info("Channel signal bot disabled in config")
-        except Exception as e:
-            logger.warning(f"Signal bot init failed: {e}")
-            self.signal_bot = None
 
     async def _balance_monitor_loop(self):
         """Monitor account balance and update equity."""
@@ -347,7 +366,7 @@ class TradingSystem:
                             })
                             if hasattr(self, 'notifier'):
                                 asyncio.ensure_future(self.notifier.send(
-                                    f"⚠️ T1 Daily drawdown limit hit: {drawdown:.2f}% — trading paused."
+                                    f"⚠️ {self.instance_label} Daily drawdown limit hit: {drawdown:.2f}% — trading paused."
                                 )) # assumed dd_pct mean drawdown percent
 
                         # Emergency shutdown (close positions) is separate from halting entries
@@ -436,9 +455,6 @@ class TradingSystem:
                 self._learning_loop(),
                 self._daily_summary_loop(),
             ]
-            if getattr(self, 'signal_bot', None):
-                _coros.append(self.signal_bot.start())
-                _coros.append(_limit_order_alert_watcher(self.signal_bot.executor))
 
             results = await asyncio.gather(*_coros, return_exceptions=True)
             # Log any exceptions that occurred in individual loops
@@ -446,7 +462,7 @@ class TradingSystem:
                 if isinstance(result, Exception):
                     loop_names = [
                         'trading', 'position_monitor', 'balance_monitor',
-                        'learning', 'daily_summary', 'signal_bot', 'limit_alert_watcher'
+                        'learning', 'daily_summary'
                     ]
                     logger.error(f"Loop '{loop_names[i]}' failed: {result}", exc_info=result)
         except asyncio.CancelledError:
@@ -501,7 +517,13 @@ class TradingSystem:
                         f"is a pending limit order — checking EA order book."
                     )
                     try:
-                        ea_orders = await self.mt5_client.get_all_orders() or []
+                        ea_orders = await self.mt5_client.get_all_orders()
+                        if ea_orders is None:
+                            logger.warning(
+                                f"[STARTUP] get_all_orders bridge error — leaving "
+                                f"ticket={ticket} as pending_limit for monitor to resolve."
+                            )
+                            continue
                         ea_tickets = {int(o.get('ticket', 0)) for o in ea_orders}
 
                         if int(ticket) in ea_tickets:
@@ -511,19 +533,55 @@ class TradingSystem:
                                 f"on EA — leaving in pending_limit_orders for monitor."
                             )
                         else:
-                            # Not in orders, not a position — expired or cancelled
-                            logger.info(
-                                f"[STARTUP] Limit order ticket={ticket} not found "
-                                f"in EA orders — marking cancelled."
+                            # Not in EA orders — either it filled while we were
+                            # down (now a live position) or it was cancelled.
+                            ea_positions = await self.mt5_client.get_all_positions()
+                            if ea_positions is None:
+                                logger.warning(
+                                    f"[STARTUP] get_all_positions bridge error — leaving "
+                                    f"ticket={ticket} as pending_limit for monitor to resolve."
+                                )
+                                continue
+                            pos_match = next(
+                                (p for p in ea_positions
+                                 if int(p.get('ticket', 0) or 0) == int(ticket)),
+                                None
                             )
-                            self.db.update_trade(trade_id, {
-                                'status':      'cancelled',
-                                'exit_reason': 'not_found_on_restart',
-                                'exit_time':   datetime.now(timezone.utc).replace(tzinfo=None),
-                            })
-                            self.db.update_pending_limit_order_status(
-                                int(ticket), 'cancelled', 'not_found_on_restart'
-                            )
+                            if pos_match:
+                                logger.info(
+                                    f"[STARTUP] Limit order ticket={ticket} FILLED "
+                                    f"while system was down — promoting to open position."
+                                )
+                                self.db.update_trade(trade_id, {'status': 'open'})
+                                self.db.update_pending_limit_order_status(
+                                    int(ticket), 'filled'
+                                )
+                                self._register_new_position(
+                                    trade_id    = trade_id,
+                                    ticket      = int(ticket),
+                                    symbol      = trade.get('symbol', ''),
+                                    direction   = trade.get('direction', 'long'),
+                                    entry_price = float(pos_match.get('price', trade.get('entry_price', 0.0)) or 0.0),
+                                    volume      = float(pos_match.get('volume', trade.get('position_size', 0.0)) or 0.0),
+                                    sl          = float(trade.get('stop_loss', 0.0) or 0.0),
+                                    tp1         = float(trade.get('take_profit_1') or 0.0),
+                                    tp2         = float(trade.get('take_profit_2') or 0.0),
+                                    platform    = platform,
+                                    analysis_id = trade.get('analysis_id'),
+                                )
+                            else:
+                                logger.info(
+                                    f"[STARTUP] Limit order ticket={ticket} not found "
+                                    f"in EA orders or positions — marking cancelled."
+                                )
+                                self.db.update_trade(trade_id, {
+                                    'status':      'cancelled',
+                                    'exit_reason': 'not_found_on_restart',
+                                    'exit_time':   datetime.now(timezone.utc).replace(tzinfo=None),
+                                })
+                                self.db.update_pending_limit_order_status(
+                                    int(ticket), 'cancelled', 'not_found_on_restart'
+                                )
                     except Exception as e:
                         logger.warning(
                             f"[STARTUP] Could not check order book for ticket={ticket}: {e} "
@@ -746,10 +804,26 @@ class TradingSystem:
                                .get('global_limits', {})
                                .get('max_concurrent_trades', 3)
                 )
-                if len(self.open_positions) >= max_concurrent:
+                try:
+                    _pending_count = len(self.db.get_pending_limit_orders() or [])
+                except Exception:
+                    _pending_count = 0
+                if len(self.open_positions) + _pending_count >= max_concurrent:
                     logger.debug(
-                        f"[{symbol}] At max positions "
-                        f"({len(self.open_positions)}/{max_concurrent}) — skipping."
+                        f"[{symbol}] At max exposure (open={len(self.open_positions)} "
+                        f"pending={_pending_count} max={max_concurrent}) — skipping."
+                    )
+                    continue
+
+                # Enforce max_trades_per_day (was configured but never checked)
+                max_daily = (
+                    self.config.get('risk_management', {})
+                               .get('global_limits', {})
+                               .get('max_trades_per_day', 0)
+                )
+                if max_daily and self.daily_stats.get('trades_today', 0) >= int(max_daily):
+                    logger.info(
+                        f"[{symbol}] Daily trade cap ({max_daily}) reached — skipping."
                     )
                     continue
  
@@ -767,6 +841,22 @@ class TradingSystem:
                     for p in self.open_positions.values()
                 ):
                     logger.debug(f"[{symbol}] Already have open position — skip.")
+                    continue
+
+                # Skip if a pending limit order already exists for this symbol.
+                # Without this, consecutive bar-closes on the same setup stack
+                # near-identical limit orders that can all fill later —
+                # multiplying exposure (root cause of the Jul 17/23 loss runs).
+                try:
+                    _pending_syms = {
+                        str(o.get('symbol', '')).replace('/', '')
+                        for o in (self.db.get_pending_limit_orders() or [])
+                    }
+                except Exception as _pe:
+                    logger.debug(f"[{symbol}] Pending-order check failed: {_pe}")
+                    _pending_syms = set()
+                if norm_sym in _pending_syms:
+                    logger.debug(f"[{symbol}] Pending limit order exists — skip.")
                     continue
  
                 # ── Run analysis ──────────────────────────────────────────────
@@ -892,6 +982,7 @@ class TradingSystem:
                 symbol         = symbol,
                 direction      = analysis['direction'],
                 platform       = platform,
+                symbol_spec    = await self._get_symbol_spec(symbol),
             )
             if not sizing.get('approved') or sizing.get('position_size', 0) <= 0:
                 logger.info(f"[{symbol}] Position sizing rejected: {sizing}")
@@ -913,6 +1004,36 @@ class TradingSystem:
                 return
  
             # ── Place order ───────────────────────────────────────────────────
+            # ADDED 2026-08-30 audit: a BUY_LIMIT must sit at or below the
+            # market and a SELL_LIMIT at or above it. mt5_file_bridge.place_order
+            # maps order_type='limit' straight to BUY_LIMIT/SELL_LIMIT with no
+            # side check, so wrong-side limits were sent, retried three times and
+            # rejected. trading_system.log carries 23 x retcode 10015 (invalid
+            # price) since 30 Jul from exactly this. Skipping produces the same
+            # outcome the rejection already produced, minus the round trips.
+            if order_type == 'limit' and limit_price:
+                ref_price = current_price
+                try:
+                    _px = await self.mt5_client.get_current_price(symbol.replace('/', ''))
+                    if _px:
+                        _mid = (float(_px.get('bid', 0)) + float(_px.get('ask', 0))) / 2
+                        if _mid > 0:
+                            ref_price = _mid
+                except Exception as _pxe:
+                    logger.debug(
+                        f"[{symbol}] limit-side check fell back to bar close: {_pxe}"
+                    )
+
+                _dir = analysis['direction']
+                if ((_dir == 'long'  and float(limit_price) > ref_price) or
+                        (_dir == 'short' and float(limit_price) < ref_price)):
+                    logger.warning(
+                        f"[{symbol}] {entry_type} {_dir} limit {float(limit_price):.5f} "
+                        f"is on the wrong side of market {ref_price:.5f} - the broker "
+                        f"rejects this as retcode 10015. Skipping."
+                    )
+                    return
+
             if platform == 'mt5':
                 result = await self.mt5_client.place_order(
                     symbol      = symbol.replace('/', ''),
@@ -922,7 +1043,7 @@ class TradingSystem:
                     price       = limit_price if order_type == 'limit' else None,
                     stop_loss   = stop_loss,
                     take_profit = take_profit_2,
-                    comment     = f"Analysis_{analysis_id[:8]}"
+                    comment     = f"Analysis_{analysis_id[-8:]}"
                                   if analysis_id != 'unknown' else "Python",
                 )
             else:
@@ -993,7 +1114,7 @@ class TradingSystem:
                 )
                 if hasattr(self, 'notifier'):
                     asyncio.ensure_future(self.notifier.send(
-                        f"⏳ <b>Limit Order Placed T1</b> — {symbol}\n"
+                        f"⏳ <b>Limit Order Placed {self.instance_label}</b> — {symbol}\n"
                         f"<b>{analysis['direction'].upper()}</b> "
                         f"@ <code>{limit_price:.5f}</code> [{entry_type}]\n"
                         f"SL: <code>{stop_loss:.5f}</code>  "
@@ -1044,21 +1165,36 @@ class TradingSystem:
         try:
             #  NEW: Pre-close sweep to catch any orders that are pending but should be cancelled before we do any checks.
             await self._pre_close_cancel_all_pending()
+            await self._weekend_close_open_positions()
+
+            # One live-price probe per symbol per sweep (see below).
+            _price_probe_cache = {}
 
             pending = self.db.get_pending_limit_orders()
             if not pending:
                 return
  
-            # Single EA call for all pending orders
-            ea_orders = await self.mt5_client.get_all_orders() or []
+            # Single EA call for all pending orders.
+            # GUARD: None = bridge failure. Treating it as an empty order book
+            # made every pending order look filled/cancelled and poisoned the
+            # DB while the real orders stayed live on the broker.
+            ea_orders = await self.mt5_client.get_all_orders()
+            if ea_orders is None:
+                logger.warning(
+                    "[LIMIT] get_all_orders returned None (bridge error) — "
+                    "skipping pending-order checks this cycle."
+                )
+                return
             ea_order_tickets = {int(o.get('ticket', 0)) for o in ea_orders}
- 
-            # Also get all positions to detect fills
-            ea_positions = await self.mt5_client.get_all_positions() or []
-            ea_pos_by_comment = {}
-            for p in ea_positions:
-                comment = str(p.get('comment', ''))
-                ea_pos_by_comment[comment] = p
+
+            # Also get all positions to detect fills — same None guard.
+            ea_positions = await self.mt5_client.get_all_positions()
+            if ea_positions is None:
+                logger.warning(
+                    "[LIMIT] get_all_positions returned None (bridge error) — "
+                    "skipping pending-order checks this cycle."
+                )
+                return
  
             now = datetime.now(timezone.utc).replace(tzinfo=None)
  
@@ -1080,11 +1216,16 @@ class TradingSystem:
  
                 # ── Filled: ticket no longer in pending orders ─────────────────
                 if ticket not in ea_order_tickets:
-                    # Find the resulting position by matching our comment
-                    analysis_id_short = (trade_id.split('_')[2][:8]
-                                         if '_' in trade_id else trade_id[:8])
-                    comment_key = f"Analysis_{analysis_id_short}"
-                    filled_pos  = ea_pos_by_comment.get(comment_key)
+                    # Match the resulting position by ticket: on MT5 hedging
+                    # accounts the position ticket equals the originating order
+                    # ticket. (The old comment-based match could never succeed —
+                    # comments were written as 'Analysis_analysis' for every
+                    # trade — so fills were misclassified as external cancels.)
+                    filled_pos = next(
+                        (p for p in ea_positions
+                         if int(p.get('ticket', 0) or 0) == ticket),
+                        None
+                    )
  
                     if filled_pos:
                         pos_ticket     = int(filled_pos.get('ticket', 0))
@@ -1092,7 +1233,28 @@ class TradingSystem:
                         volume         = float(filled_pos.get('volume', 0.0))
  
                         # Update trade record with real position ticket
-                        self.db.update_trade(trade_id, {'ticket': pos_ticket, 'status': 'open'})
+                        # B8 FIXED 2026-08-30 audit: the row was written at
+                        # PLACEMENT, so entry_time held the moment the limit
+                        # was sent and entry_price the requested level, never
+                        # the fill. Every duration and realized_rr for a
+                        # limit-filled trade was wrong by however long the
+                        # order rested. Both columns are now writable
+                        # (db.ALLOWED_TRADE_COLUMNS) and are corrected here.
+                        _fill_update = {'ticket': pos_ticket, 'status': 'open'}
+                        if executed_price:
+                            _fill_update['entry_price'] = float(executed_price)
+                        _fill_time = filled_pos.get('time') or filled_pos.get('open_time')
+                        try:
+                            if _fill_time:
+                                _fill_update['entry_time'] = datetime.fromtimestamp(
+                                    int(_fill_time), timezone.utc
+                                ).replace(tzinfo=None)
+                            else:
+                                _fill_update['entry_time'] = datetime.now(
+                                    timezone.utc).replace(tzinfo=None)
+                        except (TypeError, ValueError, OSError) as _fe:
+                            logger.debug(f"[FILL] {symbol}: fill time unusable ({_fe})")
+                        self.db.update_trade(trade_id, _fill_update)
                         self.db.update_pending_limit_order_status(ticket, 'filled')
  
                         # Get original trade data
@@ -1123,7 +1285,7 @@ class TradingSystem:
                         )
                         if hasattr(self, 'notifier'):
                             asyncio.ensure_future(self.notifier.send(
-                                f"✅ <b>Limit Order Filled T1</b> — {symbol}\n"
+                                f"✅ <b>Limit Order Filled {self.instance_label}</b> — {symbol}\n"
                                 f"<b>{direction.upper()}</b> "
                                 f"@ <code>{executed_price:.5f}</code>\n"
                                 f"Ticket: <code>{pos_ticket}</code>"
@@ -1137,6 +1299,7 @@ class TradingSystem:
                         self.db.update_pending_limit_order_status(
                             ticket, 'cancelled', 'external_cancel'
                         )
+                        self.db.update_trade(trade_id, {'status': 'cancelled'})
                     continue
  
                 # ── Expired ───────────────────────────────────────────────────
@@ -1150,9 +1313,34 @@ class TradingSystem:
  
                 # ── Price invalidation ─────────────────────────────────────────
                 if invalidation_price and atr > 0:
-                    # Get a quick current price estimate from open positions
-                    # or from a recent bar (avoid extra bridge call if possible)
+                    # Price estimate: free ride on open-position data when
+                    # available, otherwise fetch the latest 1m close from the
+                    # bridge (pendings are capped per symbol, so this is cheap).
                     current_price = self._estimate_current_price(symbol, ea_positions)
+                    if current_price is None:
+                        # FIXED 2026-08-31: this fetch used to sit inside the
+                        # per-ORDER loop with no cache, so N pending orders on
+                        # one symbol meant N identical 1-bar bridge round trips
+                        # every sweep. _estimate_current_price only succeeds
+                        # when an open POSITION exists in that symbol, so with
+                        # pendings alone it returns None every time and the
+                        # fallback fired on every order, every 30 seconds. That
+                        # is the "Fetched 1 candles for XAUUSDm" line repeating
+                        # in the log. One probe per symbol per sweep now.
+                        if symbol in _price_probe_cache:
+                            current_price = _price_probe_cache[symbol]
+                        else:
+                            try:
+                                _px = await self.mt5_client.get_current_price(
+                                    symbol.replace('/', '')
+                                )
+                                if _px:
+                                    current_price = (
+                                        float(_px.get('bid', 0)) + float(_px.get('ask', 0))
+                                    ) / 2 or None
+                            except Exception as _pxe:
+                                logger.debug(f"[LIMIT] price fetch failed {symbol}: {_pxe}")
+                            _price_probe_cache[symbol] = current_price
                     if current_price:
                         if direction == 'long' and current_price < float(invalidation_price):
                             await self._cancel_limit_order(
@@ -1180,8 +1368,11 @@ class TradingSystem:
     ) -> None:
         """Cancel a pending limit order on the EA and update the DB."""
         try:
-            success = await self.mt5_client.cancel_order(ticket)
-            if success:
+            result = await self.mt5_client.cancel_order(ticket)
+            # cancel_order returns a dict — a truthy {'success': False} must
+            # NOT be treated as success (this previously marked orders as
+            # cancelled in the DB while they stayed live on the broker).
+            if isinstance(result, dict) and result.get('success'):
                 self.db.update_pending_limit_order_status(ticket, reason, detail)
                 self.db.update_trade(trade_id, {'status': 'cancelled'})
                 logger.info(
@@ -1190,19 +1381,35 @@ class TradingSystem:
                 )
                 if hasattr(self, 'notifier'):
                     asyncio.ensure_future(self.notifier.send(
-                        f"🗑 <b>Limit Order Cancelled T1</b> — {symbol}\n"
+                        f"🗑 <b>Limit Order Cancelled {self.instance_label}</b> — {symbol}\n"
                         f"Reason: <code>{reason}</code>\n"
                         f"{detail}\nTicket: <code>{ticket}</code>"
                     ))
             else:
+                # Keep the order 'pending' in the DB so the monitor retries the
+                # cancel next cycle. Only give up (loudly) after 5 failures —
+                # never silently mark a live broker order as cancelled.
+                attempts = getattr(self, '_cancel_attempts', {})
+                attempts[ticket] = attempts.get(ticket, 0) + 1
+                self._cancel_attempts = attempts
                 logger.warning(
-                    f"[LIMIT] EA cancel failed for ticket={ticket} — "
-                    f"may already be filled or gone."
+                    f"[LIMIT] EA cancel failed for ticket={ticket} "
+                    f"(attempt {attempts[ticket]}/5): "
+                    f"{result.get('error') if isinstance(result, dict) else result}"
                 )
-                # Mark as unknown state so it doesn't keep retrying
-                self.db.update_pending_limit_order_status(
-                    ticket, 'cancelled', 'cancel_failed_on_ea'
-                )
+                if attempts[ticket] >= 5:
+                    self.db.update_pending_limit_order_status(
+                        ticket, 'cancel_failed', 'ea_cancel_failed_5x'
+                    )
+                    logger.error(
+                        f"[LIMIT] Giving up on ticket={ticket} after 5 attempts "
+                        f"— order may still be LIVE on the broker!"
+                    )
+                    if getattr(self, 'notifier', None):
+                        asyncio.ensure_future(self.notifier.send(
+                            f"⚠️ <b>Cancel FAILED 5x</b> — ticket <code>{ticket}</code> "
+                            f"({symbol}) may still be live on the broker. Check MT5!"
+                        ))
         except Exception as e:
             logger.error(f"[LIMIT] _cancel_limit_order error: {e}", exc_info=True)
 
@@ -1575,6 +1782,11 @@ class TradingSystem:
         """
         TP partial closes are now fully managed by EA ManagePositions().
         Python no-op to avoid dual-close conflict.
+
+        DO NOT re-enable _partial_close_async against PythonFileBridge
+        v2.700: its HandleClosePosition ignores the volume field and calls
+        trade.PositionClose(ticket), so what looks like a partial close
+        would flatten the whole position.
         
         The EA divides entry→TP into milestones and partials at each one,
         then trails the runner. Python's role is signal + entry only.
@@ -1771,6 +1983,92 @@ class TradingSystem:
             'max_adverse_excursion'  : position.get('max_adverse_excursion'),
         }
 
+    async def _refine_excursions_from_bars(self, position: dict, fields: dict) -> None:
+        """
+        Recompute MFE/MAE from entry-timeframe bar highs and lows.
+
+        ADDED 2026-08-30 audit. The position monitor samples current_price once
+        every monitor_interval seconds (floor 70s), so poll-derived MFE/MAE
+        understate the real excursion. Measured bias: positions that closed on
+        the original stop must have a true MAE of exactly 1.00R, and the
+        recorded median was 0.87R, so roughly 12% is lost at the extreme.
+
+        Bars are selected by COUNT back from the end of the series, never by
+        timestamp, because the EA emits raw MQL5 rates[i].time (broker-server
+        time) while mt5_file_bridge labels it utc=True. Counting backwards is
+        immune to that offset; matching timestamps would not be.
+
+        The window spans the entry bar through the exit bar inclusive, so the
+        result can overstate by at most one bar's range at each end. That
+        direction is deliberate: it is conservative against the conclusion
+        that a losing trade never went in our favour.
+
+        Any failure leaves the poll-derived values exactly as they were.
+        """
+        try:
+            entry_price = float(position.get('entry_price') or 0.0)
+            duration    = float(fields.get('duration_minutes') or 0.0)
+            symbol      = position.get('symbol')
+            direction   = position.get('direction', 'long')
+            if not entry_price or not symbol or duration <= 0:
+                return
+
+            platform = position.get('platform') or 'mt5'
+            sym_cfg  = self.config.get('symbols', {}).get(symbol, {})
+            entry_tf = sym_cfg.get('entry_timeframe') or (sym_cfg.get('timeframes') or ['5m'])[-1]
+            tf_minutes = _tf_to_seconds(entry_tf) / 60.0
+            if tf_minutes <= 0:
+                return
+
+            # Bars covering entry -> exit, plus the lag between exit and now
+            # (the deferred-close path can run well after the position closed).
+            exit_dt = fields.get('exit_time')
+            now     = datetime.now(timezone.utc).replace(tzinfo=None)
+            lag_min = 0.0
+            if isinstance(exit_dt, datetime):
+                lag_min = max(0.0, (now - exit_dt).total_seconds() / 60.0)
+            bars_lag  = int(lag_min // tf_minutes)
+            bars_span = int(math.ceil(duration / tf_minutes)) + 1
+
+            if bars_span < 1 or bars_span + bars_lag > 400:
+                logger.debug(
+                    f"[CLOSE] MFE/MAE refine skipped: window too large "
+                    f"(span={bars_span} lag={bars_lag} tf={entry_tf})"
+                )
+                return
+
+            df = await self.market_client.fetch_historical(
+                symbol, platform, entry_tf, limit=bars_span + bars_lag + 5
+            )
+            if df is None or len(df) < bars_span + bars_lag:
+                return
+
+            end   = len(df) - bars_lag
+            start = max(0, end - bars_span)
+            if end - start < 1:
+                return
+            window = df.iloc[start:end]
+
+            hi = float(window['high'].max())
+            lo = float(window['low'].min())
+            if direction == 'long':
+                mfe, mae = max(0.0, hi - entry_price), max(0.0, entry_price - lo)
+            else:
+                mfe, mae = max(0.0, entry_price - lo), max(0.0, hi - entry_price)
+
+            # Never regress below what the poll actually observed.
+            mfe = max(mfe, float(fields.get('max_favorable_excursion') or 0.0))
+            mae = max(mae, float(fields.get('max_adverse_excursion') or 0.0))
+
+            fields['max_favorable_excursion'] = mfe
+            fields['max_adverse_excursion']   = mae
+            logger.debug(
+                f"[CLOSE] MFE/MAE from {len(window)} {entry_tf} bars: "
+                f"mfe={mfe:.5f} mae={mae:.5f}"
+            )
+        except Exception as exc:
+            logger.debug(f"[CLOSE] Bar-based MFE/MAE refine skipped: {exc}")
+
     def _apply_close_side_effects(self, net_pnl: float, symbol: str = '') -> None:
         """
         Update in-memory stats that are side-effects of closing a trade.
@@ -1880,6 +2178,8 @@ class TradingSystem:
         )
 
         # ── Side-effects: consecutive losses, daily drawdown ──────────────────
+        # Replace the 70s-poll MFE/MAE with bar-derived values before logging.
+        await self._refine_excursions_from_bars(position, fields)
         self._apply_close_side_effects(fields['net_pnl'], position.get('symbol', ''))
 
         # ── Snapshot equity immediately after close ────────────────────────────
@@ -1916,7 +2216,7 @@ class TradingSystem:
             dur_str = f"{fields['duration_minutes']:.0f}m" if fields['duration_minutes'] else "?"
             eq_str  = f" | Equity: ${equity_after_close:,.2f}" if equity_after_close else ""
             await self.notifier.send(
-                f"{emoji} {symbol} closed T1 ({fields['exit_reason']})\n"
+                f"{emoji} {symbol} closed {self.instance_label} ({fields['exit_reason']})\n"
                 f"Exit: {fields['exit_price']:.5f} | Net P&L: {fields['net_pnl']:.2f} "
                 f"| RR: {fields['realized_rr']:.2f} | Duration: {dur_str}{eq_str}"
             )
@@ -2061,6 +2361,8 @@ class TradingSystem:
             )
 
             # Apply in-memory side-effects (consecutive losses, daily drawdown)
+            # Replace the 70s-poll MFE/MAE with bar-derived values before logging.
+            await self._refine_excursions_from_bars(position, fields)
             self._apply_close_side_effects(fields['net_pnl'], position.get('symbol', ''))
 
             # Write to audit log + DB
@@ -2282,7 +2584,7 @@ class TradingSystem:
 
         if hasattr(self, "notifier"):
             action = "Closing all positions." if close_on_shutdown else "Positions left open — will reconcile on restart."
-            asyncio.ensure_future(self.notifier.send(f"🚨 T1 Emergency shutdown: {reason}. {action}"))
+            asyncio.ensure_future(self.notifier.send(f"🚨 {self.instance_label} Emergency shutdown: {reason}. {action}"))
 
         if close_on_shutdown:
             # Fire async close from the sync context via the running event loop
@@ -2430,7 +2732,7 @@ class TradingSystem:
         if hasattr(self, "notifier"):
             emoji = "✅" if profit >= 0 else "❌"
             asyncio.ensure_future(self.notifier.send(
-                f"{emoji} T1 Position closed: {position.get('symbol')} "
+                f"{emoji} {self.instance_label} Position closed: {position.get('symbol')} "
                 f"| P&L: {profit:.2f} | Reason: {reason}"
             ))
         return True
@@ -2469,8 +2771,13 @@ class TradingSystem:
         
         while self.running:
             try:
-                # Wait until end of day
-                await asyncio.sleep(86400)  # 24 hours
+                # Sleep until the next UTC midnight so daily resets align with
+                # calendar days instead of drifting from process start time.
+                _now = datetime.now(timezone.utc)
+                _next_midnight = (_now + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                await asyncio.sleep(max(60.0, (_next_midnight - _now).total_seconds()))
                 
                 # Generate summary
                 summary = self.audit_logger.generate_daily_summary()
@@ -2539,6 +2846,166 @@ class TradingSystem:
             # logger.info(f"Total equity: ${total_equity:,.2f}")
             return total_equity
     
+    async def _get_symbol_spec(self, symbol: str) -> dict:
+        """Broker contract specification for a symbol, fetched once and cached.
+
+        ADDED 2026-08-30 audit. MoneyManager used to size every position from a
+        hardcoded contract table with no entry for index CFDs, so US30m and
+        US500m were treated as 100,000-unit forex lots: every computed size came
+        out ~100,000x too small and was floored to the 0.01 minimum, which is
+        why those trades were worth about $5. The broker has been able to answer
+        this question since EA v2.505; nothing was asking it.
+
+        A failure here is not fatal: an empty dict makes MoneyManager fall back
+        to its local table, which is correct for XAU/XAG/EUR/BTC/ETH (verified
+        against 441 real fills).
+        """
+        if not hasattr(self, '_symbol_spec_cache'):
+            self._symbol_spec_cache = {}
+            # None = not probed yet, False = this EA cannot answer, True = it can.
+            self._symbol_spec_supported = None
+
+        if symbol in self._symbol_spec_cache:
+            return self._symbol_spec_cache[symbol]
+
+        # CORRECTED 2026-08-30: get_symbol_info exists in the SIGNAL bridge
+        # (PythonFileBridge v2.505) but NOT in the v2.700 EA the four strategy
+        # instances run -- its dispatcher has no such action and answers
+        # {"status":"error","error":"Unknown action: get_symbol_info"}. So on
+        # these instances the probe fails once, by design, and sizing runs off
+        # the local contract table, which is authoritative here and correct:
+        # it was measured from 441 real fills, not assumed. Probe once per
+        # process rather than once per symbol so the failure costs a single
+        # round trip, and pick the live values up automatically if the EA is
+        # ever upgraded.
+        if self._symbol_spec_supported is False:
+            self._symbol_spec_cache[symbol] = {}
+            return {}
+
+        spec = {}
+        try:
+            resp = await self.mt5_client.get_symbol_info(symbol.replace('/', ''))
+            if resp and resp.get('status') == 'success':
+                spec = {
+                    k: resp[k]
+                    for k in ('contract_size', 'volume_min', 'volume_max',
+                              'volume_step', 'point', 'tick_value', 'tick_size')
+                    if resp.get(k) is not None
+                }
+                self._symbol_spec_supported = True
+                logger.info(
+                    f"[SPEC] {symbol}: contract_size={spec.get('contract_size')} "
+                    f"volume_min={spec.get('volume_min')} "
+                    f"volume_step={spec.get('volume_step')} "
+                    f"volume_max={spec.get('volume_max')}"
+                )
+            else:
+                err = (resp or {}).get('error', 'no response')
+                self._symbol_spec_supported = False
+                logger.info(
+                    f"[SPEC] This EA does not answer get_symbol_info ({err}). "
+                    f"That is expected on PythonFileBridge v2.700. Sizing will "
+                    f"use risk_management.mt5_contract_sizes and the local "
+                    f"table, which are measured values, not guesses. Not "
+                    f"asking again this session."
+                )
+        except Exception as exc:
+            self._symbol_spec_supported = False
+            logger.info(
+                f"[SPEC] get_symbol_info unavailable ({exc}); using the local "
+                f"contract table. Not asking again this session."
+            )
+
+        self._symbol_spec_cache[symbol] = spec
+        return spec
+
+    async def _weekend_close_open_positions(self):
+        """Flatten weekend-closing instruments before the weekend break.
+
+        ADDED 2026-08-30 audit. The existing pre-close sweep only cancelled
+        PENDING orders; open positions were carried across the weekend. In
+        Jul 30 - Aug 29 that left six non-crypto legs open over a Friday close,
+        including 0.71 lots of XAUUSDm opened an hour before the 21:00 Friday
+        close and stopped out on the Sunday reopen gap for -599.45, and 4.85
+        lots of EURUSDm for -596.55.
+
+        Whether an instrument closes for the weekend is decided from the
+        broker's own session table (is_24_7 / next_close_is_weekend), not from a
+        symbol list, so crypto stays open and a newly added instrument is
+        classified without a code change. Three conditions must all hold before
+        anything is closed: the symbol is not 24/7, its session closes within
+        `minutes_before_close`, and the market does not reopen for at least
+        `min_gap_hours` after that close, which is what separates the weekend
+        from the roughly one-hour daily break.
+        """
+        try:
+            cfg = ((self.config.get('risk_management', {}) or {})
+                   .get('weekend_close', {}) or {})
+            if not cfg.get('enabled', True):
+                return
+            if not self.open_positions:
+                return
+
+            minutes = int(cfg.get('minutes_before_close', 30))
+            min_gap = float(cfg.get('min_gap_hours', 8))
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            for trade_id, position in list(self.open_positions.items()):
+                symbol = position.get('symbol')
+                ticket = position.get('ticket')
+                if not symbol or not ticket:
+                    continue
+                try:
+                    if self.market_hours.is_24_7(symbol):
+                        continue
+                    if not self.market_hours.is_near_close(symbol, minutes=minutes, now=now):
+                        continue
+                    if not self.market_hours.next_close_is_weekend(
+                            symbol, now=now, min_gap_hours=min_gap):
+                        continue
+
+                    volume = float(position.get('volume')
+                                   or position.get('position_size') or 0)
+                    if volume <= 0:
+                        continue
+
+                    secs = self.market_hours.seconds_until_close(symbol, now)
+                    close_at = (now + timedelta(seconds=secs)).strftime('%a %H:%M UTC')
+                    logger.warning(
+                        f"[WEEKEND] Closing {symbol} ticket={ticket} {volume} lots "
+                        f"- session closes {close_at} and does not reopen for "
+                        f"{min_gap:.0f}h+"
+                    )
+
+                    # No volume argument on purpose: v2.700's
+                    # HandleClosePosition calls trade.PositionClose(ticket) and
+                    # ignores the volume field entirely, so every close is a
+                    # full close. That is what this sweep wants; passing a
+                    # volume would only imply a partial that cannot happen.
+                    result = await self.mt5_client.close_position(ticket=int(ticket))
+                    if result.get('success'):
+                        logger.info(
+                            f"[WEEKEND] Closed {symbol} ticket={ticket}; the "
+                            f"position monitor will reconcile and log the exit"
+                        )
+                        if hasattr(self, 'notifier'):
+                            await self.notifier.send(
+                                f"\U0001f6cf {self.instance_label} weekend close - "
+                                f"{symbol} {volume} lots flattened before "
+                                f"{close_at}"
+                            )
+                    else:
+                        logger.error(
+                            f"[WEEKEND] MT5 rejected close for {symbol} "
+                            f"ticket={ticket}: {result.get('error')}"
+                        )
+                except Exception as exc:
+                    logger.error(f"[WEEKEND] {symbol}: {exc}", exc_info=True)
+
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.error(f"[WEEKEND] sweep failed: {exc}", exc_info=True)
+
     async def _pre_close_cancel_all_pending(self):
         """
         Cancel ALL pending limit orders for any symbol whose market closes
@@ -2554,12 +3021,21 @@ class TradingSystem:
                 return
     
             # Group by symbol and check which symbols are near close
-            symbols_near_close = set()
+            # 2026-08-30 audit: this sweep cancelled 45 live pending orders in
+            # one month at 00, 01, 02, 03, 06, 22 and 23 UTC, when the only
+            # daily close for gold/silver/EUR is 21:00 UTC, and zero of them
+            # fired near 21:00. The session table from the broker is not on the
+            # clock market_hours assumes. The computed close time is now
+            # recorded in the cancel reason so the next occurrence is visible in
+            # pending_limit_orders.csv instead of silent. See
+            # ../verify_server_offset.py before changing market_hours itself.
+            symbols_near_close = {}
             for order in pending:
                 symbol = order['symbol']
                 if symbol not in symbols_near_close:
-                    if self.market_hours.is_near_close(symbol, minutes=5):
-                        symbols_near_close.add(symbol)
+                    _secs = self.market_hours.seconds_until_close(symbol)
+                    if 0 < _secs <= 30 * 60:
+                        symbols_near_close[symbol] = _secs
     
             if not symbols_near_close:
                 return
@@ -2580,7 +3056,9 @@ class TradingSystem:
     
                 await self._cancel_limit_order(
                     ticket, trade_id, symbol, 'pre_close',
-                    f"Market {symbol} closing within 5 minutes"
+                    f"Market {symbol} closing within 30 minutes "
+                    f"(computed close "
+                    f"{(datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=symbols_near_close[symbol])).strftime('%H:%M UTC')})"
                 )
                 cancelled_count += 1
     
