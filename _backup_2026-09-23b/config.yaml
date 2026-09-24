@@ -14,69 +14,67 @@ general:
   log_trades: true
   log_analysis: true
 symbols:
-  # 2026-09-23: the five instruments in the owner's week-of-13-Jul screenshots
-  # (GC1!, 6E1!, 6B1!, BTCUSD, NQ1!), mapped to their Exness CFDs. Every
-  # other symbol is off. Engine: strategy.engine = nlm_matrix (the book).
-  #
-  # pip: the unit behind the book's 1.5-pip stop buffer (8.3). The book
-  # defines it only for FX (0.0001) and for index points (1.0, Case 10.3).
-  # Gold and BTC have no book value: 0.1 and 1.0 are the usual conventions.
-  # round_step: psychological levels ending .000/.500 (3.1). Literal only
-  # for FX (0.005); left off (0) where the book gives no reading.
   XAU/USDm:
+    # C3 2026-09-23: the 9-vs-12 pin that stood here is gone. Both values
+    # were inert: every NLM signal logged from 30 Aug to 23 Sep (109 of 109)
+    # scored 28-33, because the path to scoring guarantees 26. The gate now
+    # reads nlm.min_conviction (range 3-13); set a per-symbol value with
+    #   nlm:
+    #     min_conviction: <n>
     enabled: true
     platform: mt5
     mode: live
-    timeframes: [4H, 1H, 15m, 5m]   # macro, bias+sweep, sessions, execution (book 4.1)
-    primary_timeframe: 5m          # analysis runs on every 5M close (execution window)
+    timeframes:
+    - 4H
+    - 15m
+    - 5m
+    primary_timeframe: 15m
     entry_timeframe: 5m
-    nlm_matrix:
-      pip: 0.1            # no book value; $0.10 convention
-      round_step: 0
+    confluence_threshold: 6
+  US30m:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
+  US500m:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
+  XAG/USDm:
+    enabled: true
+    platform: mt5
+    mode: live
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
   EUR/USDm:
     enabled: true
     platform: mt5
     mode: live
-    timeframes: [4H, 1H, 15m, 5m]   # macro, bias+sweep, sessions, execution (book 4.1)
-    primary_timeframe: 5m          # analysis runs on every 5M close (execution window)
-    entry_timeframe: 5m
-    nlm_matrix:
-      pip: 0.0001
-      round_step: 0.005
-  GBP/USDm:
-    enabled: true
-    platform: mt5
-    mode: live
-    timeframes: [4H, 1H, 15m, 5m]   # macro, bias+sweep, sessions, execution (book 4.1)
-    primary_timeframe: 5m          # analysis runs on every 5M close (execution window)
-    entry_timeframe: 5m
-    nlm_matrix:
-      pip: 0.0001
-      round_step: 0.005
-  BTC/USDm:
-    enabled: true
-    platform: mt5
-    mode: live
-    timeframes: [4H, 1H, 15m, 5m]   # macro, bias+sweep, sessions, execution (book 4.1)
-    primary_timeframe: 5m          # analysis runs on every 5M close (execution window)
-    entry_timeframe: 5m
-    nlm_matrix:
-      pip: 1.0            # no book value; $1 convention
-      round_step: 0
-  USTECm:
-    enabled: true
-    platform: mt5
-    mode: live
-    timeframes: [4H, 1H, 15m, 5m]   # macro, bias+sweep, sessions, execution (book 4.1)
-    primary_timeframe: 5m          # analysis runs on every 5M close (execution window)
-    entry_timeframe: 5m
-    nlm_matrix:
-      pip: 1.0            # index point, as in Case 10.3. CONFIRM the Exness symbol name
-      round_step: 0
-  # Off: not in the screenshots.
-  US30m:     {enabled: false, platform: mt5, mode: live, timeframes: [4H, 1H, 15m, 5m], primary_timeframe: 5m}
-  US500m:    {enabled: false, platform: mt5, mode: live, timeframes: [4H, 1H, 15m, 5m], primary_timeframe: 5m}
-  XAG/USDm:  {enabled: false, platform: mt5, mode: live, timeframes: [4H, 1H, 15m, 5m], primary_timeframe: 5m}
+    timeframes:
+    - 4H
+    - 1H
+    - 15m
+    primary_timeframe: 1H
+    entry_timeframe: 15m
+    confluence_threshold: 5
 indicators:
   ema:
     periods:
@@ -140,9 +138,6 @@ indicators:
     lhlh_for_downtrend: true
     structure_break_confirmation: true
 strategy:
-  # nlm_matrix = The Nexus Liquidity Matrix Strategy, book v1.0
-  # (strategy/nlm_matrix_engine.py). 'nlm' = the earlier 9-phase engine.
-  engine: nlm_matrix
   # DEAD 2026-08-30 audit: classic-engine setup list. nlm_engine.py never reads it.
   # # Entry types — evaluated in order, first passing type wins.
   # # Each type has its own order placement logic (market vs limit).
@@ -194,7 +189,6 @@ strategy:
     nlm_order_block_bars:              3   # NLM OB entry — zone is sticky
     nlm_fvg_bars:                      2   # NLM FVG — fills or fails fast
     nlm_breaker_bars:                  2   # NLM breaker — lower conviction
-    nlm_matrix_fvg_bars:               0   # book: no clock expiry (0 = none); see nlm_matrix engine
     price_invalidation_atr_multiplier: 1.0 # Cancel if price moves 1×ATR past entry level
     min_cancel_floor_seconds:         60   # Never cancel within 60s of placement
  
@@ -205,15 +199,13 @@ strategy:
     min_atr_threshold: 0.0005
     max_atr_threshold: 0.05
     session_blockouts:
-      # 2026-09-23: both OFF. The book has no session blockout; with
-      # nlm_matrix every order is a limit and the only filters are the book's.
       - name: london_market_orders
-        enabled: false
+        enabled: true
         start: '07:00'
         end: '12:00'
         order_types: ['market']
       - name: overlap_all_orders
-        enabled: false
+        enabled: true
         start: '20:00'
         end: '24:00'
         order_types: ['market', 'limit']
@@ -248,8 +240,6 @@ risk_management:
     ETHUSDm: 1
     US30m: 1
     US500m: 1
-    GBPUSDm: 100000
-    USTECm: 1          # NOT measured yet: confirm in MT5 (Specification -> Contract size)
 
   # Per-symbol lot ceilings. A single max_position_size_lots cannot be right
   # across instruments whose notional per lot differs by five orders of
@@ -264,15 +254,6 @@ risk_management:
     # dollar shortfall.
     US30m: 35
     US500m: 120
-    # 2026-09-23 nlm_matrix: book 9.1/9.2 sizes every trade to its stop at
-    # 0.5-1.0% risk (0.6% here). The global 6.0 cap would cut tight-stop
-    # trades below that, so the five book symbols get caps that let the
-    # formula stand. The 30x-equity notional backstop below still applies.
-    XAU/USDm: 20      # $600 / ($0.30 stop x 100) = 20 lots
-    EUR/USDm: 30      # $600 / (2 pip stop x $10)  = 30 lots
-    GBP/USDm: 30
-    BTC/USDm: 20      # $600 / ($30 stop x 1)      = 20 lots
-    USTECm: 40        # $600 / (15 pt stop x 1)    = 40 lots
 
   # Symbol-agnostic notional backstop, in multiples of equity, per position.
   # Fixed-fractional sizing puts no ceiling on exposure: a US500m signal with a
@@ -353,35 +334,6 @@ nlm:
   max_mss_age_bars: 15
   # N1 2026-09-23: Phase 1 chop guard range, in daily bars including today.
   d1_range_days: 5
-nlm_matrix:
-  # The Nexus Liquidity Matrix Strategy, book v1.0. Section numbers are the
-  # book's. Values the book states are marked BOOK; values the book leaves
-  # open are marked CHOICE with the reading used. Per-symbol overrides go in
-  # symbols.<sym>.nlm_matrix.
-  macro_tf: 4H              # BOOK 4.1 (4H must not contradict 1H, 4.4)
-  bias_tf: 1H               # BOOK 4.1 / journal "1H Macro Bias"
-  sweep_tf: 1H              # BOOK 10.1 "verify 1H chart sweeps"
-  session_tf: 15m           # CHOICE: frame used to measure session extremes
-  exec_tf: 5m               # BOOK 4.1, 8.2 "5M FVG"
-  swing_order: 2            # BOOK 2.4 3-to-5 candle swing -> 5-candle fractal
-  sl_buffer_pips: 1.5       # BOOK 8.3
-  min_rr_to_node: 3.0       # BOOK 9.4 minimum R:R to the target
-  target_rr: 5.0            # OWNER: 1:5 target replaces the 8.4 node target
-  partial_rr: 2.0           # BOOK 9.3
-  partial_fraction: 0.5     # BOOK 9.3 "e.g. 50%"
-  velocity_candles: 3       # BOOK 3.2 measurement tool
-  velocity_atr_period: 20   # BOOK 3.2
-  velocity_ratio: 1.5       # BOOK 3.2
-  displacement_atr_ratio: 1.5  # CHOICE: 2.6 gives no number; reuses 3.2's 1.5 x ATR20
-  displacement_body_frac: 0.5  # CHOICE: "large-bodied" read as body >= half the range
-  mss_window_bars: 1        # CHOICE: MSS within the 1H candle after the reclaim
-  sessions:                 # BOOK gives NY open 13:30 UTC; the rest are standard clocks
-    asian: ['00:00', '07:00']
-    london: ['07:00', '13:30']
-    new_york: ['13:30', '21:00']
-  session_days: 2
-  rule3_enabled: true       # CHOICE on reading: see engine G8 (6.2)
-
 # Per-symbol pip size used by the NLM SL buffer (4 pips beyond sweep wick).
 # Engine has built-in defaults for XAU/XAG/BTC/EURUSD/GBPUSD/USDJPY;
 # add entries here to override or cover other symbols.

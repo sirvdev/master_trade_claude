@@ -19,7 +19,14 @@ from pathlib import Path
 from logger.db import DatabaseManager
 from logger.audit_logger import AuditLogger
 from data_feed.market_client import MultiMarketClient
-from strategy.nlm_engine import NLMStrategyEngine as StrategyEngine
+from strategy.nlm_engine import NLMStrategyEngine
+from strategy.nlm_matrix_engine import NLMMatrixEngine
+import json as _json
+
+# strategy.engine selects the engine. 'nlm_matrix' is the Nexus Liquidity
+# Matrix book v1.0 (strategy/nlm_matrix_engine.py); 'nlm' is the earlier
+# 9-phase Nexus Liquidity Method engine, kept selectable.
+_ENGINES = {'nlm_matrix': NLMMatrixEngine, 'nlm': NLMStrategyEngine}
 from risk_management.money_manager import MoneyManager
 from execution.mt5_file_bridge import MT5FileBridge as MT5Bridge
 from learning.learner import StrategyLearner
@@ -74,8 +81,15 @@ def _limit_expiry_times(placed_at, primary_tf, entry_type, strategy_config):
         "nlm_order_block":     exp_cfg.get("nlm_order_block_bars",     3),
         "nlm_fvg":             exp_cfg.get("nlm_fvg_bars",             2),
         "nlm_breaker":         exp_cfg.get("nlm_breaker_bars",         2),
+        # Nexus Liquidity Matrix (book): no clock expiry. An order is cancelled
+        # by the book's own rules instead (missed at 1:2, body close beyond the
+        # axis, price through the stop). 0 means no time expiry.
+        "nlm_matrix_fvg":      exp_cfg.get("nlm_matrix_fvg_bars",      0),
     }
     expiry_bars = int(bars_map.get(entry_type, 3))
+    if expiry_bars <= 0:
+        return (placed_at + timedelta(days=30),
+                placed_at + timedelta(seconds=int(exp_cfg.get("min_cancel_floor_seconds", 60))))
     floor_secs  = int(exp_cfg.get("min_cancel_floor_seconds", 60))
     placed_ts      = _t.time()
     next_bar_close = math.ceil(placed_ts / tf_secs) * tf_secs
@@ -197,7 +211,14 @@ class TradingSystem:
         # ── Note: StrategyEngine creates its own TechnicalIndicators instance ──
         # Don't create a separate one here to avoid duplication and sync issues.
         # Access indicators via: self.strategy_engine.indicators if needed.
-        self.strategy_engine = StrategyEngine(self.config)
+        _engine_name = (self.config.get('strategy', {}) or {}).get('engine', 'nlm')
+        self.strategy_engine = _ENGINES.get(_engine_name, NLMStrategyEngine)(self.config)
+        logger.info(f"Strategy engine: {_engine_name} -> {type(self.strategy_engine).__name__}")
+        self._nlm_setups_path = Path('data') / 'nlm_matrix_setups.json'
+        try:
+            self._nlm_setups = _json.loads(self._nlm_setups_path.read_text(encoding='utf-8'))
+        except Exception:
+            self._nlm_setups = {}
         self.money_manager = MoneyManager(self.config)
         # Note: stop/TP management is handled by the MT5 EA, not Python.
 
@@ -786,6 +807,7 @@ class TradingSystem:
                     logger.debug(f"[{symbol}] Pending-order check failed: {_pe}")
                     _pending_syms = set()
                 if norm_sym in _pending_syms:
+                    await self._nlm_check_pending(symbol, symbol_config)
                     logger.debug(f"[{symbol}] Pending limit order exists — skip.")
                     continue
  
@@ -972,122 +994,194 @@ class TradingSystem:
                     )
                     return
 
-            if platform == 'mt5':
-                result = await self.mt5_client.place_order(
-                    symbol      = symbol.replace('/', ''),
-                    direction   = analysis['direction'],
-                    volume      = sizing['position_size'],
-                    order_type  = order_type,
-                    price       = limit_price if order_type == 'limit' else None,
-                    stop_loss   = stop_loss,
-                    take_profit = take_profit_2,
-                    comment     = f"Analysis_{analysis_id[-8:]}"
-                                  if analysis_id != 'unknown' else "Python",
-                )
-            else:
-                logger.warning(f"[{symbol}] Unsupported platform: {platform}")
-                return
- 
-            if not result.get('success'):
-                logger.error(f"[{symbol}] Order failed: {result.get('error')}")
-                return
- 
-            ticket         = result.get('ticket') or result.get('order_id')
-            executed_price = result.get('filled_price') or result.get('price') or order_price
-            placed_at      = datetime.now(timezone.utc).replace(tzinfo=None)
- 
-            # ── Log trade ─────────────────────────────────────────────────────
-            trade_status = 'pending_limit' if order_type == 'limit' else 'open'
-            trade_id = self.audit_logger.log_trade_entry({
-                'analysis_id'  : analysis_id,
-                'symbol'       : symbol,
-                'platform'     : platform,
-                'direction'    : analysis['direction'],
-                'entry_price'  : executed_price,
-                'stop_loss'    : stop_loss,
-                'take_profit_1': take_profit_1,
-                'take_profit_2': take_profit_2,
-                'position_size': sizing['position_size'],
-                'status'       : trade_status,
-            })
-            self.db.update_trade(trade_id, {'ticket': ticket})
- 
-            # ── Route: limit vs market ─────────────────────────────────────────
-            if order_type == 'limit':
-                # Limit order is PENDING — save to tracker, do NOT open position
-                primary_tf = symbol_config.get('primary_timeframe', '15m')
-                expiry_time, min_floor = _limit_expiry_times(
-                    placed_at, primary_tf, entry_type,
-                    self.config.get('strategy', {})
-                )
- 
-                invalidation_atr_mult = float(
-                    self.config.get('strategy', {})
-                               .get('limit_order_expiry', {})
-                               .get('price_invalidation_atr_multiplier', 1.0)
-                )
-                if analysis['direction'] == 'long':
-                    invalidation_price = float(limit_price) - invalidation_atr_mult * atr
+            # ── Legs ──────────────────────────────────────────────────────────
+            # nlm_matrix (book 9.3): 50% of the size targets 1:2 and 50% the
+            # 1:5 target; the EA (PartialCloseSteps=0, BreakevenMinRR=2.0)
+            # moves the surviving leg's stop to entry at 1:2. Other engines
+            # send one order to take_profit_2 exactly as before.
+            _nlm_setup = levels.get('nlm_setup')
+            _legs_spec = levels.get('legs') or [{'fraction': 1.0,
+                                                 'take_profit': take_profit_2,
+                                                 'label': ''}]
+            _total = float(sizing['position_size'])
+            _step = 0.01
+            _legs = []
+            for _spec in _legs_spec:
+                _v = math.floor(_total * float(_spec['fraction']) / _step + 1e-9) * _step
+                _legs.append((round(_v, 2), float(_spec['take_profit']), _spec.get('label', '')))
+            if len(_legs) > 1 and any(v < _step for v, _, _ in _legs):
+                # Too small to split at the broker's 0.01 step: one order to
+                # the final target; the EA still moves it to breakeven at 1:2.
+                logger.warning(f"[{symbol}] {_total} lots cannot be split into "
+                               f"{len(_legs)} legs; sending one order to the final target.")
+                _legs = [(round(_total, 2), _legs[-1][1], _legs[-1][2])]
+            elif len(_legs) > 1:
+                # rounding remainder goes to the last leg
+                _legs[-1] = (round(_total - sum(v for v, _, _ in _legs[:-1]), 2),
+                             _legs[-1][1], _legs[-1][2])
+
+            for _leg_volume, _leg_tp, _leg_label in _legs:
+                _leg_tag = f" [{_leg_label}]" if _leg_label else ""
+                if platform == 'mt5':
+                    result = await self.mt5_client.place_order(
+                        symbol      = symbol.replace('/', ''),
+                        direction   = analysis['direction'],
+                        volume      = _leg_volume,
+                        order_type  = order_type,
+                        price       = limit_price if order_type == 'limit' else None,
+                        stop_loss   = stop_loss,
+                        take_profit = _leg_tp,
+                        comment     = (f"Analysis_{analysis_id[-8:]}"
+                                   if analysis_id != 'unknown' else "Python") + _leg_tag,
+                    )
                 else:
-                    invalidation_price = float(limit_price) + invalidation_atr_mult * atr
+                    logger.warning(f"[{symbol}] Unsupported platform: {platform}")
+                    return
  
-                self.db.save_pending_limit_order({
-                    'trade_id':           trade_id,
-                    'ticket':             ticket,
-                    'symbol':             symbol,
-                    'direction':          analysis['direction'],
-                    'entry_type':         entry_type,
-                    'limit_price':        limit_price or executed_price,
-                    'placed_at':          placed_at.isoformat(),
-                    'expiry_time':        expiry_time.isoformat(),
-                    'min_cancel_floor':   min_floor.isoformat(),
-                    'invalidation_price': invalidation_price,
-                    'atr_at_placement':   atr,
+                if not result.get('success'):
+                    logger.error(f"[{symbol}] Order failed{_leg_tag}: {result.get('error')}")
+                    continue
+ 
+                ticket         = result.get('ticket') or result.get('order_id')
+                executed_price = result.get('filled_price') or result.get('price') or order_price
+                placed_at      = datetime.now(timezone.utc).replace(tzinfo=None)
+ 
+                # ── Log trade ─────────────────────────────────────────────────────
+                trade_status = 'pending_limit' if order_type == 'limit' else 'open'
+                trade_id = self.audit_logger.log_trade_entry({
+                    'analysis_id'  : analysis_id,
+                    'symbol'       : symbol,
+                    'platform'     : platform,
+                    'direction'    : analysis['direction'],
+                    'entry_price'  : executed_price,
+                    'stop_loss'    : stop_loss,
+                    'take_profit_1': take_profit_1,
+                    'take_profit_2': _leg_tp,
+                    'position_size': _leg_volume,
+                    'status'       : trade_status,
                 })
+                self.db.update_trade(trade_id, {'ticket': ticket})
  
-                logger.info(
-                    f"[{symbol}] LIMIT ORDER placed — ticket={ticket} "
-                    f"type={entry_type} price={limit_price:.5f} "
-                    f"expiry={expiry_time.strftime('%H:%M:%S')} UTC"
-                )
-                if getattr(self, 'notifier', None):
-                    asyncio.ensure_future(self.notifier.send(
-                        f"⏳ <b>Limit Order Placed {self.instance_label}</b> — {symbol}\n"
-                        f"<b>{analysis['direction'].upper()}</b> "
-                        f"@ <code>{limit_price:.5f}</code> [{entry_type}]\n"
-                        f"SL: <code>{stop_loss:.5f}</code>  "
-                        f"TP1: <code>{take_profit_1:.5f}</code>\n"
-                        f"Expires: <code>{expiry_time.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
-                        f"Ticket: <code>{ticket}</code>"
-                    ))
+                # ── Route: limit vs market ─────────────────────────────────────────
+                if order_type == 'limit':
+                    # Limit order is PENDING — save to tracker, do NOT open position
+                    primary_tf = symbol_config.get('primary_timeframe', '15m')
+                    expiry_time, min_floor = _limit_expiry_times(
+                        placed_at, primary_tf, entry_type,
+                        self.config.get('strategy', {})
+                    )
  
-            else:
-                # Market order — register in open_positions immediately
-                self._register_new_position(
-                    trade_id    = trade_id,
-                    ticket      = ticket,
-                    symbol      = symbol,
-                    direction   = analysis['direction'],
-                    entry_price = executed_price,
-                    volume      = sizing['position_size'],
-                    sl          = stop_loss,
-                    tp1         = take_profit_1,
-                    tp2         = take_profit_2,
-                    tp1_fraction = 0.5,
-                    platform    = platform,
-                    analysis_id = analysis_id,
-                )
-                self.daily_stats['trades_today'] += 1
-                logger.info(
-                    f"[{symbol}] MARKET ORDER filled — ticket={ticket} "
-                    f"price={executed_price:.5f} "
-                    f"dir={analysis['direction']} type={entry_type}"
-                )
+                    invalidation_atr_mult = float(
+                        self.config.get('strategy', {})
+                                   .get('limit_order_expiry', {})
+                                   .get('price_invalidation_atr_multiplier', 1.0)
+                    )
+                    if analysis['direction'] == 'long':
+                        invalidation_price = float(limit_price) - invalidation_atr_mult * atr
+                    else:
+                        invalidation_price = float(limit_price) + invalidation_atr_mult * atr
+                    if _nlm_setup:
+                        # Book 6.3: price trading through the stop (beyond the
+                        # sweep extreme) before the fill turns the sweep into a
+                        # breakout, so the resting order is cancelled there.
+                        invalidation_price = float(stop_loss)
+ 
+                    self.db.save_pending_limit_order({
+                        'trade_id':           trade_id,
+                        'ticket':             ticket,
+                        'symbol':             symbol,
+                        'direction':          analysis['direction'],
+                        'entry_type':         entry_type,
+                        'limit_price':        limit_price or executed_price,
+                        'placed_at':          placed_at.isoformat(),
+                        'expiry_time':        expiry_time.isoformat(),
+                        'min_cancel_floor':   min_floor.isoformat(),
+                        'invalidation_price': invalidation_price,
+                        'atr_at_placement':   atr,
+                    })
+ 
+                    if _nlm_setup:
+                        self._remember_nlm_setup(ticket, _nlm_setup)
+                    logger.info(
+                        f"[{symbol}] LIMIT ORDER placed{_leg_tag} — ticket={ticket} "
+                        f"type={entry_type} price={limit_price:.5f} "
+                        f"expiry={expiry_time.strftime('%H:%M:%S')} UTC"
+                    )
+                    if getattr(self, 'notifier', None):
+                        asyncio.ensure_future(self.notifier.send(
+                            f"⏳ <b>Limit Order Placed {self.instance_label}</b> — {symbol}\n"
+                            f"<b>{analysis['direction'].upper()}</b> "
+                            f"@ <code>{limit_price:.5f}</code> [{entry_type}]\n"
+                            f"SL: <code>{stop_loss:.5f}</code>  "
+                            f"TP: <code>{_leg_tp:.5f}</code>{_leg_tag}\n"
+                            f"Expires: <code>{expiry_time.strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
+                            f"Ticket: <code>{ticket}</code>"
+                        ))
+ 
+                else:
+                    # Market order — register in open_positions immediately
+                    self._register_new_position(
+                        trade_id    = trade_id,
+                        ticket      = ticket,
+                        symbol      = symbol,
+                        direction   = analysis['direction'],
+                        entry_price = executed_price,
+                        volume      = _leg_volume,
+                        sl          = stop_loss,
+                        tp1         = take_profit_1,
+                        tp2         = _leg_tp,
+                        tp1_fraction = 0.5,
+                        platform    = platform,
+                        analysis_id = analysis_id,
+                    )
+                    self.daily_stats['trades_today'] += 1
+                    logger.info(
+                        f"[{symbol}] MARKET ORDER filled — ticket={ticket} "
+                        f"price={executed_price:.5f} "
+                        f"dir={analysis['direction']} type={entry_type}"
+                    )
  
         except Exception as e:
             logger.error(
                 f"[{symbol}] Error processing entry signal: {e}", exc_info=True
             )
+
+    def _remember_nlm_setup(self, ticket, setup: dict) -> None:
+        """Keep the book setup behind a resting order so the book's cancel
+        rules can be applied to it, across restarts."""
+        self._nlm_setups[str(ticket)] = setup
+        try:
+            self._nlm_setups_path.parent.mkdir(exist_ok=True)
+            self._nlm_setups_path.write_text(_json.dumps(self._nlm_setups, indent=1),
+                                             encoding='utf-8')
+        except Exception as e:
+            logger.warning(f"[NLM-M] could not persist setup for {ticket}: {e}")
+
+    async def _nlm_check_pending(self, symbol: str, symbol_config: dict) -> None:
+        """Book cancel rules for a resting limit (8.2 missed at 1:2, 6.3/10.4
+        body close beyond the axis). Runs on every exec-TF bar close while an
+        order for this symbol is pending."""
+        check = getattr(self.strategy_engine, 'pending_order_valid', None)
+        if check is None:
+            return
+        try:
+            orders = [o for o in (self.db.get_pending_limit_orders() or [])
+                      if str(o.get('symbol', '')).replace('/', '') == symbol.replace('/', '')
+                      and str(o.get('ticket')) in self._nlm_setups]
+            if not orders:
+                return
+            data = await self.market_client.fetch_multiple_timeframes(
+                symbol, symbol_config.get('platform', 'mt5'),
+                symbol_config.get('timeframes', []))
+            if not data:
+                return
+            for o in orders:
+                ok, why = check(self._nlm_setups[str(o['ticket'])], data)
+                if not ok:
+                    await self._cancel_limit_order(int(o['ticket']), o['trade_id'],
+                                                   symbol, 'invalidated', why)
+        except Exception as e:
+            logger.error(f"[NLM-M] pending check failed for {symbol}: {e}", exc_info=True)
 
     async def _check_pending_limit_orders(self):
         """
@@ -2778,4 +2872,4 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         print(f"\nFatal error: {e}")
-        sys.exit(1)
+        sys.exit(1)
